@@ -1,0 +1,4 @@
+MetaTrader5==5.0.5640
+pandas==3.0.2
+numpy==2.4.4
+Pillow==12.2.0

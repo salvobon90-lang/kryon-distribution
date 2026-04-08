@@ -78,6 +78,7 @@ class LicenseManager:
                 "activation_endpoint": "/api/license/activate",
                 "refresh_endpoint": "/api/license/refresh",
                 "grace_days": 5,
+                "force_packaged_mode": False,
                 "enforce_packaged_only": True,
             },
         )
@@ -123,7 +124,8 @@ class LicenseManager:
             raise RuntimeError(str(exc.reason or exc)) from exc
 
     def is_dev_mode(self):
-        return not getattr(sys, "frozen", False)
+        self.reload_config()
+        return (not getattr(sys, "frozen", False)) and not bool(self.config.get("force_packaged_mode", False))
 
     def build_activation_payload(self, email, license_key):
         return {

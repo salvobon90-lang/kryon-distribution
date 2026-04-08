@@ -5,6 +5,8 @@ __pycache__/
 
 .kryon_runtime/
 dist/
+.venv/
+kryon_session_state.json
 
 licensing_server/licenses.db
 licensing_server/__pycache__/

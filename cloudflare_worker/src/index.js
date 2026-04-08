@@ -312,7 +312,8 @@ async function handleAdminSetRelease(request, env, payload) {
 
 async function handleLatestRelease(env, requestUrl) {
   const channel = (requestUrl.searchParams.get("channel") || "stable").trim().toLowerCase();
-  const row = await env.DB.prepare("SELECT * FROM release_channels WHERE channel = ?")
+  const sessionDb = env.DB.withSession("first-primary");
+  const row = await sessionDb.prepare("SELECT * FROM release_channels WHERE channel = ?")
     .bind(channel)
     .first();
   if (!row) {

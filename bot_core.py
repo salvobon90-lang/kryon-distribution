@@ -13,7 +13,7 @@ import traceback
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ==============================================================================
-# CONFIGURAZIONE (KRYON ULTIMATE PRO V 15.4.1 - LICENSE REFRESH & UPDATE STAGING)
+# CONFIGURAZIONE (KRYON ULTIMATE PRO V 15.4.2 - CLIENT DELIVERY & MONTHLY LICENSING)
 # ==============================================================================
 PROFIT_MODE = True
 PRIMARY_SYMBOL = "XAUUSD"

@@ -16,7 +16,7 @@ from kryon_license import LicenseManager
 from kryon_update import UpdateManager
 from kryon_runtime import get_runtime_dir
 
-VERSION = "KRYON ULTIMATE PRO V 15.4.1"
+VERSION = "KRYON ULTIMATE PRO V 15.4.2"
 AUTHOR_BRAND = "POWERED BY BONS ⚡ FOR MY DAUGHTER EMMA ❤️ AND MY TRUE LOVE LAUPHI ❤️  "
 running = False
 
