@@ -11,6 +11,19 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $DistRoot = Join-Path $Root "dist"
 $VersionSource = Join-Path $Root "kryon.pyw"
 
+function Set-AppVersionInFile {
+    param(
+        [string]$Path,
+        [string]$Version
+    )
+    if (-not (Test-Path $Path)) {
+        return
+    }
+    $content = Get-Content $Path -Raw
+    $content = [regex]::Replace($content, 'KRYON ULTIMATE PRO V [0-9.]+', "KRYON ULTIMATE PRO V $Version")
+    [System.IO.File]::WriteAllText($Path, $content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 if (-not $Version) {
     if (Test-Path $VersionSource) {
         $versionLine = Select-String -Path $VersionSource -Pattern 'VERSION\s*=\s*"KRYON ULTIMATE PRO V ([0-9.]+)"' | Select-Object -First 1
@@ -48,6 +61,9 @@ foreach ($file in $files) {
         Copy-Item $src -Destination (Join-Path $ReleaseDir $file) -Force
     }
 }
+
+Set-AppVersionInFile -Path (Join-Path $ReleaseDir "kryon.pyw") -Version $Version
+Set-AppVersionInFile -Path (Join-Path $ReleaseDir "bot_core.py") -Version $Version
 
 $imgRoot = Join-Path $Root "immagini kryon"
 if (Test-Path $imgRoot) {

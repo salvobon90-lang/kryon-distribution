@@ -16,7 +16,7 @@ from kryon_license import LicenseManager
 from kryon_update import UpdateManager
 from kryon_runtime import get_runtime_dir
 
-VERSION = "KRYON ULTIMATE PRO V 15.4.2"
+VERSION = "KRYON ULTIMATE PRO V 15.4.5"
 AUTHOR_BRAND = "POWERED BY BONS ⚡ FOR MY DAUGHTER EMMA ❤️ AND MY TRUE LOVE LAUPHI ❤️  "
 running = False
 
@@ -95,6 +95,12 @@ def start_bot():
         status_var.set("ENGINE: LICENSE BLOCK")
         status_label.config(fg=DANGER)
         return
+    update_gate = update_manager.get_runtime_gate(force=True)
+    if not update_gate.get("run_allowed", False):
+        log_error(f"{update_gate.get('headline', 'UPDATE BLOCCATO')} | {update_gate.get('detail', '')}")
+        status_var.set("ENGINE: UPDATE BLOCK")
+        status_label.config(fg=DANGER)
+        return
     bot_core.reset_session_tracking()
     running = True
     session_start_time = datetime.now()
@@ -114,6 +120,9 @@ def stop_bot():
 
 def toggle_scalping_mode():
     global scalping_active
+    if not license_manager.get_runtime_status().get("run_allowed", False):
+        log_error("Licenza non valida: impossibile modificare le modalita' operative.")
+        return
     scalping_active = not scalping_active
     bot_core.toggle_scalping(scalping_active)
     if scalping_active:
@@ -128,6 +137,9 @@ def toggle_scalping_mode():
 
 def toggle_crypto_mode():
     global crypto_active
+    if not license_manager.get_runtime_status().get("run_allowed", False):
+        log_error("Licenza non valida: impossibile modificare le modalita' operative.")
+        return
     crypto_active = not crypto_active
     bot_core.toggle_crypto(crypto_active)
     if crypto_active:
@@ -141,6 +153,9 @@ def toggle_crypto_mode():
 
 
 def apply_optimizer_profile(profile_name):
+    if not license_manager.get_runtime_status().get("run_allowed", False):
+        log_error("Licenza non valida: optimizer bloccato.")
+        return
     if bot_core.set_optimizer_profile(profile_name):
         refresh_optimizer_buttons()
 
@@ -197,21 +212,36 @@ def open_activation_dialog():
     dialog.configure(bg=BG_ALT)
     dialog.transient(root)
     dialog.grab_set()
-    dialog.geometry("620x560")
+    dialog.geometry("700x620")
 
     card = tk.Frame(dialog, bg=CARD_BG, highlightthickness=1, highlightbackground=BORDER_SOFT)
     card.pack(fill="both", expand=True, padx=16, pady=16)
 
-    tk.Label(card, text="Licensing Base", bg=CARD_BG, fg=TEXT_MAIN, font=("Segoe UI Semibold", 14)).pack(anchor="w", padx=16, pady=(16, 4))
+    tk.Label(card, text="Licenza KRYON", bg=CARD_BG, fg=TEXT_MAIN, font=("Segoe UI Semibold", 14)).pack(anchor="w", padx=16, pady=(16, 4))
     tk.Label(
         card,
-        text="Questo pannello genera la richiesta di attivazione e applica una risposta JSON nello stesso formato che usera' il server licenze.",
+        text="La licenza va attivata una sola volta su questo PC. Finche' resta valida, KRYON usera' il token salvato e si aggiornera' da solo.",
         bg=CARD_BG,
         fg=TEXT_DIM,
         font=("Segoe UI", 9),
-        wraplength=560,
+        wraplength=640,
         justify="left",
     ).pack(anchor="w", padx=16, pady=(0, 12))
+
+    status_card = tk.Frame(card, bg=CARD_BG_2, highlightthickness=1, highlightbackground=BORDER_SOFT)
+    status_card.pack(fill="x", padx=16, pady=(0, 12))
+
+    license_headline_var = tk.StringVar(value="LICENZA: INIT")
+    license_pc_var = tk.StringVar(value="PC: verifica in corso")
+    license_expiry_var = tk.StringVar(value="Scadenza: --")
+    license_plan_var = tk.StringVar(value="Piano: --")
+    license_token_var = tk.StringVar(value="Token: --")
+
+    tk.Label(status_card, textvariable=license_headline_var, bg=CARD_BG_2, fg=INFO, font=("Segoe UI Semibold", 12)).pack(anchor="w", padx=14, pady=(12, 2))
+    tk.Label(status_card, textvariable=license_pc_var, bg=CARD_BG_2, fg=TEXT_SOFT, font=("Segoe UI", 9)).pack(anchor="w", padx=14, pady=1)
+    tk.Label(status_card, textvariable=license_expiry_var, bg=CARD_BG_2, fg=TEXT_SOFT, font=("Segoe UI", 9)).pack(anchor="w", padx=14, pady=1)
+    tk.Label(status_card, textvariable=license_plan_var, bg=CARD_BG_2, fg=TEXT_SOFT, font=("Segoe UI", 9)).pack(anchor="w", padx=14, pady=1)
+    tk.Label(status_card, textvariable=license_token_var, bg=CARD_BG_2, fg=TEXT_DIM, font=("Segoe UI", 8)).pack(anchor="w", padx=14, pady=(1, 12))
 
     form = tk.Frame(card, bg=CARD_BG)
     form.pack(fill="x", padx=16, pady=(0, 10))
@@ -223,12 +253,28 @@ def open_activation_dialog():
     key_entry.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=4)
     form.grid_columnconfigure(1, weight=1)
 
-    request_box = tk.Text(card, height=10, bg=LOG_BG, fg=TEXT_MAIN, relief="flat", font=("Consolas", 9))
-    request_box.pack(fill="both", expand=False, padx=16, pady=(0, 10))
+    hint = tk.Label(
+        card,
+        text="Se il PC e' gia' autorizzato, non serve riattivare la licenza: KRYON la usera' fino alla scadenza e rinnovera' il token in automatico.",
+        bg=CARD_BG,
+        fg=TEXT_DIM,
+        font=("Segoe UI", 9),
+        wraplength=640,
+        justify="left",
+    )
+    hint.pack(anchor="w", padx=16, pady=(0, 10))
+
+    advanced_visible = tk.BooleanVar(value=False)
+    advanced_frame = tk.Frame(card, bg=CARD_BG)
+
+    tk.Label(advanced_frame, text="Payload richiesta", bg=CARD_BG, fg=TEXT_SOFT, font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=0, pady=(0, 4))
+    request_box = tk.Text(advanced_frame, height=8, bg=LOG_BG, fg=TEXT_MAIN, relief="flat", font=("Consolas", 9))
+    request_box.pack(fill="both", expand=False, padx=0, pady=(0, 10))
     request_box.insert("1.0", "{\n  \"activation_request\": \"genera payload\"\n}")
 
-    response_box = tk.Text(card, height=10, bg=LOG_BG, fg=TEXT_MAIN, relief="flat", font=("Consolas", 9))
-    response_box.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+    tk.Label(advanced_frame, text="Stato token/licenza", bg=CARD_BG, fg=TEXT_SOFT, font=("Segoe UI Semibold", 9)).pack(anchor="w", padx=0, pady=(0, 4))
+    response_box = tk.Text(advanced_frame, height=10, bg=LOG_BG, fg=TEXT_MAIN, relief="flat", font=("Consolas", 9))
+    response_box.pack(fill="both", expand=True, padx=0, pady=(0, 10))
     response_box.insert(
         "1.0",
         json.dumps(
@@ -253,6 +299,54 @@ def open_activation_dialog():
     footer = tk.Frame(card, bg=CARD_BG)
     footer.pack(fill="x", padx=16, pady=(0, 16))
 
+    def _fmt_iso_local(value):
+        if not value:
+            return "--"
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone()
+            return dt.strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            return str(value)
+
+    def _refresh_license_overview():
+        runtime_status = license_manager.get_runtime_status()
+        state = license_manager.load_state()
+        headline = runtime_status.get("headline", "LICENZA: --")
+        license_headline_var.set(headline)
+        color = _status_color_from_text(headline)
+
+        if runtime_status.get("status") == "ACTIVE":
+            license_pc_var.set("PC: autorizzato")
+        elif runtime_status.get("status") == "UNLICENSED":
+            license_pc_var.set("PC: non ancora autorizzato")
+        elif runtime_status.get("status") == "DEVICE_MISMATCH":
+            license_pc_var.set("PC: token appartenente a un altro dispositivo")
+        else:
+            license_pc_var.set(f"PC: stato {runtime_status.get('status', '--')}")
+
+        license_expiry_var.set(f"Scadenza: {_fmt_iso_local(state.get('expires_at'))}")
+        license_plan_var.set(f"Piano: {state.get('plan', runtime_status.get('plan', '--'))}")
+        token_preview = str(state.get("token_id", "") or "").strip()
+        if token_preview:
+            token_preview = token_preview[:8] + "..."
+        else:
+            token_preview = "--"
+        license_token_var.set(f"Token: {token_preview} | Refresh: {_fmt_iso_local(state.get('refresh_after'))}")
+
+        for widget in status_card.winfo_children():
+            if isinstance(widget, tk.Label) and widget.cget("textvariable") == str(license_headline_var):
+                widget.config(fg=color)
+
+    def _toggle_advanced():
+        if advanced_visible.get():
+            advanced_frame.pack_forget()
+            advanced_visible.set(False)
+            btn_advanced.change_style("⚙️ AVANZATO", TEXT_DIM)
+        else:
+            advanced_frame.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+            advanced_visible.set(True)
+            btn_advanced.change_style("⚙️ NASCONDI", BTN_VIOLET)
+
     def build_request():
         payload = license_manager.build_activation_payload(email_entry.get(), key_entry.get())
         request_box.delete("1.0", tk.END)
@@ -269,6 +363,7 @@ def open_activation_dialog():
             return
         license_manager.apply_activation_response(payload)
         messagebox.showinfo("Licensing", "Risposta licenza applicata e salvata.")
+        _refresh_license_overview()
         update_distribution_panel()
 
     def activate_online():
@@ -282,7 +377,8 @@ def open_activation_dialog():
             return
         response_box.delete("1.0", tk.END)
         response_box.insert("1.0", json.dumps(state, indent=2))
-        messagebox.showinfo("Licensing", "Licenza attivata online con successo.")
+        messagebox.showinfo("Licensing", "Licenza attivata su questo PC con successo.")
+        _refresh_license_overview()
         update_distribution_panel()
 
     def refresh_token():
@@ -294,13 +390,26 @@ def open_activation_dialog():
         response_box.delete("1.0", tk.END)
         response_box.insert("1.0", json.dumps(state, indent=2))
         messagebox.showinfo("Licensing", "Token aggiornato con successo.")
+        _refresh_license_overview()
         update_distribution_panel()
 
-    RoundedButton(footer, "🔐 CREA RICHIESTA", BTN_BLUE, build_request, 180, 36).pack(side="left", padx=(0, 8))
-    RoundedButton(footer, "🌐 ATTIVA ONLINE", BTN_ORANGE, activate_online, 180, 36).pack(side="left", padx=8)
-    RoundedButton(footer, "✅ APPLICA RISPOSTA", BTN_START, apply_response, 180, 36).pack(side="left", padx=8)
-    RoundedButton(footer, "🔄 REFRESH TOKEN", BTN_VIOLET, refresh_token, 180, 36).pack(side="left", padx=8)
-    RoundedButton(footer, "📂 RUNTIME", TEXT_DIM, open_runtime_folder, 120, 36).pack(side="right")
+    RoundedButton(footer, "🌐 ATTIVA SU QUESTO PC", BTN_ORANGE, activate_online, 220, 36).pack(side="left", padx=(0, 8))
+    RoundedButton(footer, "🔄 AGGIORNA TOKEN", BTN_VIOLET, refresh_token, 180, 36).pack(side="left", padx=8)
+    btn_advanced = RoundedButton(footer, "⚙️ AVANZATO", TEXT_DIM, _toggle_advanced, 140, 36)
+    btn_advanced.pack(side="left", padx=8)
+    RoundedButton(footer, "📂 FILES", TEXT_DIM, open_runtime_folder, 100, 36).pack(side="right")
+
+    advanced_actions = tk.Frame(advanced_frame, bg=CARD_BG)
+    advanced_actions.pack(fill="x", padx=0, pady=(0, 6))
+    RoundedButton(advanced_actions, "🔐 CREA RICHIESTA", BTN_BLUE, build_request, 180, 34).pack(side="left", padx=(0, 8))
+    RoundedButton(advanced_actions, "✅ APPLICA RISPOSTA", BTN_START, apply_response, 180, 34).pack(side="left", padx=8)
+
+    state = license_manager.load_state()
+    if state.get("email"):
+        email_entry.insert(0, state.get("email", ""))
+    if state.get("license_key"):
+        key_entry.insert(0, state.get("license_key", ""))
+    _refresh_license_overview()
 
 
 def update_logs():
@@ -1253,8 +1362,16 @@ def _status_color_from_text(text):
 def update_distribution_panel():
     license_manager.auto_refresh(force=False)
     license_status = license_manager.get_runtime_status()
+    license_state = license_manager.load_state()
     license_status_var.set(license_status.get("headline", "LICENZA: --"))
-    license_detail_var.set(license_status.get("detail", ""))
+    expiry_text = ""
+    if license_state.get("expires_at"):
+        try:
+            expiry_text = datetime.fromisoformat(str(license_state.get("expires_at")).replace("Z", "+00:00")).astimezone().strftime("%d/%m %H:%M")
+            expiry_text = f" | fino al {expiry_text}"
+        except Exception:
+            expiry_text = ""
+    license_detail_var.set(f"{license_status.get('detail', '')}{expiry_text}".strip())
     license_status_label.config(fg=_status_color_from_text(license_status.get("headline")))
 
     if update_manager.config.get("auto_check"):
@@ -1264,9 +1381,21 @@ def update_distribution_panel():
             update_status = update_manager.get_status()
     else:
         update_status = update_manager.get_status()
+    update_gate = update_manager.get_runtime_gate(force=False)
     update_status_var.set(update_status.get("headline", "UPDATE: --"))
     update_detail_var.set(update_status.get("detail", ""))
     update_status_label.config(fg=_status_color_from_text(update_status.get("headline")))
+    if running:
+        if not license_status.get("run_allowed", False):
+            stop_bot()
+            status_var.set("ENGINE: LICENSE BLOCK")
+            status_label.config(fg=DANGER)
+            log_error(f"{license_status.get('headline', 'LICENZA BLOCCATA')} | {license_status.get('detail', '')}")
+        elif not update_gate.get("run_allowed", False):
+            stop_bot()
+            status_var.set("ENGINE: UPDATE BLOCK")
+            status_label.config(fg=DANGER)
+            log_error(f"{update_gate.get('headline', 'UPDATE BLOCCATO')} | {update_gate.get('detail', '')}")
     root.after(5000, update_distribution_panel)
 
 

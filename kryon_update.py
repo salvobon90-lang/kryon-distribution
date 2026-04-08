@@ -55,6 +55,8 @@ class UpdateManager:
                 "auto_check": False,
                 "auto_download": False,
                 "check_interval_hours": 6,
+                "require_latest_for_run": False,
+                "strict_manifest_required": False,
             },
         )
         return self.config
@@ -91,6 +93,49 @@ class UpdateManager:
             "detail": f"Ultimo check {last_check}",
             "update_available": False,
             "latest_version": latest,
+        }
+
+    def get_runtime_gate(self, force=False):
+        self.reload_config()
+        require_latest = bool(self.config.get("require_latest_for_run", False))
+        strict_manifest = bool(self.config.get("strict_manifest_required", False))
+        status = self.check_for_updates(force=force) if force else self.get_status()
+        state = self.load_state()
+        last_error = str(state.get("last_error", "") or "").strip()
+
+        if not require_latest:
+            return {
+                "run_allowed": True,
+                "headline": status.get("headline", "UPDATE: OK"),
+                "detail": status.get("detail", ""),
+                "update_available": bool(status.get("update_available", False)),
+                "latest_version": status.get("latest_version", self.current_version),
+            }
+
+        if strict_manifest and last_error:
+            return {
+                "run_allowed": False,
+                "headline": "UPDATE: CHECK FAILED",
+                "detail": f"Impossibile verificare la versione: {last_error}",
+                "update_available": False,
+                "latest_version": state.get("latest_version", self.current_version),
+            }
+
+        if status.get("update_available", False):
+            return {
+                "run_allowed": False,
+                "headline": "UPDATE: REQUIRED",
+                "detail": f"Serve la versione {status.get('latest_version', '--')}",
+                "update_available": True,
+                "latest_version": status.get("latest_version", self.current_version),
+            }
+
+        return {
+            "run_allowed": True,
+            "headline": status.get("headline", "UPDATE: OK"),
+            "detail": status.get("detail", ""),
+            "update_available": False,
+            "latest_version": status.get("latest_version", self.current_version),
         }
 
     def check_for_updates(self, force=False):

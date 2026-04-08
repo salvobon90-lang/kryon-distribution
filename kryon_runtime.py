@@ -48,11 +48,13 @@ def ensure_runtime_subdir(name):
 
 def load_json(path, default=None):
     default = {} if default is None else default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+    for encoding in ("utf-8", "utf-8-sig"):
+        try:
+            with open(path, "r", encoding=encoding) as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return default
 
 
 def save_json(path, payload):

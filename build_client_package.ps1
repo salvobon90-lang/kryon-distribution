@@ -10,6 +10,19 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $DistRoot = Join-Path $Root "dist"
 $VersionSource = Join-Path $Root "kryon.pyw"
 
+function Set-AppVersionInFile {
+    param(
+        [string]$Path,
+        [string]$Version
+    )
+    if (-not (Test-Path $Path)) {
+        return
+    }
+    $content = Get-Content $Path -Raw
+    $content = [regex]::Replace($content, 'KRYON ULTIMATE PRO V [0-9.]+', "KRYON ULTIMATE PRO V $Version")
+    [System.IO.File]::WriteAllText($Path, $content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 if (-not $Version) {
     if (Test-Path $VersionSource) {
         $versionLine = Select-String -Path $VersionSource -Pattern 'VERSION\s*=\s*"KRYON ULTIMATE PRO V ([0-9.]+)"' | Select-Object -First 1
@@ -25,8 +38,9 @@ if (-not $Version) {
 
 $PackageName = "kryon-client-$PackageLabel-$Version"
 $PackageDir = Join-Path $DistRoot $PackageName
-$AssetsDir = Join-Path $PackageDir "immagini kryon"
-$RuntimeDir = Join-Path $PackageDir ".kryon_runtime"
+$AppDir = Join-Path $PackageDir "app"
+$AssetsDir = Join-Path $AppDir "immagini kryon"
+$RuntimeDir = Join-Path $AppDir ".kryon_runtime"
 $ZipPath = Join-Path $DistRoot ("$PackageName.zip")
 
 if (Test-Path $PackageDir) {
@@ -37,6 +51,7 @@ if (Test-Path $ZipPath) {
 }
 
 New-Item -ItemType Directory -Force -Path $PackageDir | Out-Null
+New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
 New-Item -ItemType Directory -Force -Path $AssetsDir | Out-Null
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
 
@@ -53,9 +68,12 @@ $files = @(
 foreach ($file in $files) {
     $src = Join-Path $Root $file
     if (Test-Path $src) {
-        Copy-Item $src -Destination (Join-Path $PackageDir $file) -Force
+        Copy-Item $src -Destination (Join-Path $AppDir $file) -Force
     }
 }
+
+Set-AppVersionInFile -Path (Join-Path $AppDir "kryon.pyw") -Version $Version
+Set-AppVersionInFile -Path (Join-Path $AppDir "bot_core.py") -Version $Version
 
 $imgRoot = Join-Path $Root "immagini kryon"
 if (Test-Path $imgRoot) {
@@ -76,15 +94,19 @@ $updateConfig = @{
     channel = $Channel
     auto_check = $true
     check_interval_hours = 6
+    require_latest_for_run = $true
+    strict_manifest_required = $true
 }
 
-$licenseConfig | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $RuntimeDir "license_config.json") -Encoding UTF8
-$updateConfig | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $RuntimeDir "update_config.json") -Encoding UTF8
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText((Join-Path $RuntimeDir "license_config.json"), ($licenseConfig | ConvertTo-Json -Depth 4), $utf8NoBom)
+[System.IO.File]::WriteAllText((Join-Path $RuntimeDir "update_config.json"), ($updateConfig | ConvertTo-Json -Depth 4), $utf8NoBom)
 
 $installScript = @'
 $ErrorActionPreference = "Stop"
 $BaseDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $BaseDir
+$AppDir = Join-Path $BaseDir "app"
 
 function Resolve-PythonCommand {
     if (Get-Command py -ErrorAction SilentlyContinue) {
@@ -103,20 +125,20 @@ if (-not (Test-Path ".venv")) {
 
 $venvPython = Join-Path $BaseDir ".venv\Scripts\python.exe"
 & $venvPython -m pip install --upgrade pip
-& $venvPython -m pip install -r (Join-Path $BaseDir "requirements-client.txt")
+& $venvPython -m pip install -r (Join-Path $AppDir "requirements-client.txt")
 
 Write-Host ""
 Write-Host "Installazione completata." -ForegroundColor Green
-Write-Host "Avvia ora il bot con: start_kryon.bat" -ForegroundColor Cyan
+Write-Host "Avvia ora il bot con: AVVIA_KRYON.bat" -ForegroundColor Cyan
 '@
 
 $startBat = @'
 @echo off
 cd /d "%~dp0"
 if exist ".venv\Scripts\pythonw.exe" (
-  start "" ".venv\Scripts\pythonw.exe" "kryon.pyw"
+  start "" ".venv\Scripts\pythonw.exe" "app\kryon.pyw"
 ) else (
-  echo Esegui prima install_client.ps1
+  echo Esegui prima INSTALLA_KRYON.bat
   pause
 )
 '@
@@ -125,9 +147,20 @@ $startConsoleBat = @'
 @echo off
 cd /d "%~dp0"
 if exist ".venv\Scripts\python.exe" (
-  ".venv\Scripts\python.exe" "kryon.pyw"
+  ".venv\Scripts\python.exe" "app\kryon.pyw"
 ) else (
-  echo Esegui prima install_client.ps1
+  echo Esegui prima INSTALLA_KRYON.bat
+  pause
+)
+'@
+
+$installBat = @'
+@echo off
+cd /d "%~dp0"
+powershell -ExecutionPolicy Bypass -File "%~dp0install_client.ps1"
+if errorlevel 1 (
+  echo.
+  echo Installazione non completata.
   pause
 )
 '@
@@ -137,29 +170,32 @@ $readme = @"
 
 ## Cosa contiene
 - Bot KRYON gia' configurato per licensing online e auto-update
-- Runtime cliente separato
-- Launcher rapido
+- Applicazione concentrata nella cartella `app`
+- Launcher semplici visibili in radice
 
 ## Installazione cliente
 1. Installare MetaTrader 5 sul PC cliente e fare login al broker.
 2. Estrarre tutta questa cartella in una posizione stabile, per esempio `C:\KRYON`.
-3. Fare clic destro su `install_client.ps1` e avviarlo con PowerShell.
-4. A fine installazione aprire `start_kryon.bat`.
+3. Fare doppio clic su `INSTALLA_KRYON.bat`.
+4. A fine installazione aprire `AVVIA_KRYON.bat`.
 5. Nel popup licenza inserire `email cliente + chiave cliente`.
+6. Se la licenza non e' attiva oppure se esiste una versione piu' nuova obbligatoria, il motore non partira'.
 
 ## File utili
-- `install_client.ps1`: crea ambiente Python e installa dipendenze
-- `start_kryon.bat`: avvio normale
-- `start_kryon_console.bat`: avvio con console debug
+- `INSTALLA_KRYON.bat`: installer semplice con doppio clic
+- `AVVIA_KRYON.bat`: avvio normale
+- `AVVIA_KRYON_CONSOLE.bat`: avvio con console debug
+- `app\`: contiene il motore del bot e il runtime tecnico
 
 ## Nota
 Questa build forza il controllo licenza anche se gira da sorgente, quindi il cliente non parte in `DEV MODE`.
 "@
 
-Set-Content -Path (Join-Path $PackageDir "install_client.ps1") -Value $installScript -Encoding UTF8
-Set-Content -Path (Join-Path $PackageDir "start_kryon.bat") -Value $startBat -Encoding ASCII
-Set-Content -Path (Join-Path $PackageDir "start_kryon_console.bat") -Value $startConsoleBat -Encoding ASCII
-Set-Content -Path (Join-Path $PackageDir "README_CLIENTE.md") -Value $readme -Encoding UTF8
+[System.IO.File]::WriteAllText((Join-Path $PackageDir "install_client.ps1"), $installScript, $utf8NoBom)
+Set-Content -Path (Join-Path $PackageDir "INSTALLA_KRYON.bat") -Value $installBat -Encoding ASCII
+Set-Content -Path (Join-Path $PackageDir "AVVIA_KRYON.bat") -Value $startBat -Encoding ASCII
+Set-Content -Path (Join-Path $PackageDir "AVVIA_KRYON_CONSOLE.bat") -Value $startConsoleBat -Encoding ASCII
+[System.IO.File]::WriteAllText((Join-Path $PackageDir "README_CLIENTE.md"), $readme, $utf8NoBom)
 
 Compress-Archive -Path (Join-Path $PackageDir "*") -DestinationPath $ZipPath -Force
 
