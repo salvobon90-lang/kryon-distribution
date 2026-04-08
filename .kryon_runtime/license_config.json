@@ -1,0 +1,8 @@
+{
+  "api_base_url": "https://kryon-licensing.kryonsubv2.workers.dev",
+  "activation_endpoint": "/api/license/activate",
+  "refresh_endpoint": "/api/license/refresh",
+  "grace_days": 5,
+  "force_packaged_mode": true,
+  "enforce_packaged_only": true
+}

@@ -1,0 +1,8 @@
+{
+  "manifest_url": "https://kryon-licensing.kryonsubv2.workers.dev/api/releases/latest",
+  "channel": "stable",
+  "auto_check": true,
+  "check_interval_hours": 6,
+  "require_latest_for_run": true,
+  "strict_manifest_required": true
+}
