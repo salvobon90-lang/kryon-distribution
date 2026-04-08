@@ -1,0 +1,68 @@
+===========================================================================
+      🛡️  KRYON : GUIDA ALL'INSTALLAZIONE   🛡️
+===========================================================================
+
+Questa cartella contiene tutto il necessario per attivare il tuo sistema 
+di trading ad alta frequenza. Segui i passaggi nell'ordine esatto.
+
+---------------------------------------------------------------------------
+1. COSA C'E' NELLA CARTELLA?
+---------------------------------------------------------------------------
+- python-3.12-amd64.exe  --> L'installer del motore (Python).
+- AVVIA_KRYON.bat        --> Il Launcher per installare le librerie.
+- kryon.exe              --> Il file per avviare il bot (Interfaccia).
+- bot_core.py            --> Il cervello matematico del cecchino.
+- immagini kryon/        --> La cartella con i loghi (NON spostarla).
+
+---------------------------------------------------------------------------
+2. STEP 1: PREPARARE IL "BRACCIO" (MetaTrader 5)
+---------------------------------------------------------------------------
+1. Installa MetaTrader 5 dal sito del tuo Broker.
+2. Accedi al tuo conto (Demo o Reale).
+3. IMPORTANTE: In alto su MT5, vai su:
+   Strumenti -> Opzioni -> scheda "Consiglieri Esperti".
+4. Spunta la casella: "Consenti il trading algoritmico".
+5. Il tasto "Algo Trading" in alto su MT5 deve essere VERDE.
+6. Lascia MT5 aperto in background.
+
+---------------------------------------------------------------------------
+3. STEP 2: INSTALLARE IL "MOTORE" (Python 3.12)
+---------------------------------------------------------------------------
+Avvia il file "python-3.12-amd64.exe" presente nella cartella.
+
+⚠️ ATTENZIONE: Questo e' il passaggio piu' importante! ⚠️
+
+1. Nella prima finestra, NON cliccare subito su Install.
+2. Guarda in basso e SPUNTA LA CASELLA: [X] Add Python to PATH.
+3. Spunta anche: [X] Use admin privileges when installing py.exe.
+4. Ora clicca sul tasto grande in alto: "Install Now".
+5. Attendi la fine e chiudi la finestra.
+
+Se dimentichi la spunta "Add Python to PATH", il bot non partira'.
+
+---------------------------------------------------------------------------
+4. STEP 3: SINCRONIZZARE LE "ARMI" (Il Launcher)
+---------------------------------------------------------------------------
+Ora dobbiamo scaricare le librerie matematiche (Pandas, Scikit-Learn, ecc.).
+1. Fai doppio clic sul file: AVVIA_KRYON.bat
+2. Si aprira' una finestra nera. NON CHIUDERLA.
+3. Il sistema scarichera' tutto in automatico (1-3 minuti).
+4. Alla fine, la finestra nera sparira' e si aprira' il bot.
+
+---------------------------------------------------------------------------
+5. STEP 4: OPERATIVITA' GIORNALIERA
+---------------------------------------------------------------------------
+Da questo momento, per usare il bot ti bastera':
+- Assicurarti che MT5 sia aperto.
+- Fare doppio clic su: kryon.exe
+
+---------------------------------------------------------------------------
+🆘 RISOLUZIONE ERRORI VELOCE
+---------------------------------------------------------------------------
+- Il bot non apre trade: Controlla il tasto "Algo Trading" su MT5 (Verde).
+- L'interfaccia e' senza logo: Non spostare la cartella "immagini kryon".
+- Messaggio "Module not found": Riavvia il file "AVVIA_KRYON.bat".
+
+===========================================================================
+                Powered by BONS Quantitative Engine ⚡
+===========================================================================

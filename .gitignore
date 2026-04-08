@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.kryon_runtime/
+dist/
+
+licensing_server/licenses.db
+licensing_server/__pycache__/
+
+cloudflare_worker/.wrangler/
+
+*.log

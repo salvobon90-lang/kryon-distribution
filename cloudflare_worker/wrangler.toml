@@ -1,0 +1,12 @@
+name = "kryon-licensing"
+main = "src/index.js"
+compatibility_date = "2026-04-08"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "kryon-licenses"
+database_id = "e8f58f97-0d83-461c-95ec-f20575a972d6"
+migrations_dir = "migrations"
+
+[vars]
+APP_NAME = "KRYON Licensing"

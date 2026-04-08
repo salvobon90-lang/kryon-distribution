@@ -1,0 +1,9 @@
+{
+  "channel": "stable",
+  "version": "15.3.0",
+  "download_url": "https://your-domain.example/releases/kryon-15.3.0.zip",
+  "sha256": "PUT_REAL_SHA256_HERE",
+  "notes": [
+    "Example release manifest for automatic update checks."
+  ]
+}
