@@ -16,7 +16,7 @@ from kryon_license import LicenseManager
 from kryon_update import UpdateManager
 from kryon_runtime import get_runtime_dir
 
-VERSION = "KRYON ULTIMATE PRO V 16.0.1"
+VERSION = "KRYON ULTIMATE PRO V 16.4.0"
 AUTHOR_BRAND = ""
 running = False
 
@@ -106,10 +106,18 @@ def start_bot():
         status_var.set("ENGINE: UPDATE BLOCK")
         status_label.config(fg=DANGER)
         return
-    bot_core.reset_session_tracking()
+    bot_core.start_session_tracking()
     running = True
     session_start_time = datetime.now()
     initial_balance = None
+    try:
+        session_closed_var.set("0.00 €")
+        session_wr_var.set("0.0%")
+        trade_count_var.set("0")
+        pnl_var.set("0.00 €")
+        engine_session_var.set("SESSIONE --:-- | MT5 --:--")
+    except Exception:
+        pass
     status_var.set("ENGINE: LIVE")
     status_label.config(fg=SUCCESS)
     log_event("SISTEMA ONLINE: ENGINE OPERATIVO.")
@@ -118,6 +126,15 @@ def start_bot():
 def stop_bot():
     global running
     running = False
+    bot_core.reset_session_tracking()
+    try:
+        session_closed_var.set("0.00 €")
+        session_wr_var.set("0.0%")
+        trade_count_var.set("0")
+        pnl_var.set("0.00 €")
+        engine_session_var.set("SESSIONE --:-- | MT5 --:--")
+    except Exception:
+        pass
     status_var.set("ENGINE: OFFLINE")
     status_label.config(fg=DANGER)
     log_event("SISTEMA OFFLINE.")
@@ -157,6 +174,28 @@ def toggle_crypto_mode():
         btn_crypto.change_style("🌐 CRYPTO: OFF", TEXT_DIM)
 
 
+def sync_runtime_switches_from_core():
+    global scalping_active, crypto_active
+    scalping_active = bool(getattr(bot_core, "scalping_enabled", False))
+    crypto_active = bool(getattr(bot_core, "crypto_enabled", False))
+    if scalping_active:
+        scalping_status_var.set("⚡ SCALPING: ON")
+        scalping_status_label.config(fg=SUCCESS)
+        btn_scalping.change_style("⚡ SCALPING: ON", BTN_GOLD)
+    else:
+        scalping_status_var.set("⚡ SCALPING: OFF")
+        scalping_status_label.config(fg=DANGER)
+        btn_scalping.change_style("⚡ SCALPING: OFF", TEXT_DIM)
+    if crypto_active:
+        crypto_mode_var.set("🌐 CRYPTO: ON")
+        crypto_mode_label.config(fg=SUCCESS)
+        btn_crypto.change_style("🌐 CRYPTO: ON", BTN_BLUE)
+    else:
+        crypto_mode_var.set("🌐 CRYPTO: OFF")
+        crypto_mode_label.config(fg=DANGER)
+        btn_crypto.change_style("🌐 CRYPTO: OFF", TEXT_DIM)
+
+
 def apply_optimizer_profile(profile_name):
     if not license_manager.get_runtime_status().get("run_allowed", False):
         log_error("Licenza non valida: optimizer bloccato.")
@@ -178,6 +217,25 @@ def refresh_optimizer_buttons():
             button.change_style(f"● {label}", color)
         else:
             button.change_style(label, TEXT_DIM)
+
+
+def _optimizer_guidance_colors(session_profit=None):
+    if session_profit is None:
+        return {"SAFE": BORDER_SOFT, "BALANCED": BORDER_SOFT, "ATTACK": BORDER_SOFT}
+    if session_profit < 0:
+        return {"SAFE": SUCCESS, "BALANCED": WARNING, "ATTACK": DANGER}
+    if session_profit <= 50.0:
+        return {"SAFE": WARNING, "BALANCED": SUCCESS, "ATTACK": WARNING}
+    return {"SAFE": DANGER, "BALANCED": SUCCESS, "ATTACK": SUCCESS}
+
+
+def refresh_optimizer_guidance_lights(session_profit=None):
+    labels = globals().get("optimizer_signal_labels", {})
+    if not labels:
+        return
+    colors = _optimizer_guidance_colors(session_profit)
+    for name, label in labels.items():
+        label.config(fg=colors.get(name, BORDER_SOFT))
 
 
 def log_event(msg):
@@ -706,6 +764,7 @@ tk.Label(scalp_box, text="CRYPTO", bg=CARD_BG, fg=TEXT_DIM, font=("Segoe UI Semi
 crypto_mode_var = tk.StringVar(value="🌐 CRYPTO: OFF")
 crypto_mode_label = tk.Label(scalp_box, textvariable=crypto_mode_var, font=("Segoe UI Semibold", 11), bg=CARD_BG, fg=DANGER)
 crypto_mode_label.pack(anchor="w", padx=10, pady=(2, 8))
+sync_runtime_switches_from_core()
 
 dist_box = tk.Frame(sidebar, bg=CARD_BG, highlightthickness=1, highlightbackground=BORDER_SOFT)
 dist_box.pack(fill="x", padx=18, pady=(0, 10))
@@ -783,98 +842,109 @@ tree.tag_configure("closed_mkt", foreground=DANGER)
 tree.tag_configure("neutral", foreground=INFO)
 tree.tag_configure("low_vol", foreground=BTN_GOLD)
 
-mod_control = make_card(workspace)
-mod_control.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
-add_title(mod_control, "CONTROL", "Modalita, drawdown e motore decisionale")
+top_right = tk.Frame(workspace, bg=BG_ALT)
+top_right.grid(row=0, column=1, sticky="nsew")
+top_right.grid_rowconfigure(0, weight=1)
+top_right.grid_columnconfigure(0, weight=1, uniform="top_right")
+top_right.grid_columnconfigure(1, weight=1, uniform="top_right")
 
-control_split = tk.Frame(mod_control, bg=CARD_BG)
-control_split.pack(fill="both", expand=True, padx=10, pady=(10, 10))
-control_split.grid_columnconfigure(0, weight=3)
-control_split.grid_columnconfigure(1, weight=4)
-control_split.grid_rowconfigure(0, weight=1)
+mod_portfolio = make_card(top_right)
+mod_portfolio.grid(row=0, column=0, sticky="nsew", padx=(5, 3), pady=5)
+add_title(mod_portfolio, "PORTFOLIO", "Conto live, sessione e optimizer")
 
-control_left = tk.Frame(control_split, bg=CARD_BG)
-control_left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-
-control_right = tk.Frame(control_split, bg=CARD_BG)
-control_right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-
-prop_grid = tk.Frame(control_left, bg=CARD_BG)
+prop_grid = tk.Frame(mod_portfolio, bg=CARD_BG)
 prop_grid.pack(fill="x", padx=10, pady=(10, 6))
+prop_grid.grid_columnconfigure(1, weight=1)
 
-ai_mode_var, eq_mode_var, opt_var, dd_var = tk.StringVar(value="---"), tk.StringVar(value="---"), tk.StringVar(value="BALANCED"), tk.StringVar(value="0.0%")
-wr_var, sig_var, exec_var = tk.StringVar(value="0.0% / 0.0%"), tk.StringVar(value="0 / 0"), tk.StringVar(value="0")
+balance_var = tk.StringVar(value="0.00 €")
+pnl_var = tk.StringVar(value="0.00 €")
+session_closed_var = tk.StringVar(value="0.00 €")
+session_wr_var = tk.StringVar(value="0.0%")
+trade_count_var = tk.StringVar(value="0")
 
-tk.Label(prop_grid, text="AI MODE:", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", pady=4)
-lbl_ai = tk.Label(prop_grid, textvariable=ai_mode_var, font=("Segoe UI", 11, "bold"), bg=CARD_BG)
-lbl_ai.grid(row=0, column=1, sticky="w", pady=2, padx=10)
+tk.Label(prop_grid, text="BALANCE:", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).grid(row=0, column=0, sticky="w", pady=4)
+lbl_balance_value = tk.Label(prop_grid, textvariable=balance_var, font=("Segoe UI", 11, "bold"), bg=CARD_BG, fg=TEXT_MAIN)
+lbl_balance_value.grid(row=0, column=1, sticky="e", pady=2, padx=10)
 
-tk.Label(prop_grid, text="EQUITY:", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).grid(row=1, column=0, sticky="w", pady=4)
-lbl_eq = tk.Label(prop_grid, textvariable=eq_mode_var, font=("Segoe UI", 11, "bold"), bg=CARD_BG)
-lbl_eq.grid(row=1, column=1, sticky="w", pady=2, padx=10)
+tk.Label(prop_grid, text="LIVE:", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).grid(row=1, column=0, sticky="w", pady=4)
+lbl_live_value = tk.Label(prop_grid, textvariable=pnl_var, font=("Segoe UI", 11, "bold"), bg=CARD_BG, fg=INFO)
+lbl_live_value.grid(row=1, column=1, sticky="e", pady=2, padx=10)
 
-tk.Label(prop_grid, text="PROFILE:", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).grid(row=2, column=0, sticky="w", pady=4)
-lbl_opt = tk.Label(prop_grid, textvariable=opt_var, font=("Segoe UI", 11, "bold"), bg=CARD_BG, fg=INFO)
-lbl_opt.grid(row=2, column=1, sticky="w", pady=2, padx=10)
+tk.Label(prop_grid, text="SESSION:", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).grid(row=2, column=0, sticky="w", pady=4)
+lbl_session_value = tk.Label(prop_grid, textvariable=session_closed_var, font=("Segoe UI", 11, "bold"), bg=CARD_BG, fg=INFO)
+lbl_session_value.grid(row=2, column=1, sticky="e", pady=2, padx=10)
 
-tk.Label(prop_grid, text="DRAWDOWN:", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).grid(row=3, column=0, sticky="w", pady=4)
-lbl_dd = tk.Label(prop_grid, textvariable=dd_var, font=("Segoe UI", 11, "bold"), bg=CARD_BG)
-lbl_dd.grid(row=3, column=1, sticky="w", pady=2, padx=10)
+tk.Label(prop_grid, text="WIN RATE TOTAL:", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).grid(row=3, column=0, sticky="w", pady=4)
+lbl_session_wr = tk.Label(prop_grid, textvariable=session_wr_var, font=("Segoe UI", 11, "bold"), fg=TEXT_MAIN, bg=CARD_BG)
+lbl_session_wr.grid(row=3, column=1, sticky="e", pady=2, padx=10)
 
-tk.Label(prop_grid, text="WINRATE S/A:", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).grid(row=4, column=0, sticky="w", pady=4)
-tk.Label(prop_grid, textvariable=wr_var, font=("Segoe UI", 11, "bold"), fg=TEXT_MAIN, bg=CARD_BG).grid(row=4, column=1, sticky="w", pady=2, padx=10)
+tk.Label(prop_grid, text="TRADE:", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).grid(row=4, column=0, sticky="w", pady=4)
+lbl_trade_count = tk.Label(prop_grid, textvariable=trade_count_var, font=("Segoe UI", 11, "bold"), fg=INFO, bg=CARD_BG)
+lbl_trade_count.grid(row=4, column=1, sticky="e", pady=2, padx=10)
 
-tk.Label(prop_grid, text="SIGNALS/FILT:", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).grid(row=5, column=0, sticky="w", pady=4)
-tk.Label(prop_grid, textvariable=sig_var, font=("Segoe UI", 11, "bold"), fg=TEXT_MAIN, bg=CARD_BG).grid(row=5, column=1, sticky="w", pady=2, padx=10)
-
-tk.Label(prop_grid, text="EXECUTED:", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).grid(row=6, column=0, sticky="w", pady=4)
-tk.Label(prop_grid, textvariable=exec_var, font=("Segoe UI", 11, "bold"), fg=INFO, bg=CARD_BG).grid(row=6, column=1, sticky="w", pady=2, padx=10)
-
-optimizer_bar = tk.Frame(control_left, bg=CARD_BG)
+optimizer_bar = tk.Frame(mod_portfolio, bg=CARD_BG)
 optimizer_bar.pack(fill="x", padx=10, pady=(0, 8))
 tk.Label(optimizer_bar, text="OPTIMIZER", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 8)).pack(anchor="w", pady=(0, 4))
 optimizer_buttons_wrap = tk.Frame(optimizer_bar, bg=CARD_BG)
 optimizer_buttons_wrap.pack(fill="x")
-optimizer_buttons = {
-    "SAFE": RoundedButton(optimizer_buttons_wrap, "🛡️ SAFE", TEXT_DIM, lambda: apply_optimizer_profile("SAFE"), 114, 34),
-    "BALANCED": RoundedButton(optimizer_buttons_wrap, "⚖️ BALANCED", BTN_BLUE, lambda: apply_optimizer_profile("BALANCED"), 146, 34),
-    "ATTACK": RoundedButton(optimizer_buttons_wrap, "🚀 ATTACK", TEXT_DIM, lambda: apply_optimizer_profile("ATTACK"), 120, 34),
-}
-optimizer_buttons["SAFE"].pack(side="left", padx=(0, 6))
-optimizer_buttons["BALANCED"].pack(side="left", padx=6)
-optimizer_buttons["ATTACK"].pack(side="left", padx=(6, 0))
+optimizer_buttons = {}
+optimizer_signal_labels = {}
+optimizer_specs = [
+    ("SAFE", "🛡️ SAFE", TEXT_DIM, 114),
+    ("BALANCED", "⚖️ BALANCED", BTN_BLUE, 146),
+    ("ATTACK", "🚀 ATTACK", TEXT_DIM, 120),
+]
+for idx, (name, label, color, width) in enumerate(optimizer_specs):
+    optimizer_buttons_wrap.grid_columnconfigure(idx, weight=1)
+    cell = tk.Frame(optimizer_buttons_wrap, bg=CARD_BG)
+    cell.grid(row=0, column=idx, padx=6 if idx else (0, 6), sticky="n")
+    button = RoundedButton(cell, label, color, lambda p=name: apply_optimizer_profile(p), width, 34)
+    button.pack()
+    signal = tk.Label(cell, text="●", fg=BORDER_SOFT, bg=CARD_BG, font=("Segoe UI Symbol", 13, "bold"))
+    signal.pack(pady=(4, 0))
+    optimizer_buttons[name] = button
+    optimizer_signal_labels[name] = signal
 refresh_optimizer_buttons()
+refresh_optimizer_guidance_lights()
 
-strategy_frame = tk.LabelFrame(
-    control_right,
-    text="STRATEGIES",
-    bg=CARD_BG,
-    fg=FG,
-    bd=0,
-    highlightthickness=1,
-    highlightbackground=BORDER_SOFT,
-)
+mod_strategies = make_card(top_right)
+mod_strategies.grid(row=0, column=1, sticky="nsew", padx=(3, 5), pady=5)
+add_title(mod_strategies, "STRATEGIES", "Live matrix sessione e stato branch")
+
+strategy_frame = tk.Frame(mod_strategies, bg=CARD_BG)
 strategy_frame.pack(fill="both", expand=True, padx=0, pady=0)
-strategy_overview_var = tk.StringVar(value="Assets 0 | Branch 0 | Active 0 | Live 0 | Positive 0 | Net 0.0€")
+strategy_overview_var = tk.StringVar(value="Assets 0 | Branch 0 | Active 0 | Open 0 | Live 0.0€ | Session 0.0€")
 strategy_overview = tk.Frame(strategy_frame, bg=CARD_BG)
 strategy_overview.pack(fill="x", padx=6, pady=(6, 0))
 tk.Label(strategy_overview, text="LIVE MATRIX", bg=CARD_BG, fg=FG, font=("Segoe UI Semibold", 8)).pack(side="left")
 tk.Label(strategy_overview, textvariable=strategy_overview_var, bg=CARD_BG, fg=TEXT_DIM, font=("Segoe UI", 8)).pack(side="right")
 
-strategy_summary = ttk.Treeview(strategy_frame, columns=("Branch", "State", "Block", "Net", "WR", "Trd"), show="headings", height=9)
-for col in ("Branch", "State", "Block", "Net", "WR", "Trd"):
+strategy_summary_wrap = tk.Frame(strategy_frame, bg=CARD_BG)
+strategy_summary_wrap.pack(fill="x", padx=6, pady=(4, 4))
+strategy_summary = ttk.Treeview(strategy_summary_wrap, columns=("Branch", "State", "Block", "Live", "Open", "Net", "WR", "Trd"), show="headings", height=12)
+for col in ("Branch", "State", "Block", "Live", "Open", "Net", "WR", "Trd"):
     strategy_summary.heading(col, text=col, anchor="center")
-strategy_summary.column("Branch", width=126, minwidth=118, stretch=True, anchor="w")
-strategy_summary.column("State", width=68, minwidth=64, stretch=False, anchor="center")
-strategy_summary.column("Block", width=118, minwidth=106, stretch=False, anchor="center")
-strategy_summary.column("Net", width=74, minwidth=68, stretch=False, anchor="e")
-strategy_summary.column("WR", width=56, minwidth=52, stretch=False, anchor="e")
+strategy_summary.heading("Live", text="Live", anchor="center")
+strategy_summary.heading("Open", text="Open", anchor="center")
+strategy_summary.heading("Net", text="Sess Net", anchor="center")
+strategy_summary.heading("WR", text="Sess WR", anchor="center")
+strategy_summary.heading("Trd", text="Sess Trd", anchor="center")
+strategy_summary.column("Branch", width=108, minwidth=98, stretch=True, anchor="w")
+strategy_summary.column("State", width=64, minwidth=60, stretch=False, anchor="center")
+strategy_summary.column("Block", width=98, minwidth=90, stretch=False, anchor="center")
+strategy_summary.column("Live", width=62, minwidth=56, stretch=False, anchor="e")
+strategy_summary.column("Open", width=42, minwidth=38, stretch=False, anchor="center")
+strategy_summary.column("Net", width=64, minwidth=58, stretch=False, anchor="e")
+strategy_summary.column("WR", width=52, minwidth=48, stretch=False, anchor="e")
 strategy_summary.column("Trd", width=46, minwidth=42, stretch=False, anchor="center")
 strategy_summary.tag_configure("active", foreground=SUCCESS)
 strategy_summary.tag_configure("standby", foreground=INFO)
 strategy_summary.tag_configure("locked", foreground=DANGER)
 strategy_summary.tag_configure("weak", foreground=WARNING)
-strategy_summary.pack(fill="x", padx=6, pady=(4, 4))
+strategy_summary_scroll = ttk.Scrollbar(strategy_summary_wrap, orient="vertical", command=strategy_summary.yview)
+strategy_summary.configure(yscrollcommand=strategy_summary_scroll.set)
+strategy_summary.pack(side="left", fill="x", expand=True)
+strategy_summary_scroll.pack(side="right", fill="y", padx=(4, 0))
 
 strategy_divider = tk.Frame(strategy_frame, bg=BORDER_SOFT, height=1)
 strategy_divider.pack(fill="x", padx=6, pady=(0, 2))
@@ -899,50 +969,34 @@ mod_positions = make_card(workspace)
 mod_positions.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
 add_title(mod_positions, "POSITIONS", "Trade aperti, direzione e cluster")
 
-monitor_tree = ttk.Treeview(mod_positions, columns=("Asset", "Dir", "Time", "Profit", "Info"), show="headings")
+monitor_tree = ttk.Treeview(mod_positions, columns=("Asset", "Dir", "Time", "Profit", "Prob", "Info"), show="headings")
 pos_scroll = ttk.Scrollbar(mod_positions, orient="vertical", command=monitor_tree.yview)
 monitor_tree.configure(yscrollcommand=pos_scroll.set)
 pos_scroll.pack(side="right", fill="y")
 monitor_tree.pack(fill="both", expand=True, padx=5, pady=5)
-for col in ("Asset", "Dir", "Time", "Profit", "Info"):
+for col in ("Asset", "Dir", "Time", "Profit", "Prob", "Info"):
     monitor_tree.heading(col, text=col)
 monitor_tree.column("Asset", width=78, minwidth=70, stretch=False, anchor="center")
 monitor_tree.column("Dir", width=86, minwidth=80, stretch=False, anchor="center")
 monitor_tree.column("Time", width=88, minwidth=80, stretch=False, anchor="center")
 monitor_tree.column("Profit", width=90, minwidth=84, stretch=False, anchor="e")
-monitor_tree.column("Info", width=150, minwidth=120, stretch=True, anchor="w")
+monitor_tree.column("Prob", width=72, minwidth=66, stretch=False, anchor="center")
+monitor_tree.column("Info", width=170, minwidth=140, stretch=True, anchor="w")
 monitor_tree.tag_configure("profit", foreground=SUCCESS)
 monitor_tree.tag_configure("loss", foreground=DANGER)
 
 mod_telemetry = make_card(workspace)
 mod_telemetry.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
-add_title(mod_telemetry, "PORTFOLIO", "Saldo, sessione chiusa e live map estesa")
+add_title(mod_telemetry, "LIVE MAP", "Radar rapido degli asset")
 
-dash_top = tk.Frame(mod_telemetry, bg=CARD_BG)
-dash_top.pack(fill="x", padx=5, pady=5)
+live_map_body = tk.Frame(mod_telemetry, bg=CARD_BG)
+live_map_body.pack(fill="both", expand=True, padx=5, pady=5)
 
-balance_var, pnl_var = tk.StringVar(), tk.StringVar()
-tk.Label(dash_top, text="BAL ", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).pack(side="left")
-tk.Label(dash_top, textvariable=balance_var, fg=TEXT_MAIN, bg=CARD_BG, font=("Segoe UI Semibold", 12)).pack(side="left", padx=(0, 15))
-tk.Label(dash_top, text="LIVE ", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI Semibold", 10)).pack(side="left")
-lbl_pnl = tk.Label(dash_top, textvariable=pnl_var, bg=CARD_BG, font=("Segoe UI", 12, "bold"))
-lbl_pnl.pack(side="left")
-
-session_frame = tk.Frame(dash_top, bg=CARD_BG)
-session_frame.pack(side="right")
-session_pnl_var = tk.StringVar(value="Session 0.0€ | WR Tot 0.0% | Trd 0")
-lbl_sess_pnl = tk.Label(session_frame, textvariable=session_pnl_var, bg=CARD_BG, font=("Segoe UI", 10, "bold"), fg=INFO)
-lbl_sess_pnl.pack(side="right", padx=5)
-
-heat_frame = tk.LabelFrame(mod_telemetry, text="LIVE MAP", bg=CARD_BG, fg=FG, bd=0, highlightthickness=1, highlightbackground=BORDER_SOFT)
-heat_frame.pack(fill="both", expand=True, padx=5, pady=5)
-heat_frame.configure(height=168)
-heat_frame.pack_propagate(False)
-
-live_map_grid = tk.Frame(heat_frame, bg=CARD_BG)
+live_map_grid = tk.Frame(live_map_body, bg=CARD_BG)
 live_map_grid.pack(fill="both", expand=True, padx=4, pady=4)
-for _col in range(3):
+for _col in range(5):
     live_map_grid.grid_columnconfigure(_col, weight=1, uniform="live_map")
+live_map_tiles = {}
 
 mod_log = make_card(workspace)
 mod_log.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
@@ -1009,43 +1063,49 @@ style_text_widget(error_box, ERR_BG, ERR_FG)
 # UPDATERS UI
 # ==============================================================================
 def update_prop_panel():
-    if running:
-        data = bot_core.get_decision_data()
-        if data:
-            ai_mode_var.set(data.get("ai_mode", "---"))
-            eq_mode_var.set(data.get("equity_mode", "---"))
-            opt_var.set(data.get("optimizer_profile", "BALANCED"))
-            dd_var.set(f"{data.get('drawdown', 0.0)}%")
-            wr_var.set(f"{data.get('winrate', 0.0)}% / {data.get('total_winrate', 0.0)}%")
-            sig_var.set(f"{data.get('signals', 0)} / {data.get('filtered', 0)}")
-            exec_var.set(str(data.get('executed', 0)))
+    data = bot_core.get_decision_data()
+    if data:
+        refresh_optimizer_buttons()
 
-            lbl_ai.config(fg=SUCCESS if data.get("ai_mode") == "AGGRESSIVE" else WARNING)
-            lbl_eq.config(fg=SUCCESS if data.get("equity_mode") == "AGGRESSIVE" else DANGER)
-            lbl_dd.config(fg=SUCCESS if data.get("drawdown", 0) < 3 else DANGER)
-            lbl_opt.config(fg=INFO if data.get("optimizer_profile") == "BALANCED" else (SUCCESS if data.get("optimizer_profile") == "SAFE" else BTN_ORANGE))
-            refresh_optimizer_buttons()
+        sess_closed = float(data.get("session_closed_profit", 0.0) or 0.0)
+        closed_num = int(data.get("closed_trades", 0) or 0)
+        session_wr = float(data.get("winrate", 0.0) or 0.0)
+        session_start_lbl = data.get("session_started_at_label", "--:--")
+        balance_var.set(f"{float(data.get('balance', 0.0) or 0.0):.2f} €")
+        session_closed_var.set(f"{sess_closed:.2f} €")
+        session_wr_var.set(f"{session_wr:.1f}%")
+        trade_count_var.set(str(closed_num))
+        lbl_session_value.config(fg=SUCCESS if sess_closed >= 0 else DANGER)
+        if session_wr >= 55:
+            lbl_session_wr.config(fg=SUCCESS)
+        elif session_wr >= 45:
+            lbl_session_wr.config(fg=WARNING)
+        else:
+            lbl_session_wr.config(fg=DANGER)
+        lbl_trade_count.config(fg=INFO if closed_num > 0 else TEXT_DIM)
+        engine_session_var.set(f"SESSIONE {session_start_lbl}")
+        refresh_optimizer_guidance_lights(sess_closed)
 
-            sess_closed = data.get("session_closed_profit", 0)
-            closed_num = data.get("closed_trades", 0)
-            session_start_lbl = data.get("session_started_at_label", "--:--")
-            session_pnl_var.set(
-                f"Session {sess_closed}€ | WR Tot {data.get('total_winrate', 0.0)}% | Trd {closed_num}"
-            )
-            lbl_sess_pnl.config(fg=SUCCESS if sess_closed >= 0 else DANGER)
-            engine_session_var.set(f"SESSIONE {session_start_lbl}")
-
-            if mt5.terminal_info():
-                acc = mt5.account_info()
-                if acc:
-                    balance_var.set(f"{round(acc.balance, 2)} €")
-                    pnl = acc.equity - acc.balance
-                    pnl_var.set(f"{round(pnl, 2)} €")
-                    lbl_pnl.config(fg=SUCCESS if pnl >= 0 else DANGER)
+        if mt5.terminal_info():
+            acc = mt5.account_info()
+            if acc:
+                balance_var.set(f"{round(acc.balance, 2):.2f} €")
+        live_pnl = float(data.get("session_open_pnl", 0.0) or 0.0)
+        pnl_var.set(f"{live_pnl:.2f} €")
+        lbl_live_value.config(fg=SUCCESS if live_pnl >= 0 else DANGER)
     root.after(1000, update_prop_panel)
 
 
 def update_strategy_panel():
+    try:
+        summary_scroll_pos = strategy_summary.yview()[0]
+    except Exception:
+        summary_scroll_pos = 0.0
+    try:
+        detail_scroll_pos = strategy_canvas.yview()[0]
+    except Exception:
+        detail_scroll_pos = 0.0
+
     for widget in strategy_list.winfo_children():
         widget.destroy()
 
@@ -1055,21 +1115,21 @@ def update_strategy_panel():
         strategies,
         key=lambda s: (
             0 if s["status"] == "ACTIVE" else 1 if s["status"] == "STANDBY" else 2,
-            -float(s.get("net_profit", 0.0)),
+            -float(s.get("total_net_profit", 0.0)),
             s["name"],
         ),
     )
-    strategy_summary.configure(height=min(max(len(strategies), 8), 14))
+    strategy_summary.configure(height=min(max(len(strategies), 10), 16))
 
     asset_count = len({s.get("family", "---") for s in strategies})
     strategy_count = len(strategies)
     active_count = len([s for s in strategies if s["status"] == "ACTIVE"])
-    live_count = len([s for s in strategies if s.get("live_block") in ("LIVE", "READY")])
-    positive_count = len([s for s in strategies if s.get("net_profit", 0.0) > 0])
-    net_total = round(sum(s.get("net_profit", 0.0) for s in strategies), 2)
-    best_branch = max(strategies, key=lambda s: s.get("net_profit", 0.0))["name"] if strategies else "---"
+    open_count = sum(int(s.get("open_positions", 0) or 0) for s in strategies)
+    live_total = round(sum(float(s.get("live_pnl", 0.0) or 0.0) for s in strategies), 2)
+    session_total = round(sum(float(s.get("session_net_profit", 0.0) or 0.0) for s in strategies), 2)
+    best_branch = max(strategies, key=lambda s: s.get("total_net_profit", 0.0))["name"] if strategies else "---"
     strategy_overview_var.set(
-        f"Assets {asset_count} | Branch {strategy_count} | Active {active_count} | Live {live_count} | Positive {positive_count} | Net {net_total}€ | Best {best_branch}"
+        f"Assets {asset_count} | Branch {strategy_count} | Active {active_count} | Open {open_count} | Live {live_total}€ | Session {session_total}€ | Best {best_branch}"
     )
 
     for strategy in strategies:
@@ -1077,7 +1137,7 @@ def update_strategy_panel():
             row_tag = "locked"
         elif strategy["status"] == "STANDBY":
             row_tag = "standby"
-        elif strategy.get("net_profit", 0.0) < 0:
+        elif strategy.get("total_net_profit", 0.0) < 0:
             row_tag = "weak"
         else:
             row_tag = "active"
@@ -1088,6 +1148,8 @@ def update_strategy_panel():
                 strategy["name"],
                 strategy["status"],
                 str(strategy.get("live_block", "INIT"))[:12],
+                f"{strategy.get('live_pnl', 0.0)}€",
+                strategy.get("open_positions", 0),
                 f"{strategy['net_profit']}€",
                 f"{strategy['winrate']}%",
                 strategy["closed"],
@@ -1137,6 +1199,7 @@ def update_strategy_panel():
             fg=TEXT_SOFT,
             font=("Segoe UI", 8),
         ).pack(anchor="w")
+
         tk.Label(
             matrix,
             text=f"BE {strategy['be_trigger']}% | Trail {strategy['trail']}",
@@ -1172,8 +1235,9 @@ def update_strategy_panel():
         stats.pack(fill="x", padx=10, pady=(0, 8))
         tk.Label(stats, text=f"WR {strategy['winrate']}%", bg=CARD_BG_2, fg=SUCCESS if strategy["winrate"] >= 50 else WARNING, font=("Segoe UI Semibold", 9)).pack(side="left")
         tk.Label(stats, text=f"PF {strategy['profit_factor']}", bg=CARD_BG_2, fg=INFO, font=("Segoe UI Semibold", 9)).pack(side="left", padx=(12, 0))
-        tk.Label(stats, text=f"Net {strategy['net_profit']}€", bg=CARD_BG_2, fg=SUCCESS if strategy["net_profit"] >= 0 else DANGER, font=("Segoe UI Semibold", 9)).pack(side="left", padx=(12, 0))
-        tk.Label(stats, text=f"{strategy['closed']} trd", bg=CARD_BG_2, fg=TEXT_SOFT, font=("Segoe UI", 9)).pack(side="right")
+        tk.Label(stats, text=f"Live {strategy.get('live_pnl', 0.0)}€", bg=CARD_BG_2, fg=SUCCESS if strategy.get("live_pnl", 0.0) >= 0 else DANGER, font=("Segoe UI Semibold", 9)).pack(side="left", padx=(12, 0))
+        tk.Label(stats, text=f"Sess {strategy['net_profit']}€", bg=CARD_BG_2, fg=SUCCESS if strategy["net_profit"] >= 0 else DANGER, font=("Segoe UI Semibold", 9)).pack(side="left", padx=(12, 0))
+        tk.Label(stats, text=f"{strategy.get('open_positions', 0)} open | {strategy['closed']} cls", bg=CARD_BG_2, fg=TEXT_SOFT, font=("Segoe UI", 9)).pack(side="right")
 
         live_box = tk.Frame(card, bg=CARD_BG, highlightthickness=1, highlightbackground=BORDER_SOFT)
         live_box.pack(fill="x", padx=10, pady=(0, 8))
@@ -1217,6 +1281,15 @@ def update_strategy_panel():
             anchor="w",
             justify="left",
         ).pack(fill="x", padx=8, pady=(0, 6))
+        tk.Label(
+            live_box,
+            text=f"Last close: {strategy.get('last_close_symbol', '---')} @ {strategy.get('last_close_time', '---')} | {strategy.get('last_close_reason', '---')}",
+            bg=CARD_BG,
+            fg=TEXT_DIM if strategy.get("last_close_time", "---") == "---" else INFO,
+            font=("Segoe UI", 8),
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", padx=8, pady=(0, 6))
 
         if strategy["disabled_reason"]:
             tk.Label(
@@ -1228,6 +1301,11 @@ def update_strategy_panel():
                 anchor="w",
                 justify="left",
             ).pack(fill="x", padx=10, pady=(0, 8))
+
+    strategy_summary.update_idletasks()
+    strategy_list.update_idletasks()
+    strategy_summary.yview_moveto(summary_scroll_pos)
+    strategy_canvas.yview_moveto(detail_scroll_pos)
 
     root.after(1500, update_strategy_panel)
 
@@ -1253,50 +1331,91 @@ def update_debug_panel():
 
 
 def update_telemetry():
-    if running:
-        for widget in live_map_grid.winfo_children():
-            widget.destroy()
-        active_symbols = list(getattr(bot_core, "symbols", []) or list(bot_core.radar_state.keys()))
-        columns = 3
-        rows = max(1, (len(active_symbols) + columns - 1) // columns)
-        for row_idx in range(rows):
-            live_map_grid.grid_rowconfigure(row_idx, weight=1, uniform="live_map_row")
+    symbol_pool = [bot_core.PRIMARY_SYMBOL, *bot_core.SECONDARY_SYMBOLS, *bot_core.CRYPTO_SYMBOLS]
+    active_symbols = []
+    for base_symbol in symbol_pool:
+        resolved = bot_core.resolve_broker_symbol(base_symbol)
+        if resolved not in active_symbols:
+            active_symbols.append(resolved)
 
-        for idx, s in enumerate(active_symbols):
-            row_idx, col_idx = divmod(idx, columns)
-            state = bot_core.radar_state.get(s, {})
-            sig = state.get("sig", "NEUTRAL")
-            conf = state.get("conf", 0)
-            status = str(state.get("status", "INIT"))
-            if sig == "BUY":
-                color = SUCCESS
-            elif sig == "SELL":
-                color = DANGER
-            elif "OUT" in status or "NO DATA" in status or "CHAOS" in status:
-                color = "#6b3340"
-            elif "WAIT" in sig or "REGIME" in status or "M15" in status:
-                color = WARNING
-            else:
-                color = TEXT_DIM
-            short_status = status[:16]
-            heat_text = f"{s}\n{sig} {conf}%\n{short_status}"
-            tk.Label(
+    columns = 5 if len(active_symbols) >= 12 else 4 if len(active_symbols) >= 9 else 3
+    rows = max(1, (len(active_symbols) + columns - 1) // columns)
+
+    for col_idx in range(5):
+        live_map_grid.grid_columnconfigure(col_idx, weight=(1 if col_idx < columns else 0), uniform="live_map")
+    for row_idx in range(rows):
+        live_map_grid.grid_rowconfigure(row_idx, weight=1, uniform="live_map_row", minsize=46)
+
+    stale = [sym for sym in live_map_tiles.keys() if sym not in active_symbols]
+    for sym in stale:
+        tile = live_map_tiles.pop(sym, None)
+        if tile:
+            tile["frame"].destroy()
+
+    for idx, s in enumerate(active_symbols):
+        row_idx, col_idx = divmod(idx, columns)
+        state = bot_core.radar_state.get(s, {})
+        sig = state.get("sig", "NEUTRAL")
+        conf = state.get("conf", 0)
+        status = str(state.get("status", "INIT"))
+        if sig == "BUY":
+            color = SUCCESS
+        elif sig == "SELL":
+            color = DANGER
+        elif "OUT" in status or "NO DATA" in status or "CHAOS" in status:
+            color = "#6b3340"
+        elif "WAIT" in sig or "REGIME" in status or "M15" in status:
+            color = WARNING
+        else:
+            color = TEXT_DIM
+
+        compact_status = status.replace("_", " ").strip() or "INIT"
+        if len(compact_status) > 22:
+            compact_status = compact_status[:21] + "…"
+        header_text = s
+        status_text = f"{sig} {conf}% | {compact_status}"
+
+        tile = live_map_tiles.get(s)
+        if tile is None:
+            frame = tk.Frame(
                 live_map_grid,
-                text=heat_text,
+                bg=color,
+                highlightthickness=1,
+                highlightbackground=BORDER_SOFT,
+            )
+            header_lbl = tk.Label(
+                frame,
+                text=header_text,
                 bg=color,
                 fg=TEXT_MAIN,
-                font=("Segoe UI", 8, "bold"),
-                justify="center",
+                font=("Segoe UI Semibold", 8),
                 anchor="center",
-                padx=6,
-                pady=8,
-            ).grid(
-                row=row_idx,
-                column=col_idx,
-                sticky="nsew",
-                padx=3,
-                pady=3,
+                justify="center",
             )
+            header_lbl.pack(fill="x", padx=4, pady=(4, 0))
+            status_lbl = tk.Label(
+                frame,
+                text=status_text,
+                bg=color,
+                fg=TEXT_MAIN,
+                font=("Segoe UI", 7),
+                anchor="center",
+                justify="center",
+            )
+            status_lbl.pack(fill="x", padx=4, pady=(0, 4))
+            tile = {"frame": frame, "header": header_lbl, "status": status_lbl}
+            live_map_tiles[s] = tile
+
+        tile["frame"].configure(bg=color, highlightbackground=BORDER_SOFT)
+        tile["header"].configure(text=header_text, bg=color, fg=TEXT_MAIN)
+        tile["status"].configure(text=status_text, bg=color, fg=TEXT_MAIN)
+        tile["frame"].grid(
+            row=row_idx,
+            column=col_idx,
+            sticky="nsew",
+            padx=2,
+            pady=2,
+        )
 
     root.after(1500, update_telemetry)
 
@@ -1352,6 +1471,10 @@ def update_analysis():
 def update_positions():
     if running and mt5.terminal_info():
         pos = mt5.positions_get()
+        strategy_rows = {
+            row.get("name"): row
+            for row in bot_core.get_strategy_dashboard()
+        }
         monitor_tree.delete(*monitor_tree.get_children())
         if pos:
             now_ts = time.time()
@@ -1362,8 +1485,23 @@ def update_positions():
                 duration = format_duration(now_ts - p.time)
                 profit_str = f"{round(p.profit, 2)} €"
                 p_tag = "profit" if p.profit >= 0 else "loss"
-                info_text = p.comment.split("_")[-1] if "_" in p.comment else "Cluster"
-                monitor_tree.insert("", "end", values=(p.symbol, direction, duration, profit_str, info_text), tags=(p_tag,))
+                strategy_tag = bot_core.position_strategy_map.get(getattr(p, "ticket", None)) or bot_core.extract_strategy_tag(getattr(p, "comment", "") or "")
+                strategy_cfg = bot_core.get_strategy_by_tag(strategy_tag) if strategy_tag else None
+                strategy_row = strategy_rows.get(strategy_cfg["name"]) if strategy_cfg else None
+                prob_value = float(strategy_row.get("probability", 0.0) or 0.0) if strategy_row else 0.0
+                prob_mode = str(strategy_row.get("probability_mode", "OFF")) if strategy_row else "OFF"
+                prob_text = f"{prob_value:.1f}%"
+                if prob_mode == "SHADOW":
+                    prob_text += "*"
+                info_parts = []
+                if strategy_tag:
+                    info_parts.append(strategy_tag)
+                if strategy_row and strategy_row.get("probability_reason") not in ("---", "", None):
+                    info_parts.append(str(strategy_row.get("probability_reason")))
+                if not info_parts:
+                    info_parts.append(p.comment.split("_")[-1] if "_" in p.comment else "Cluster")
+                info_text = " | ".join(info_parts)
+                monitor_tree.insert("", "end", values=(p.symbol, direction, duration, profit_str, prob_text, info_text), tags=(p_tag,))
     root.after(2000, update_positions)
 
 

@@ -4,7 +4,7 @@ import numpy as np
 import time
 import os
 import json
-import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import threading
 import warnings
@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ==============================================================================
-# CONFIGURAZIONE (KRYON ULTIMATE PRO V 16.0.1 - OPEN STRATEGY GOVERNANCE + TITANYX + SIGNAL PRIORITY)
+# CONFIGURAZIONE (KRYON ULTIMATE PRO V 16.4.0 - PROBABILITY ENGINE)
 # ==============================================================================
 PROFIT_MODE = True
 PRIMARY_SYMBOL = "XAUUSD"
@@ -26,19 +26,31 @@ symbols = symbols_list.copy()
 
 TIMEFRAME_MAIN = mt5.TIMEFRAME_M5
 MAX_UNIQUE_SYMBOLS = 13
-MAX_CLUSTERS_PER_SYMBOL = 3
-SYMBOL_CLUSTER_CAPS = {"USTECH": 4, "GER40": 4}
+MAX_CLUSTERS_PER_SYMBOL = 4
+SYMBOL_CLUSTER_CAPS = {"USTECH": 4, "GER40": 4, "US500": 4, "XAUUSD": 4, "BTCUSD": 4}
 
-MAX_NEW_TRADES_PER_CYCLE = 2
-MAX_TRADES_PER_CYCLE = 5
-RISK_PER_TRADE_PERCENT = 0.5
-MAX_TOTAL_RISK = 0.08
+MAX_NEW_TRADES_PER_CYCLE = 4
+MAX_TRADES_PER_CYCLE = 8
+MAX_PARALLEL_SYMBOL_SCANS = MAX_UNIQUE_SYMBOLS
+MAX_COMPATIBLE_STRATEGIES_PER_SYMBOL = 2
+RISK_PER_TRADE_PERCENT = 0.65
+MAX_TOTAL_RISK = 0.11
 CURRENT_OPTIMIZER_PROFILE = "BALANCED"
+STRESS_TEST_ACTIVE = True
+USE_FULL_SYMBOL_SCAN_PARALLELISM = True
+USE_FULL_STRATEGY_EVAL_PARALLELISM = True
+MAX_PARALLEL_STRATEGY_EVAL = 10
+PROBABILITY_ENGINE_ENABLED = True
+PROBABILITY_MIN_THRESHOLD = 44.0
+PROBABILITY_HARD_THRESHOLD = 38.0
+PROBABILITY_CONFIRM_CYCLES = 3
+PROBABILITY_MIN_AGE_SEC = 75
+PROBABILITY_RECHECK_SEC = 3.0
 
 OPTIMIZER_PROFILES = {
-    "SAFE": {"risk_per_trade_percent": 0.30, "max_total_risk": 0.05, "max_trades_per_cycle": 3},
-    "BALANCED": {"risk_per_trade_percent": 0.50, "max_total_risk": 0.08, "max_trades_per_cycle": 5},
-    "ATTACK": {"risk_per_trade_percent": 0.75, "max_total_risk": 0.12, "max_trades_per_cycle": 7},
+    "SAFE": {"risk_per_trade_percent": 0.40, "max_total_risk": 0.07, "max_trades_per_cycle": 4},
+    "BALANCED": {"risk_per_trade_percent": 0.65, "max_total_risk": 0.11, "max_trades_per_cycle": 8},
+    "ATTACK": {"risk_per_trade_percent": 0.90, "max_total_risk": 0.15, "max_trades_per_cycle": 10},
 }
 
 ASSET_WEIGHTS = {
@@ -118,6 +130,9 @@ crypto_enabled = False
 scalping_enabled = False
 
 mt5_lock = threading.Lock()
+strategy_runtime_lock = threading.Lock()
+liquidity_sniper_cycle_lock = threading.Lock()
+history_state_lock = threading.RLock()
 
 performance_memory = {"wins": 0, "losses": 0}
 strategy_stats = {}
@@ -129,11 +144,19 @@ session_decision_stats = {"signals": 0, "filtered": 0, "executed": 0}
 session_started_at = datetime.now()
 session_broker_started_at = None
 session_balance_start = None
+session_active = False
+session_baseline_ready = False
+session_runtime_id = session_started_at.strftime("%Y%m%d%H%M%S%f")
+session_trade_ledger = []
+portfolio_snapshot = {}
+strategy_matrix_snapshot = []
+session_ignored_position_ids = set()
 equity_peak = 0.0
 equity_mode = "NORMAL"
 ai_mode = "STABLE"
 
 SESSION_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kryon_session_state.json")
+RUNTIME_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kryon_runtime_state.json")
 
 processed_deals = set()
 trade_memory = {}
@@ -141,6 +164,7 @@ position_strategy_map = {}
 resolved_symbol_map = {}
 liquidity_sniper_cycle_symbols = []
 titanyx_week_state = {"week": None, "balance": None}
+luke_reentry_state = {}
 liquidity_sniper_day_state = {
     "day": None,
     "total_trades": 0,
@@ -304,6 +328,12 @@ def register_strategy(
             "live_block": "INIT",
             "pretrigger": "---",
             "last_tp_plan": "---",
+            "probability": 0.0,
+            "probability_reason": "---",
+            "probability_mode": "OFF",
+            "probability_threshold": PROBABILITY_MIN_THRESHOLD,
+            "probability_symbol": "---",
+            "probability_time": None,
         },
     )
 
@@ -428,6 +458,24 @@ def extract_leg_index(comment):
         return None
 
 
+def extract_strategy_tag(comment):
+    if not comment:
+        return None
+    text = str(comment).strip()
+    if not text:
+        return None
+    if "[" in text:
+        text = text.split("[", 1)[0].strip()
+    if "_TP" in text:
+        text = text.rsplit("_TP", 1)[0]
+    elif "_" in text:
+        text = text.rsplit("_", 1)[0]
+    candidate = TAG_ALIASES.get(text, text)
+    if any(strategy.get("tag") == candidate for strategy in STRATEGIES):
+        return candidate
+    return None
+
+
 def compute_profit_factor(stats):
     gross_loss = abs(stats.get("gross_loss", 0.0))
     if gross_loss == 0:
@@ -451,8 +499,32 @@ def _blank_strategy_stats():
     return {strategy["name"]: _blank_stats_row() for strategy in STRATEGIES}
 
 
+def _new_session_runtime_id():
+    return datetime.now().strftime("%Y%m%d%H%M%S%f")
+
+
 def _deal_ticket(deal):
     return getattr(deal, "ticket", None) or getattr(deal, "deal", None)
+
+
+REALIZED_EXIT_DEAL_ENTRIES = {
+    entry
+    for entry in (
+        getattr(mt5, "DEAL_ENTRY_OUT", None),
+        getattr(mt5, "DEAL_ENTRY_OUT_BY", None),
+        getattr(mt5, "DEAL_ENTRY_INOUT", None),
+    )
+    if entry is not None
+}
+
+
+def _is_realized_exit_deal(deal):
+    entry = getattr(deal, "entry", None)
+    if entry not in REALIZED_EXIT_DEAL_ENTRIES:
+        return False
+    if entry == getattr(mt5, "DEAL_ENTRY_INOUT", None):
+        return abs(get_deal_realized_pnl(deal)) > 1e-9
+    return True
 
 
 def get_deal_realized_pnl(deal):
@@ -470,69 +542,374 @@ def format_runtime_timestamp(ts):
     return str(ts)
 
 
+def _blank_portfolio_snapshot():
+    if not session_active:
+        started_label = "--:-- | MT5 --:--"
+    else:
+        started_label = f"{session_started_at.strftime('%H:%M')} | MT5 --:--"
+    return {
+        "session_id": session_runtime_id,
+        "balance": 0.0,
+        "equity": 0.0,
+        "live_pnl": 0.0,
+        "open_positions": 0,
+        "session_profit": 0.0,
+        "session_closed_profit": 0.0,
+        "session_open_pnl": 0.0,
+        "closed_trades": 0,
+        "flat_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "winrate": 0.0,
+        "tracked_results": 0,
+        "session_started_at": session_started_at,
+        "session_started_at_label": started_label,
+    }
+
+
+def _build_trade_ledger_entry(deal, strategy_cfg, strategy_tag, realized_pnl, deal_time, leg_comment, exit_reason, mapped):
+    return {
+        "session_id": session_runtime_id,
+        "deal_ticket": _deal_ticket(deal),
+        "position_id": getattr(deal, "position_id", None) or getattr(deal, "position", None),
+        "symbol": getattr(deal, "symbol", ""),
+        "strategy_name": strategy_cfg["name"] if strategy_cfg and mapped else None,
+        "strategy_tag": strategy_tag if strategy_cfg and mapped else None,
+        "mapped": bool(strategy_cfg and mapped),
+        "pnl": round(realized_pnl, 2),
+        "result": "WIN" if realized_pnl > 0 else ("LOSS" if realized_pnl < 0 else "BE"),
+        "closed_at": deal_time,
+        "deal_comment": str(getattr(deal, "comment", "") or ""),
+        "entry_comment": str(leg_comment or ""),
+        "leg_index": extract_leg_index(leg_comment),
+        "exit_reason": exit_reason,
+    }
+
+
+def _strategy_status_and_block(strategy, runtime):
+    status = "ACTIVE" if strategy.get("enabled") else "OFF"
+    is_crypto_branch = is_crypto_family(strategy.get("symbol_family"))
+    if is_crypto_branch and not crypto_enabled:
+        status = "STANDBY"
+    elif strategy["name"].endswith("_SCALP") and not scalping_enabled:
+        status = "STANDBY"
+    if strategy.get("disabled_reason"):
+        status = "LOCKED"
+
+    live_block = runtime.get("live_block", "INIT")
+    if status == "STANDBY" and is_crypto_branch and not crypto_enabled:
+        live_block = "CRYPTO OFF"
+    elif status == "STANDBY":
+        live_block = "SCALP OFF"
+    elif status == "LOCKED":
+        live_block = "LOCKED"
+    elif status == "OFF":
+        live_block = "OFF"
+    return status, live_block
+
+
+def _collect_strategy_live_state(live_positions=None):
+    if not session_active:
+        return {
+            "strategy_live": {},
+            "unmapped_live": {"open_positions": 0, "live_pnl": 0.0, "symbols": []},
+            "total_live_pnl": 0.0,
+            "total_open_positions": 0,
+        }
+    positions = live_positions if live_positions is not None else safe_positions()
+    strategy_live = {}
+    unmapped_live = {"open_positions": 0, "live_pnl": 0.0, "symbols": set()}
+    total_live_pnl = 0.0
+    total_open_positions = 0
+
+    for p in positions:
+        if getattr(p, "magic", None) != MAGIC_ID:
+            continue
+        total_open_positions += 1
+        pnl = float(getattr(p, "profit", 0.0) or 0.0)
+        total_live_pnl += pnl
+        strategy_tag = position_strategy_map.get(getattr(p, "ticket", None)) or extract_strategy_tag(getattr(p, "comment", ""))
+        strategy_cfg = get_strategy_by_tag(strategy_tag) if strategy_tag else None
+        if strategy_cfg and symbol_in_family(getattr(p, "symbol", ""), strategy_cfg.get("symbol_family")):
+            strategy_state = strategy_live.setdefault(
+                strategy_cfg["name"],
+                {"open_positions": 0, "live_pnl": 0.0, "symbols": set()},
+            )
+        else:
+            strategy_state = unmapped_live
+        strategy_state["open_positions"] += 1
+        strategy_state["live_pnl"] += pnl
+        strategy_state["symbols"].add(getattr(p, "symbol", ""))
+
+    return {
+        "strategy_live": strategy_live,
+        "unmapped_live": {
+            "open_positions": unmapped_live["open_positions"],
+            "live_pnl": round(unmapped_live["live_pnl"], 2),
+            "symbols": sorted(sym for sym in unmapped_live["symbols"] if sym),
+        },
+        "total_live_pnl": round(total_live_pnl, 2),
+        "total_open_positions": total_open_positions,
+    }
+
+
+def _rebuild_portfolio_snapshot(acc=None, live_pnl=None):
+    global portfolio_snapshot
+    live_state = _collect_strategy_live_state()
+    if live_pnl is None:
+        live_pnl = live_state["total_live_pnl"]
+    broker_session_start = get_broker_session_start() if session_active else None
+    session_closed_profit = float(session_stats.get("profit", 0.0) or 0.0)
+    session_profit = session_closed_profit + float(live_pnl or 0.0)
+    wins = int(session_stats.get("wins", 0) or 0)
+    losses = int(session_stats.get("losses", 0) or 0)
+    tracked_results = wins + losses
+    portfolio_snapshot = {
+        "session_id": session_runtime_id,
+        "balance": round(float(getattr(acc, "balance", 0.0) or 0.0), 2) if acc else 0.0,
+        "equity": round(float(getattr(acc, "equity", 0.0) or 0.0), 2) if acc else 0.0,
+        "live_pnl": round(float(live_pnl or 0.0), 2),
+        "open_positions": int(live_state.get("total_open_positions", 0) or 0),
+        "session_profit": round(session_profit, 2),
+        "session_closed_profit": round(session_closed_profit, 2),
+        "session_open_pnl": round(float(live_pnl or 0.0), 2),
+        "closed_trades": int(session_stats.get("trades", 0) or 0),
+        "flat_trades": int(session_stats.get("flat", 0) or 0),
+        "wins": wins,
+        "losses": losses,
+        "winrate": round(_get_session_winrate() * 100, 1),
+        "tracked_results": tracked_results,
+        "session_started_at": session_started_at,
+        "session_started_at_label": (
+            f"{session_started_at.strftime('%H:%M')} | MT5 {broker_session_start.strftime('%H:%M') if broker_session_start else '--:--'}"
+            if session_active
+            else "--:-- | MT5 --:--"
+        ),
+    }
+
+
+def _rebuild_strategy_matrix_snapshot():
+    global strategy_matrix_snapshot
+    with strategy_runtime_lock:
+        strategy_runtime_snapshot = {name: dict(runtime) for name, runtime in strategy_runtime.items()}
+    live_state = _collect_strategy_live_state()
+    strategy_live = live_state.get("strategy_live", {})
+
+    latest_session_close = {}
+    for entry in session_trade_ledger:
+        strategy_name = entry.get("strategy_name")
+        if not strategy_name:
+            continue
+        current = latest_session_close.get(strategy_name)
+        if current is None or entry.get("closed_at") > current.get("closed_at"):
+            latest_session_close[strategy_name] = entry
+
+    dashboard = []
+    for strategy in STRATEGIES:
+        stats = dict(strategy_stats.get(strategy["name"], {}))
+        runtime = strategy_runtime_snapshot.get(strategy["name"], {})
+        wins = int(stats.get("wins", 0) or 0)
+        losses = int(stats.get("losses", 0) or 0)
+        total = wins + losses
+        winrate = (wins / total) * 100 if total > 0 else 0.0
+        profit_factor = compute_profit_factor(stats)
+        profit_factor_display = "INF" if profit_factor == float("inf") else round(profit_factor, 2)
+        status, live_block = _strategy_status_and_block(strategy, runtime)
+        last_close = latest_session_close.get(strategy["name"], {})
+        live_row = strategy_live.get(strategy["name"], {})
+        live_pnl = round(float(live_row.get("live_pnl", 0.0) or 0.0), 2)
+        open_positions = int(live_row.get("open_positions", 0) or 0)
+        dashboard.append(
+            {
+                "session_id": session_runtime_id,
+                "name": strategy["name"],
+                "family": strategy.get("symbol_family", "---"),
+                "tag": strategy["tag"],
+                "status": status,
+                "mode": strategy["execution_mode"],
+                "session": strategy.get("session_label", "24H"),
+                "risk_multiplier": strategy["risk_multiplier"],
+                "sl_atr": strategy.get("sl_atr_multiplier", 1.2),
+                "tp_rr": strategy.get("tp_rr_multiplier", 2.0),
+                "tp_mode": "MULTI" if strategy["execution_mode"] == "MULTI_ONLY" else ("STD" if strategy["execution_mode"] == "STD_ONLY" else "AUTO"),
+                "split_range": f"{strategy.get('min_splits', 1)}-{strategy.get('max_splits', MAX_SPLITS)}" if strategy["execution_mode"] == "MULTI_ONLY" else "1",
+                "be_trigger": round(strategy.get("be_trigger_progress", 0.45) * 100),
+                "trail": " | ".join([f"{int(t*100)}>{int(l*100)}" for t, l in strategy.get("trail_steps", [])]) if strategy.get("trail_steps") else "---",
+                "winrate": round(winrate, 1),
+                "profit_factor": profit_factor_display,
+                "closed": int(stats.get("closed", 0) or 0),
+                "net_profit": round(float(stats.get("net_profit", 0.0) or 0.0), 2),
+                "live_pnl": live_pnl,
+                "open_positions": open_positions,
+                "total_net_profit": round(float(stats.get("net_profit", 0.0) or 0.0) + live_pnl, 2),
+                "session_winrate": round(winrate, 1),
+                "session_closed": int(stats.get("closed", 0) or 0),
+                "session_net_profit": round(float(stats.get("net_profit", 0.0) or 0.0), 2),
+                "disabled_reason": strategy.get("disabled_reason", ""),
+                "auto_disable": strategy.get("auto_disable", False),
+                "last_signal": runtime.get("last_signal", "---"),
+                "last_signal_conf": runtime.get("last_signal_conf", 0.0),
+                "last_signal_symbol": runtime.get("last_signal_symbol", "---"),
+                "last_signal_time": format_runtime_timestamp(runtime.get("last_signal_time")),
+                "last_result": runtime.get("last_result", "---"),
+                "last_result_profit": runtime.get("last_result_profit", 0.0),
+                "last_result_time": format_runtime_timestamp(runtime.get("last_result_time")),
+                "last_event": runtime.get("last_event", "INIT"),
+                "live_block": live_block,
+                "pretrigger": runtime.get("pretrigger", "---"),
+                "tp_plan": runtime.get("last_tp_plan", "---"),
+                "probability": round(float(runtime.get("probability", 0.0) or 0.0), 1),
+                "probability_reason": runtime.get("probability_reason", "---"),
+                "probability_mode": runtime.get("probability_mode", "OFF"),
+                "probability_threshold": round(float(runtime.get("probability_threshold", PROBABILITY_MIN_THRESHOLD) or PROBABILITY_MIN_THRESHOLD), 1),
+                "probability_symbol": runtime.get("probability_symbol", "---"),
+                "probability_time": format_runtime_timestamp(runtime.get("probability_time")),
+                "last_close_symbol": last_close.get("symbol", "---"),
+                "last_close_time": format_runtime_timestamp(last_close.get("closed_at")),
+                "last_close_reason": last_close.get("exit_reason", "---"),
+            }
+        )
+
+    legacy_total = legacy_stats.get("wins", 0) + legacy_stats.get("losses", 0)
+    if legacy_stats.get("closed", 0) > 0 or abs(legacy_stats.get("net_profit", 0.0)) > 0:
+        legacy_pf = compute_profit_factor(legacy_stats)
+        legacy_live = live_state.get("unmapped_live", {})
+        dashboard.append(
+            {
+                "session_id": session_runtime_id,
+                "name": "LEGACY",
+                "family": "UNMAPPED",
+                "tag": "LEGACY",
+                "status": "LOCKED",
+                "mode": "HISTORY",
+                "session": "DAY",
+                "risk_multiplier": 0.0,
+                "sl_atr": 0.0,
+                "tp_rr": 0.0,
+                "tp_mode": "N/A",
+                "split_range": "-",
+                "be_trigger": 0,
+                "trail": "---",
+                "winrate": round((legacy_stats.get("wins", 0) / legacy_total) * 100, 1) if legacy_total > 0 else 0.0,
+                "profit_factor": "INF" if legacy_pf == float("inf") else round(legacy_pf, 2),
+                "closed": legacy_stats.get("closed", 0),
+                "net_profit": round(legacy_stats.get("net_profit", 0.0), 2),
+                "live_pnl": round(float(legacy_live.get("live_pnl", 0.0) or 0.0), 2),
+                "open_positions": int(legacy_live.get("open_positions", 0) or 0),
+                "total_net_profit": round(
+                    float(legacy_stats.get("net_profit", 0.0) or 0.0) + float(legacy_live.get("live_pnl", 0.0) or 0.0),
+                    2,
+                ),
+                "session_winrate": round((legacy_stats.get("wins", 0) / legacy_total) * 100, 1) if legacy_total > 0 else 0.0,
+                "session_closed": legacy_stats.get("closed", 0),
+                "session_net_profit": round(legacy_stats.get("net_profit", 0.0), 2),
+                "disabled_reason": "UNMAPPED DEALS",
+                "auto_disable": False,
+                "last_signal": "---",
+                "last_signal_conf": 0.0,
+                "last_signal_symbol": "---",
+                "last_signal_time": "---",
+                "last_result": "---",
+                "last_result_profit": 0.0,
+                "last_result_time": "---",
+                "last_event": "UNMAPPED SESSION DEAL",
+                "live_block": "UNMAPPED",
+                "pretrigger": "---",
+                "tp_plan": "---",
+                "last_close_symbol": "---",
+                "last_close_time": "---",
+                "last_close_reason": "---",
+            }
+        )
+
+    strategy_matrix_snapshot = dashboard
+
+
+def _rebuild_visual_snapshots(acc=None, live_pnl=None):
+    _rebuild_portfolio_snapshot(acc=acc, live_pnl=live_pnl)
+    _rebuild_strategy_matrix_snapshot()
+
+
+
 def record_strategy_signal(name, symbol, signal, confidence):
-    runtime = strategy_runtime.setdefault(name, {})
-    runtime["last_signal"] = signal
-    runtime["last_signal_conf"] = round(confidence, 1)
-    runtime["last_signal_symbol"] = symbol
-    runtime["last_signal_time"] = datetime.now()
-    runtime["last_event"] = f"SIGNAL {signal}"
-    runtime["live_block"] = "READY"
-    runtime["pretrigger"] = "TRIGGER READY"
+    with strategy_runtime_lock:
+        runtime = strategy_runtime.setdefault(name, {})
+        runtime["last_signal"] = signal
+        runtime["last_signal_conf"] = round(confidence, 1)
+        runtime["last_signal_symbol"] = symbol
+        runtime["last_signal_time"] = datetime.now()
+        runtime["last_event"] = f"SIGNAL {signal}"
+        runtime["live_block"] = "READY"
+        runtime["pretrigger"] = "TRIGGER READY"
 
 
 def set_strategy_pretrigger(name, pretrigger_text_value="---"):
-    runtime = strategy_runtime.setdefault(name, {})
-    runtime["pretrigger"] = pretrigger_text_value or "---"
+    with strategy_runtime_lock:
+        runtime = strategy_runtime.setdefault(name, {})
+        runtime["pretrigger"] = pretrigger_text_value or "---"
 
 
 def record_strategy_tp_plan(name, plan_text):
-    runtime = strategy_runtime.setdefault(name, {})
-    runtime["last_tp_plan"] = plan_text or "---"
+    with strategy_runtime_lock:
+        runtime = strategy_runtime.setdefault(name, {})
+        runtime["last_tp_plan"] = plan_text or "---"
+
+
+def record_strategy_probability(name, symbol, probability, reason, mode="OFF", threshold=PROBABILITY_MIN_THRESHOLD):
+    with strategy_runtime_lock:
+        runtime = strategy_runtime.setdefault(name, {})
+        runtime["probability"] = round(float(probability or 0.0), 1)
+        runtime["probability_reason"] = reason or "---"
+        runtime["probability_mode"] = mode or "OFF"
+        runtime["probability_threshold"] = round(float(threshold or PROBABILITY_MIN_THRESHOLD), 1)
+        runtime["probability_symbol"] = symbol or "---"
+        runtime["probability_time"] = datetime.now()
 
 
 def record_strategy_event(name, event_text):
-    runtime = strategy_runtime.setdefault(name, {})
-    runtime["last_event"] = event_text
-    event_upper = str(event_text).upper()
-    if event_upper.startswith("NO SETUP "):
-        runtime["live_block"] = event_upper.replace("NO SETUP ", "")[:24]
-    elif "NO SETUP" in event_upper:
-        runtime["live_block"] = "NO SETUP"
-    elif "COOLDOWN" in event_upper:
-        runtime["live_block"] = "COOLDOWN"
-    elif "OUT SESSION" in event_upper:
-        runtime["live_block"] = "OUT SESSION"
-    elif "FAST" in event_upper:
-        runtime["live_block"] = "FAST"
-    elif "SPREAD" in event_upper:
-        runtime["live_block"] = "SPREAD"
-    elif "LOW SCORE" in event_upper:
-        runtime["live_block"] = "LOW SCORE"
-    elif "REGIME" in event_upper:
-        runtime["live_block"] = "REGIME"
-    elif "LIVE" in event_upper or "ENTRY" in event_upper:
-        runtime["live_block"] = "LIVE"
-    elif "FAIL" in event_upper:
-        runtime["live_block"] = "FAIL"
-    elif "FILTER" in event_upper:
-        runtime["live_block"] = event_upper.replace("FILTER ", "")[:18]
-    else:
-        runtime["live_block"] = event_upper[:18]
+    with strategy_runtime_lock:
+        runtime = strategy_runtime.setdefault(name, {})
+        runtime["last_event"] = event_text
+        event_upper = str(event_text).upper()
+        if event_upper.startswith("NO SETUP "):
+            runtime["live_block"] = event_upper.replace("NO SETUP ", "")[:24]
+        elif "NO SETUP" in event_upper:
+            runtime["live_block"] = "NO SETUP"
+        elif "COOLDOWN" in event_upper:
+            runtime["live_block"] = "COOLDOWN"
+        elif "OUT SESSION" in event_upper:
+            runtime["live_block"] = "OUT SESSION"
+        elif "FAST" in event_upper:
+            runtime["live_block"] = "FAST"
+        elif "SPREAD" in event_upper:
+            runtime["live_block"] = "SPREAD"
+        elif "LOW SCORE" in event_upper:
+            runtime["live_block"] = "LOW SCORE"
+        elif "REGIME" in event_upper:
+            runtime["live_block"] = "REGIME"
+        elif "LIVE" in event_upper or "ENTRY" in event_upper:
+            runtime["live_block"] = "LIVE"
+        elif "FAIL" in event_upper:
+            runtime["live_block"] = "FAIL"
+        elif "FILTER" in event_upper:
+            runtime["live_block"] = event_upper.replace("FILTER ", "")[:18]
+        else:
+            runtime["live_block"] = event_upper[:18]
 
 
 def record_strategy_result(name, profit, result_time=None):
-    runtime = strategy_runtime.setdefault(name, {})
-    ts = result_time if isinstance(result_time, datetime) else datetime.now()
-    runtime["last_result"] = "WIN" if profit > 0 else ("LOSS" if profit < 0 else "BE")
-    runtime["last_result_profit"] = round(profit, 2)
-    runtime["last_result_time"] = ts
-    runtime["last_event"] = f"RESULT {runtime['last_result']}"
-    runtime["live_block"] = runtime["last_result"]
-    runtime["pretrigger"] = "---"
-    if profit < 0:
-        runtime["last_loss_time"] = ts
-        runtime["last_loss_profit"] = round(profit, 2)
+    with strategy_runtime_lock:
+        runtime = strategy_runtime.setdefault(name, {})
+        ts = result_time if isinstance(result_time, datetime) else datetime.now()
+        runtime["last_result"] = "WIN" if profit > 0 else ("LOSS" if profit < 0 else "BE")
+        runtime["last_result_profit"] = round(profit, 2)
+        runtime["last_result_time"] = ts
+        runtime["last_event"] = f"RESULT {runtime['last_result']}"
+        runtime["live_block"] = runtime["last_result"]
+        runtime["pretrigger"] = "---"
+        if profit < 0:
+            runtime["last_loss_time"] = ts
+            runtime["last_loss_profit"] = round(profit, 2)
 
 
 def evaluate_strategy_health():
@@ -583,21 +960,11 @@ refresh_symbols()
 
 
 def _default_session_start():
-    now = datetime.now()
-    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return datetime.now()
 
 
 def _load_session_state():
-    try:
-        with open(SESSION_STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        started = datetime.fromisoformat(str(data.get("session_started_at")))
-        broker_started_raw = data.get("session_broker_started_at")
-        broker_started = datetime.fromisoformat(str(broker_started_raw)) if broker_started_raw else None
-        balance = data.get("session_balance_start")
-        return started, broker_started, float(balance) if balance is not None else None
-    except Exception:
-        return _default_session_start(), None, None
+    return _default_session_start(), None, None
 
 
 def _save_session_state():
@@ -613,7 +980,48 @@ def _save_session_state():
         pass
 
 
+def _load_runtime_state():
+    try:
+        with open(RUNTIME_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        profile = str(data.get("optimizer_profile") or CURRENT_OPTIMIZER_PROFILE).upper()
+        if profile not in OPTIMIZER_PROFILES:
+            profile = "BALANCED"
+        return {
+            "optimizer_profile": profile,
+            "crypto_enabled": bool(data.get("crypto_enabled", False)),
+            "scalping_enabled": bool(data.get("scalping_enabled", False)),
+        }
+    except Exception:
+        return {
+            "optimizer_profile": CURRENT_OPTIMIZER_PROFILE,
+            "crypto_enabled": False,
+            "scalping_enabled": False,
+        }
+
+
+def _save_runtime_state():
+    try:
+        payload = {
+            "optimizer_profile": CURRENT_OPTIMIZER_PROFILE,
+            "crypto_enabled": bool(crypto_enabled),
+            "scalping_enabled": bool(scalping_enabled),
+        }
+        with open(RUNTIME_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+
 session_started_at, session_broker_started_at, session_balance_start = _load_session_state()
+_runtime_state = _load_runtime_state()
+CURRENT_OPTIMIZER_PROFILE = _runtime_state.get("optimizer_profile", CURRENT_OPTIMIZER_PROFILE)
+_boot_profile = OPTIMIZER_PROFILES.get(CURRENT_OPTIMIZER_PROFILE, OPTIMIZER_PROFILES["BALANCED"])
+RISK_PER_TRADE_PERCENT = _boot_profile["risk_per_trade_percent"]
+MAX_TOTAL_RISK = _boot_profile["max_total_risk"]
+MAX_TRADES_PER_CYCLE = _boot_profile["max_trades_per_cycle"]
+crypto_enabled = bool(_runtime_state.get("crypto_enabled", False))
+scalping_enabled = bool(_runtime_state.get("scalping_enabled", False))
 
 # ==============================================================================
 # THREAD-SAFE DATA ACCESS & UTILS
@@ -651,6 +1059,47 @@ def normalize_trade_volume(info, volume):
     step_text = f"{step:.8f}".rstrip("0")
     digits = len(step_text.split(".")[1]) if "." in step_text else 0
     return round(normalized, digits)
+
+
+def gold_points_to_price(info, points):
+    if not info:
+        return 0.0
+    return float(points) * float(getattr(info, "point", 0.01) or 0.01) * 10.0
+
+
+def price_to_gold_points(info, distance):
+    if not info:
+        return 0.0
+    unit = gold_points_to_price(info, 1.0)
+    if unit <= 0:
+        return 0.0
+    return float(distance) / unit
+
+
+def build_fixed_weight_lot_plan(total_lot, info, weights):
+    if not weights:
+        return []
+    step = float(getattr(info, "volume_step", 0.01) or 0.01)
+    min_vol = float(getattr(info, "volume_min", step) or step)
+    scaled_total = np.floor((float(total_lot) / step)) * step
+    if scaled_total < min_vol:
+        return []
+    raw_weights = [max(0.0, float(w or 0.0)) for w in weights]
+    weight_sum = sum(raw_weights)
+    if weight_sum <= 0:
+        return []
+    normalized = [w / weight_sum for w in raw_weights]
+    raw_lots = [scaled_total * w for w in normalized]
+    lot_plan = [np.floor(raw / step) * step for raw in raw_lots]
+    remainder_steps = int(round((scaled_total - sum(lot_plan)) / step))
+    order = sorted(range(len(raw_lots)), key=lambda idx: ((raw_lots[idx] - lot_plan[idx]), normalized[idx]), reverse=True)
+    for idx in order:
+        if remainder_steps <= 0:
+            break
+        lot_plan[idx] += step
+        remainder_steps -= 1
+    final_lots = [round(lot, 8) for lot in lot_plan if lot + 1e-9 >= min_vol]
+    return final_lots
 
 
 def get_supported_close_fill_modes(info):
@@ -728,53 +1177,53 @@ def get_cluster_profile(strategy_cfg, cluster_state):
     if buffer_progress is None:
         buffer_progress = clamp(base_buffer * (0.86 + quality * 0.28), 0.02, 0.25)
 
-    lock_bias = cluster_state.get("cluster_lock_bias")
+    lock_bias = cluster_state.get("cluster_lock_bias", strategy_cfg.get("cluster_lock_bias"))
     if lock_bias is None:
         lock_bias = (0.5 - quality) * (0.20 if is_orb_cluster else 0.14)
     if is_gold_cluster:
         lock_bias += 0.04
 
-    protect_bias = cluster_state.get("protect_bias")
+    protect_bias = cluster_state.get("protect_bias", strategy_cfg.get("protect_bias"))
     if protect_bias is None:
         protect_bias = (0.5 - quality) * (0.26 if is_orb_cluster else 0.18)
     if is_gold_cluster:
         protect_bias += 0.06
 
-    early_cashout_ratio = cluster_state.get("early_cashout_ratio")
+    early_cashout_ratio = cluster_state.get("early_cashout_ratio", strategy_cfg.get("early_cashout_ratio"))
     if early_cashout_ratio is None:
         early_cashout_ratio = clamp(0.10 + (0.5 - quality) * (0.16 if is_orb_cluster else 0.10), 0.04, 0.24)
 
-    orb_cashout_ratio = cluster_state.get("orb_cashout_ratio")
+    orb_cashout_ratio = cluster_state.get("orb_cashout_ratio", strategy_cfg.get("orb_cashout_ratio"))
     if orb_cashout_ratio is None:
         orb_cashout_ratio = clamp(0.18 + (0.5 - quality) * 0.20, 0.08, 0.32)
 
-    hard_lock_ratio = cluster_state.get("hard_lock_ratio")
+    hard_lock_ratio = cluster_state.get("hard_lock_ratio", strategy_cfg.get("hard_lock_ratio"))
     if hard_lock_ratio is None:
         hard_lock_ratio = clamp(0.14 + (0.5 - quality) * 0.18, 0.06, 0.30)
 
-    cascade_ratio = cluster_state.get("cascade_ratio")
+    cascade_ratio = cluster_state.get("cascade_ratio", strategy_cfg.get("cascade_ratio"))
     if cascade_ratio is None:
         cascade_ratio = clamp(0.10 + (0.5 - quality) * 0.16, 0.04, 0.26)
 
-    tp1_guard_ratio = cluster_state.get("tp1_guard_ratio")
+    tp1_guard_ratio = cluster_state.get("tp1_guard_ratio", strategy_cfg.get("tp1_guard_ratio"))
     if tp1_guard_ratio is None:
         tp1_guard_ratio = clamp(0.08 + (0.5 - quality) * (0.12 if is_orb_cluster else 0.08), 0.03, 0.18)
     if is_gold_cluster:
         tp1_guard_ratio = clamp(tp1_guard_ratio + 0.02, 0.04, 0.24)
 
-    weak_floor = cluster_state.get("weak_profit_floor")
+    weak_floor = cluster_state.get("weak_profit_floor", strategy_cfg.get("weak_profit_floor"))
     if weak_floor is None:
         weak_floor = max(0.35, strategy_cfg.get("multi_tp_eur_min", 0.50) * clamp(1.00 + (0.5 - quality) * 0.40, 0.70, 1.20))
 
-    tp3_bridge_ratio = cluster_state.get("tp3_bridge_ratio")
+    tp3_bridge_ratio = cluster_state.get("tp3_bridge_ratio", strategy_cfg.get("tp3_bridge_ratio"))
     if tp3_bridge_ratio is None:
         tp3_bridge_ratio = clamp(0.46 + (quality - 0.5) * 0.22 + (0.06 if is_gold_cluster else 0.0), 0.34, 0.70)
 
-    runner_peak_keep_ratio = cluster_state.get("runner_peak_keep_ratio")
+    runner_peak_keep_ratio = cluster_state.get("runner_peak_keep_ratio", strategy_cfg.get("runner_peak_keep_ratio"))
     if runner_peak_keep_ratio is None:
         runner_peak_keep_ratio = clamp(0.60 - quality * (0.18 if is_orb_cluster else 0.22) + (0.10 if is_gold_cluster else 0.0), 0.36, 0.76)
 
-    runner_realized_lock_ratio = cluster_state.get("runner_realized_lock_ratio")
+    runner_realized_lock_ratio = cluster_state.get("runner_realized_lock_ratio", strategy_cfg.get("runner_realized_lock_ratio"))
     if runner_realized_lock_ratio is None:
         runner_realized_lock_ratio = clamp(0.70 + (0.5 - quality) * (0.18 if is_orb_cluster else 0.16) + (0.10 if is_gold_cluster else 0.0), 0.52, 0.96)
 
@@ -797,6 +1246,23 @@ def get_cluster_profile(strategy_cfg, cluster_state):
 
 
 def build_dynamic_multi_tp_prices(symbol, signal, entry_price, info, lot_per_trade, atr, spread_price, strategy_cfg, splits):
+    fixed_tp_points = list(strategy_cfg.get("fixed_tp_points") or [])
+    point_value_price = float(strategy_cfg.get("point_value_price", info.point if info else 0.0) or 0.0)
+    tp_point_buffer = float(strategy_cfg.get("tp_point_buffer", 0.0) or 0.0)
+    if fixed_tp_points and point_value_price > 0:
+        prices = []
+        projected_profits = []
+        prev_distance = 0.0
+        step_floor = max(info.point * 6, spread_price * 0.35, atr * 0.03)
+        for i in range(splits):
+            base_points = float(fixed_tp_points[i] if i < len(fixed_tp_points) else fixed_tp_points[-1])
+            distance = max((base_points + tp_point_buffer) * point_value_price, prev_distance + step_floor)
+            tp_price = entry_price + distance if signal == "BUY" else entry_price - distance
+            prices.append(round(tp_price, info.digits))
+            projected_profits.append(round(price_distance_to_profit(info, lot_per_trade, distance), 2))
+            prev_distance = distance
+        return prices, projected_profits
+
     eur_min = strategy_cfg.get("multi_tp_eur_min", 0.50)
     eur_max = strategy_cfg.get("multi_tp_eur_max", 1.50)
     target_eur = min(max(strategy_cfg.get("effective_multi_tp_target_eur", strategy_cfg.get("multi_tp_target_eur", 1.00)), eur_min), eur_max)
@@ -843,11 +1309,14 @@ def build_dynamic_multi_tp_plan(strategy_cfg, score, confidence, df, info, sprea
     atr = df["atr"].iloc[-1]
     quality_metrics = compute_trade_quality(strategy_cfg, score, confidence, df, spread_price)
     quality = quality_metrics["quality"]
+    forced_splits = strategy_cfg.get("fixed_tp_splits")
     min_splits = max(4, int(strategy_cfg.get("min_splits", 4)))
     max_splits = max(min_splits, min(MAX_SPLITS, int(strategy_cfg.get("max_splits", MAX_SPLITS))))
 
     split_span = max_splits - min_splits
-    if split_span <= 0:
+    if forced_splits is not None:
+        splits = max(1, min(MAX_SPLITS, int(forced_splits)))
+    elif split_span <= 0:
         splits = min_splits
     else:
         extra_budget = 0
@@ -885,6 +1354,14 @@ def build_dynamic_multi_tp_plan(strategy_cfg, score, confidence, df, info, sprea
     plan_cfg["effective_tp_quality"] = round(quality, 3)
     plan_cfg["effective_be_trigger"] = round(clamp(strategy_cfg.get("be_trigger_progress", 0.45) + (quality - 0.5) * 0.18, 0.06, 0.82), 4)
     plan_cfg["effective_be_buffer_progress"] = round(clamp(strategy_cfg.get("be_buffer_progress", 0.05) * (0.86 + quality * 0.28), 0.02, 0.25), 4)
+    if forced_splits is not None:
+        plan_cfg["fixed_tp_splits"] = splits
+    if strategy_cfg.get("fixed_tp_points"):
+        plan_cfg["fixed_tp_points"] = list(strategy_cfg.get("fixed_tp_points") or [])
+    if strategy_cfg.get("point_value_price"):
+        plan_cfg["point_value_price"] = float(strategy_cfg.get("point_value_price"))
+    if strategy_cfg.get("tp_point_buffer") is not None:
+        plan_cfg["tp_point_buffer"] = float(strategy_cfg.get("tp_point_buffer"))
     plan_text = f"{splits}TP | C{int(round(confidence))} | S{int(round(score * 100))} | Q{int(round(quality * 100))} | TP1~{round(target_eur, 2)}€"
     return plan_cfg, splits, plan_text
 
@@ -919,6 +1396,11 @@ def _multi_tp_weight_template(strategy_cfg, quality):
 def build_dynamic_multi_tp_lot_plan(total_lot, info, strategy_cfg, splits, quality):
     if splits <= 0:
         return []
+    fixed_weights = list(strategy_cfg.get("lot_weights_override") or [])
+    if fixed_weights:
+        weighted_plan = build_fixed_weight_lot_plan(total_lot, info, fixed_weights[:splits])
+        if weighted_plan:
+            return weighted_plan
     step = float(info.volume_step or 0.01)
     min_vol = float(info.volume_min or step)
     weights, base_scale = _multi_tp_weight_template(strategy_cfg, quality)
@@ -1168,6 +1650,294 @@ def count_consecutive_state(series, end_offset=2):
     return count, current
 
 
+def _probability_direction_ok(side, left, right):
+    if side == "BUY":
+        return left >= right
+    return left <= right
+
+
+def _infer_probability_profile(strategy_cfg):
+    name = str(strategy_cfg.get("name", "") or "")
+    suite = str(strategy_cfg.get("suite", "") or "")
+    if suite == "TITANYX" or name.endswith("_LUKE"):
+        return "MEAN_REVERSION"
+    if "LIQUIDITY_PULLBACK" in name or "REVERSAL_SWEEP" in name:
+        return "STRUCTURE"
+    if name.endswith("_ORB") or name.endswith("_BREAK_RETEST") or name.endswith("_KUMO_BREAKOUT"):
+        return "BREAKOUT"
+    if name.endswith("_VWAP_RECLAIM") or name.endswith("_VWAP_TREND"):
+        return "VWAP"
+    if name.endswith("_SCALP"):
+        return "SCALP"
+    if (
+        name.endswith("_TREND")
+        or name.endswith("_SANTO_GRAAL")
+        or name.endswith("_DOUBLE_MACD")
+        or name.endswith("_SIDUS")
+        or name.endswith("_PURIA")
+        or name.endswith("_HEIKEN_TDI")
+    ):
+        return "TREND"
+    return "GENERIC"
+
+
+def _infer_probability_mode(strategy_cfg):
+    name = str(strategy_cfg.get("name", "") or "")
+    suite = str(strategy_cfg.get("suite", "") or "")
+    if (
+        name.endswith("_ORB")
+        or name.endswith("_BREAK_RETEST")
+        or name.endswith("_TREND")
+        or name.endswith("_VWAP_RECLAIM")
+        or name.endswith("_VWAP_TREND")
+        or name.endswith("_SCALP")
+    ):
+        return "LIVE"
+    if (
+        suite == "TITANYX"
+        or name.endswith("_LUKE")
+        or "LIQUIDITY_PULLBACK" in name
+        or "REVERSAL_SWEEP" in name
+        or name.endswith("_SANTO_GRAAL")
+        or name.endswith("_DOUBLE_MACD")
+        or name.endswith("_SIDUS")
+        or name.endswith("_PURIA")
+        or name.endswith("_HEIKEN_TDI")
+        or name.endswith("_KUMO_BREAKOUT")
+    ):
+        return "SHADOW"
+    return "OFF"
+
+
+def _resolve_cluster_opened_at(cluster_state, live_positions):
+    opened_at = cluster_state.get("opened_at")
+    if isinstance(opened_at, datetime):
+        return opened_at
+    try:
+        timestamps = []
+        for p in live_positions:
+            opened_epoch = getattr(p, "time", None) or getattr(p, "time_update", None)
+            if opened_epoch:
+                timestamps.append(datetime.fromtimestamp(int(opened_epoch)))
+        if timestamps:
+            return min(timestamps)
+    except Exception:
+        pass
+    return None
+
+
+def _build_cluster_probability_reason(contributions):
+    positive = [label for label, delta in sorted(contributions.items(), key=lambda item: item[1], reverse=True) if delta > 0][:2]
+    negative = [label for label, delta in sorted(contributions.items(), key=lambda item: item[1]) if delta < 0][:2]
+    if positive and negative:
+        return f"{'+'.join(positive)} | {'/'.join(negative)}"
+    if positive:
+        return "+".join(positive)
+    if negative:
+        return "/".join(negative)
+    return "NEUTRAL"
+
+
+def evaluate_cluster_probability(symbol, strategy_cfg, cluster_state, live_positions, cluster_meta=None):
+    cluster_state = cluster_state or {}
+    cluster_meta = cluster_meta or {}
+    mode = _infer_probability_mode(strategy_cfg)
+    profile = _infer_probability_profile(strategy_cfg)
+    result = {
+        "mode": mode,
+        "profile": profile,
+        "probability": 50.0,
+        "threshold": PROBABILITY_MIN_THRESHOLD,
+        "hard_threshold": PROBABILITY_HARD_THRESHOLD,
+        "reason": "NO DATA",
+        "should_exit": False,
+        "below_count": 0,
+    }
+    if not PROBABILITY_ENGINE_ENABLED or mode == "OFF" or not live_positions:
+        return result
+
+    now = datetime.now()
+    last_eval = cluster_state.get("probability_last_eval_at")
+    if isinstance(last_eval, datetime) and (now - last_eval).total_seconds() < PROBABILITY_RECHECK_SEC:
+        cached = cluster_state.get("probability_cached")
+        if isinstance(cached, dict):
+            return dict(cached)
+
+    info = safe_info(symbol)
+    tick = safe_tick(symbol)
+    df_m5 = get_m5_cached(symbol)
+    if not info or not tick or df_m5 is None or len(df_m5) < 30:
+        result["reason"] = "NO LIVE DATA"
+        cluster_state["probability_cached"] = dict(result)
+        cluster_state["probability_last_eval_at"] = now
+        return result
+
+    pos_type = live_positions[0].type
+    side = "BUY" if pos_type == 0 else "SELL"
+    price = float(tick.bid if side == "BUY" else tick.ask)
+    total_volume = max(sum(float(getattr(p, "volume", 0.0) or 0.0) for p in live_positions), 1e-9)
+    avg_entry = sum(float(p.price_open) * float(getattr(p, "volume", 0.0) or 0.0) for p in live_positions) / total_volume
+
+    tp_candidates = [float(getattr(p, "tp", 0.0) or 0.0) for p in live_positions if float(getattr(p, "tp", 0.0) or 0.0) > 0]
+    sl_candidates = [float(getattr(p, "sl", 0.0) or 0.0) for p in live_positions if float(getattr(p, "sl", 0.0) or 0.0) > 0]
+    if side == "BUY":
+        tp_candidates = [tp for tp in tp_candidates if tp > avg_entry]
+        nearest_tp = min(tp_candidates) if tp_candidates else avg_entry + float(df_m5["atr"].iloc[-1])
+        sl_ref = max(sl_candidates) if sl_candidates else avg_entry - float(df_m5["atr"].iloc[-1])
+    else:
+        tp_candidates = [tp for tp in tp_candidates if tp < avg_entry]
+        nearest_tp = max(tp_candidates) if tp_candidates else avg_entry - float(df_m5["atr"].iloc[-1])
+        sl_ref = min(sl_candidates) if sl_candidates else avg_entry + float(df_m5["atr"].iloc[-1])
+
+    atr_m5 = float(df_m5["atr"].iloc[-1] or 0.0)
+    if atr_m5 <= 0:
+        atr_m5 = max(abs(avg_entry - nearest_tp), info.point * 50)
+    ema20_m5 = df_m5["close"].ewm(span=20, adjust=False).mean()
+    ema50_m5 = df_m5["close"].ewm(span=50, adjust=False).mean()
+    m5_close = float(df_m5["close"].iloc[-1])
+    vwap_m5 = float(df_m5["vwap"].iloc[-1])
+    ema20_slope = float(ema20_m5.iloc[-1] - ema20_m5.iloc[-4]) if len(ema20_m5) >= 4 else 0.0
+
+    df_m1 = get_m1_cached(symbol)
+    df_m15 = get_m15_cached(symbol)
+    df_h1 = get_h1_cached(symbol)
+    m1_momentum = 0.0
+    m1_against_shock = False
+    if df_m1 is not None and len(df_m1) >= 6:
+        m1_momentum = float(df_m1["close"].iloc[-1] - df_m1["close"].iloc[-4])
+        last_range = float(df_m1["high"].iloc[-1] - df_m1["low"].iloc[-1])
+        atr_m1 = float(df_m1["atr"].iloc[-1] or atr_m5)
+        last_bar_dir = float(df_m1["close"].iloc[-1] - df_m1["open"].iloc[-1])
+        m1_against_shock = last_range > (atr_m1 * 1.8) and not _probability_direction_ok(side, last_bar_dir, 0.0)
+    else:
+        atr_m1 = atr_m5
+
+    m15_align = None
+    if df_m15 is not None and len(df_m15) >= 25:
+        ema20_m15 = df_m15["close"].ewm(span=20, adjust=False).mean()
+        m15_align = _probability_direction_ok(side, float(df_m15["close"].iloc[-1]), float(ema20_m15.iloc[-1]))
+
+    h1_align = None
+    if df_h1 is not None and len(df_h1) >= 25:
+        ema20_h1 = df_h1["close"].ewm(span=20, adjust=False).mean()
+        h1_align = _probability_direction_ok(side, float(df_h1["close"].iloc[-1]), float(ema20_h1.iloc[-1]))
+
+    risk_dist = max(abs(avg_entry - sl_ref), atr_m5 * 0.35, info.point * 25)
+    target_dist = max(abs(nearest_tp - avg_entry), risk_dist)
+    signed_move = (price - avg_entry) if side == "BUY" else (avg_entry - price)
+    tp_progress = signed_move / max(target_dist, 1e-9)
+    sl_buffer = ((price - sl_ref) if side == "BUY" else (sl_ref - price)) / max(risk_dist, 1e-9)
+
+    opened_at = _resolve_cluster_opened_at(cluster_state, live_positions)
+    age_sec = max(0.0, (now - opened_at).total_seconds()) if opened_at else 0.0
+    positive_legs = int(cluster_state.get("positive_legs", 0) or 0)
+    realized_profit = float(cluster_state.get("realized_profit", 0.0) or 0.0)
+    open_profit = float(cluster_meta.get("open_profit", 0.0) or 0.0)
+
+    base_score = float(cluster_state.get("score", strategy_cfg.get("min_score", 0.45)) or strategy_cfg.get("min_score", 0.45))
+    confidence = float(cluster_state.get("confidence", base_score * 100.0) or (base_score * 100.0))
+    probability = 50.0
+    contributions = {}
+
+    def add(label, value):
+        nonlocal probability
+        probability += value
+        contributions[label] = round(contributions.get(label, 0.0) + value, 2)
+
+    add("SETUP", (base_score - 0.5) * 28.0)
+    add("CONF", (confidence - 50.0) * 0.16)
+
+    price_vs_ema20 = _probability_direction_ok(side, price, float(ema20_m5.iloc[-1]))
+    ema_stack_ok = _probability_direction_ok(side, float(ema20_m5.iloc[-1]), float(ema50_m5.iloc[-1]))
+    vwap_ok = _probability_direction_ok(side, price, vwap_m5)
+    slope_ok = _probability_direction_ok(side, ema20_slope, 0.0)
+    m1_ok = _probability_direction_ok(side, m1_momentum, 0.0)
+
+    if profile in {"BREAKOUT", "SCALP", "VWAP", "TREND", "GENERIC"}:
+        add("EMA20", 7.0 if price_vs_ema20 else -9.0)
+        add("STACK", 7.0 if ema_stack_ok else -9.0)
+        add("VWAP", 6.0 if vwap_ok else -7.0)
+        add("MOMO", 6.0 if m1_ok else -7.0)
+        add("SLOPE", 5.0 if slope_ok else -6.0)
+    elif profile == "MEAN_REVERSION":
+        zscore = compute_zscore(df_m5["close"], 50)
+        z_now = float(zscore.iloc[-1])
+        z_prev = float(zscore.iloc[-3]) if len(zscore) >= 3 else z_now
+        add("REVERT", 7.0 if abs(z_now) < abs(z_prev) else -7.0)
+        add("VWAP", 5.0 if abs(price - vwap_m5) < abs(avg_entry - vwap_m5) else -6.0)
+        add("MOMO", 5.0 if m1_ok else -5.0)
+    elif profile == "STRUCTURE":
+        add("EMA20", 5.0 if price_vs_ema20 else -7.0)
+        add("H1", 4.0 if h1_align is True else (-4.0 if h1_align is False else 0.0))
+        add("MOMO", 5.0 if m1_ok else -6.0)
+
+    if m15_align is True:
+        add("M15", 4.0)
+    elif m15_align is False:
+        add("M15", -4.0)
+    if h1_align is True:
+        add("H1", 4.0)
+    elif h1_align is False:
+        add("H1", -5.0)
+
+    if tp_progress >= 0.55:
+        add("PROGRESS", 8.0)
+    elif tp_progress >= 0.25:
+        add("PROGRESS", 4.0)
+    elif tp_progress <= -0.25:
+        add("PROGRESS", -6.0)
+
+    if sl_buffer <= 0.20:
+        add("SLRISK", -20.0)
+    elif sl_buffer <= 0.35:
+        add("SLRISK", -12.0)
+    elif sl_buffer >= 0.75:
+        add("SLRISK", 4.0)
+
+    if positive_legs >= 1:
+        add("TPLOCK", 5.0)
+    if positive_legs >= 2 or realized_profit > 0:
+        add("TPLOCK", 7.0)
+    if open_profit > 0.0 and positive_legs == 0:
+        add("OPENPNL", 2.0)
+
+    if age_sec >= 900 and tp_progress < 0.08:
+        add("DECAY", -7.0)
+    elif age_sec >= 300 and tp_progress < -0.08:
+        add("DECAY", -5.0)
+    elif age_sec <= 180 and tp_progress >= 0.12:
+        add("DECAY", 2.0)
+
+    if m1_against_shock:
+        add("SHOCK", -7.0)
+    if abs(price - avg_entry) > atr_m5 * 2.6 and tp_progress < 0:
+        add("EXTREME", -6.0)
+
+    probability = clamp(probability, 0.0, 100.0)
+    previous_below_count = int(cluster_state.get("probability_below_count", 0) or 0)
+    below_count = previous_below_count + 1 if probability < PROBABILITY_MIN_THRESHOLD else 0
+    should_exit = False
+    if mode == "LIVE" and age_sec >= PROBABILITY_MIN_AGE_SEC:
+        should_exit = probability < PROBABILITY_HARD_THRESHOLD or below_count >= PROBABILITY_CONFIRM_CYCLES
+
+    result.update(
+        {
+            "probability": round(probability, 1),
+            "reason": _build_cluster_probability_reason(contributions),
+            "should_exit": bool(should_exit),
+            "below_count": below_count,
+            "age_sec": round(age_sec, 1),
+            "tp_progress": round(tp_progress, 3),
+            "sl_buffer": round(sl_buffer, 3),
+            "open_profit": round(open_profit, 2),
+        }
+    )
+    cluster_state["probability_below_count"] = below_count
+    cluster_state["probability_last_eval_at"] = now
+    cluster_state["probability_cached"] = dict(result)
+    return result
+
+
 def compute_kumo_cloud(df, conv_period=8, base_period=29, span_b_period=34, displacement=29):
     high = df["high"]
     low = df["low"]
@@ -1194,9 +1964,9 @@ def should_use_multi_tp(df, symbol):
     atr_ratio = atr / price
     trend_strength = compute_trend_strength(df)
 
-    if atr_ratio < 0.001:
+    if atr_ratio < 0.0008:
         return False
-    if trend_strength < MIN_TREND_STRENGTH:
+    if trend_strength < (MIN_TREND_STRENGTH * 0.85):
         return False
     return True
 
@@ -1294,6 +2064,47 @@ def ensure_session_balance_anchor():
             _save_session_state()
 
 
+def _seed_session_baseline():
+    global session_ignored_position_ids, last_history_check, session_baseline_ready
+    with history_state_lock:
+        processed_deals.clear()
+        session_ignored_position_ids = set()
+        if not mt5.terminal_info():
+            try:
+                mt5.initialize()
+            except Exception:
+                pass
+        if not mt5.terminal_info():
+            session_baseline_ready = False
+            last_history_check = datetime.now()
+            return False
+
+        now = datetime.now()
+        broker_now = now + get_live_broker_offset(force=True)
+        seed_start = now - timedelta(days=5)
+        with mt5_lock:
+            seed_deals = mt5.history_deals_get(seed_start, broker_now) or []
+        for d in seed_deals:
+            if getattr(d, "magic", None) != MAGIC_ID or not _is_realized_exit_deal(d):
+                continue
+            deal_ticket = _deal_ticket(d)
+            if deal_ticket is not None:
+                processed_deals.add(deal_ticket)
+
+        for p in safe_positions():
+            if getattr(p, "magic", None) != MAGIC_ID:
+                continue
+            position_id = getattr(p, "ticket", None)
+            if position_id is not None:
+                session_ignored_position_ids.add(position_id)
+            identifier = getattr(p, "identifier", None)
+            if identifier is not None:
+                session_ignored_position_ids.add(identifier)
+        last_history_check = datetime.now()
+        session_baseline_ready = True
+        return True
+
+
 def _refresh_runtime_modes():
     global equity_mode, ai_mode
     drawdown = get_drawdown()
@@ -1317,57 +2128,130 @@ def _refresh_runtime_modes():
 
 
 def get_decision_data():
+    if not session_active:
+        acc = mt5.account_info()
+        with history_state_lock:
+            _rebuild_visual_snapshots(acc=acc, live_pnl=0.0)
+            snapshot = dict(portfolio_snapshot or _blank_portfolio_snapshot())
+            signals = session_decision_stats["signals"]
+            filtered = session_decision_stats["filtered"]
+            executed = session_decision_stats["executed"]
+        return {
+            "ai_mode": ai_mode,
+            "equity_mode": equity_mode,
+            "optimizer_profile": CURRENT_OPTIMIZER_PROFILE,
+            "drawdown": round(get_drawdown() * 100, 2),
+            "winrate": 0.0,
+            "total_winrate": 0.0,
+            "signals": signals,
+            "filtered": filtered,
+            "executed": executed,
+            "equity": float(snapshot.get("equity", 0.0) or 0.0),
+            "balance": float(snapshot.get("balance", 0.0) or 0.0),
+            "session_profit": 0.0,
+            "session_closed_profit": 0.0,
+            "session_open_pnl": 0.0,
+            "closed_trades": 0,
+            "flat_trades": 0,
+            "session_started_at_label": snapshot.get("session_started_at_label", "--:-- | MT5 --:--"),
+            "tracked_results": 0,
+            "session_id": snapshot.get("session_id", session_runtime_id),
+        }
     if mt5.terminal_info():
         try:
-            tracked = performance_memory["wins"] + performance_memory["losses"]
-            if tracked == 0 or (datetime.now() - last_history_check).total_seconds() > 2:
+            with history_state_lock:
+                history_stale = (datetime.now() - last_history_check).total_seconds() > 0.75
+            if history_stale:
                 learn_from_history()
         except Exception:
             pass
     _refresh_runtime_modes()
     acc = mt5.account_info()
     ensure_session_balance_anchor()
-    total = performance_memory["wins"] + performance_memory["losses"]
-    session_closed_profit = session_stats["profit"]
     session_open_pnl = get_live_bot_pnl()
-    session_profit = session_closed_profit + session_open_pnl
-    broker_session_start = get_broker_session_start()
+    with history_state_lock:
+        _rebuild_visual_snapshots(acc=acc, live_pnl=session_open_pnl)
+        snapshot = dict(portfolio_snapshot or _blank_portfolio_snapshot())
+        total_wr = round(_get_winrate() * 100, 1)
+        signals = session_decision_stats["signals"]
+        filtered = session_decision_stats["filtered"]
+        executed = session_decision_stats["executed"]
     return {
         "ai_mode": ai_mode,
         "equity_mode": equity_mode,
         "optimizer_profile": CURRENT_OPTIMIZER_PROFILE,
         "drawdown": round(get_drawdown() * 100, 2),
-        "winrate": round(_get_session_winrate() * 100, 1),
-        "total_winrate": round(_get_winrate() * 100, 1),
-        "signals": session_decision_stats["signals"],
-        "filtered": session_decision_stats["filtered"],
-        "executed": session_decision_stats["executed"],
-        "equity": round(acc.equity, 2) if acc else 0.0,
-        "balance": round(acc.balance, 2) if acc else 0.0,
-        "session_profit": round(session_profit, 2),
-        "session_closed_profit": round(session_closed_profit, 2),
-        "session_open_pnl": round(session_open_pnl, 2),
-        "closed_trades": session_stats["trades"],
-        "flat_trades": session_stats.get("flat", 0),
-        "session_started_at_label": f"{session_started_at.strftime('%H:%M')} | MT5 {broker_session_start.strftime('%H:%M') if broker_session_start else '--:--'}",
-        "tracked_results": total,
+        "winrate": float(snapshot.get("winrate", 0.0) or 0.0),
+        "total_winrate": total_wr,
+        "signals": signals,
+        "filtered": filtered,
+        "executed": executed,
+        "equity": float(snapshot.get("equity", 0.0) or 0.0),
+        "balance": float(snapshot.get("balance", 0.0) or 0.0),
+        "session_profit": float(snapshot.get("session_profit", 0.0) or 0.0),
+        "session_closed_profit": float(snapshot.get("session_closed_profit", 0.0) or 0.0),
+        "session_open_pnl": float(snapshot.get("session_open_pnl", 0.0) or 0.0),
+        "closed_trades": int(snapshot.get("closed_trades", 0) or 0),
+        "flat_trades": int(snapshot.get("flat_trades", 0) or 0),
+        "session_started_at_label": snapshot.get("session_started_at_label", "--:-- | MT5 --:--"),
+        "tracked_results": int(snapshot.get("tracked_results", 0) or 0),
+        "session_id": snapshot.get("session_id", session_runtime_id),
     }
 
 
 def reset_session_tracking():
-    global session_stats, session_decision_stats, decision_stats, session_started_at, session_broker_started_at, session_balance_start, last_history_check
-    session_started_at = datetime.now()
-    session_broker_started_at = session_started_at + get_live_broker_offset(force=True)
-    session_stats = {"profit": 0.0, "trades": 0, "wins": 0, "losses": 0, "flat": 0}
-    session_decision_stats = {"signals": 0, "filtered": 0, "executed": 0}
-    decision_stats = {"signals": 0, "filtered": 0, "executed": 0}
-    processed_deals.clear()
-    trade_memory.clear()
-    position_strategy_map.clear()
-    last_history_check = session_started_at
-    acc = mt5.account_info()
-    session_balance_start = acc.balance if acc else None
-    _save_session_state()
+    global session_stats, session_decision_stats, decision_stats, session_started_at, session_broker_started_at, session_balance_start
+    global last_history_check, performance_memory, legacy_stats, asset_performance
+    global session_runtime_id, session_trade_ledger, portfolio_snapshot, strategy_matrix_snapshot, session_ignored_position_ids, session_active, session_baseline_ready
+    with history_state_lock:
+        session_active = False
+        session_baseline_ready = False
+        session_started_at = datetime.now()
+        session_broker_started_at = session_started_at + get_live_broker_offset(force=True)
+        session_runtime_id = _new_session_runtime_id()
+        session_stats = {"profit": 0.0, "trades": 0, "wins": 0, "losses": 0, "flat": 0}
+        session_decision_stats = {"signals": 0, "filtered": 0, "executed": 0}
+        decision_stats = {"signals": 0, "filtered": 0, "executed": 0}
+        performance_memory = {"wins": 0, "losses": 0}
+        legacy_stats = {"wins": 0, "losses": 0, "flat": 0, "gross_profit": 0.0, "gross_loss": 0.0, "net_profit": 0.0, "closed": 0}
+        asset_performance = {}
+        session_trade_ledger = []
+        portfolio_snapshot = _blank_portfolio_snapshot()
+        strategy_matrix_snapshot = []
+        session_ignored_position_ids = set()
+        for strategy_name in list(strategy_stats.keys()):
+            strategy_stats[strategy_name] = _blank_stats_row()
+        for runtime in strategy_runtime.values():
+            runtime["last_result"] = "---"
+            runtime["last_result_profit"] = 0.0
+            runtime["last_result_time"] = None
+            runtime["last_tp_plan"] = "---"
+            runtime["pretrigger"] = "---"
+            runtime["probability"] = 0.0
+            runtime["probability_reason"] = "---"
+            runtime["probability_mode"] = "OFF"
+            runtime["probability_threshold"] = PROBABILITY_MIN_THRESHOLD
+            runtime["probability_symbol"] = "---"
+            runtime["probability_time"] = None
+            if runtime.get("live_block") in {"WIN", "LOSS", "BE", "LIVE", "READY", "INIT"}:
+                runtime["live_block"] = "INIT"
+        processed_deals.clear()
+        trade_memory.clear()
+        position_strategy_map.clear()
+        last_history_check = session_started_at
+        acc = mt5.account_info()
+        session_balance_start = acc.balance if acc else None
+        _save_session_state()
+        _rebuild_visual_snapshots(acc=acc, live_pnl=0.0)
+
+
+def start_session_tracking():
+    global session_active
+    reset_session_tracking()
+    with history_state_lock:
+        session_active = True
+        _rebuild_visual_snapshots(acc=mt5.account_info(), live_pnl=0.0)
+    _seed_session_baseline()
 
 
 def set_optimizer_profile(profile_name):
@@ -1380,6 +2264,7 @@ def set_optimizer_profile(profile_name):
     RISK_PER_TRADE_PERCENT = profile["risk_per_trade_percent"]
     MAX_TOTAL_RISK = profile["max_total_risk"]
     MAX_TRADES_PER_CYCLE = profile["max_trades_per_cycle"]
+    _save_runtime_state()
     set_log(f"⚙️ OPTIMIZER {profile_key} | risk {RISK_PER_TRADE_PERCENT}% | max risk {round(MAX_TOTAL_RISK*100,1)}% | cycle {MAX_TRADES_PER_CYCLE}")
     return True
 
@@ -1394,118 +2279,21 @@ def get_optimizer_profile():
 
 
 def get_strategy_dashboard():
+    if not session_active:
+        with history_state_lock:
+            _rebuild_strategy_matrix_snapshot()
+            return [dict(row) for row in strategy_matrix_snapshot]
     if mt5.terminal_info():
         try:
-            tracked = performance_memory["wins"] + performance_memory["losses"]
-            if tracked == 0 or (datetime.now() - last_history_check).total_seconds() > 2:
+            with history_state_lock:
+                history_stale = (datetime.now() - last_history_check).total_seconds() > 0.75
+            if history_stale:
                 learn_from_history()
         except Exception:
             pass
-    dashboard = []
-    for strategy in STRATEGIES:
-        stats = strategy_stats.get(strategy["name"], {})
-        runtime = strategy_runtime.get(strategy["name"], {})
-        wins = stats.get("wins", 0)
-        losses = stats.get("losses", 0)
-        total = wins + losses
-        winrate = (wins / total) * 100 if total > 0 else 0.0
-        profit_factor = compute_profit_factor(stats)
-        if profit_factor == float("inf"):
-            profit_factor_display = "INF"
-        else:
-            profit_factor_display = round(profit_factor, 2)
-
-        status = "ACTIVE" if strategy.get("enabled") else "OFF"
-        is_crypto_branch = is_crypto_family(strategy.get("symbol_family"))
-        if is_crypto_branch and not crypto_enabled:
-            status = "STANDBY"
-        elif strategy["name"].endswith("_SCALP") and not scalping_enabled:
-            status = "STANDBY"
-        if strategy.get("disabled_reason"):
-            status = "LOCKED"
-
-        live_block = runtime.get("live_block", "INIT")
-        if status == "STANDBY" and is_crypto_branch and not crypto_enabled:
-            live_block = "CRYPTO OFF"
-        elif status == "STANDBY":
-            live_block = "SCALP OFF"
-        elif status == "LOCKED":
-            live_block = "LOCKED"
-        elif status == "OFF":
-            live_block = "OFF"
-
-        dashboard.append(
-            {
-                "name": strategy["name"],
-                "family": strategy.get("symbol_family", "---"),
-                "tag": strategy["tag"],
-                "status": status,
-                "mode": strategy["execution_mode"],
-                "session": strategy.get("session_label", "24H"),
-                "risk_multiplier": strategy["risk_multiplier"],
-                "sl_atr": strategy.get("sl_atr_multiplier", 1.2),
-                "tp_rr": strategy.get("tp_rr_multiplier", 2.0),
-                "tp_mode": "MULTI" if strategy["execution_mode"] == "MULTI_ONLY" else ("STD" if strategy["execution_mode"] == "STD_ONLY" else "AUTO"),
-                "split_range": f"{strategy.get('min_splits', 1)}-{strategy.get('max_splits', MAX_SPLITS)}" if strategy["execution_mode"] == "MULTI_ONLY" else "1",
-                "be_trigger": round(strategy.get("be_trigger_progress", 0.45) * 100),
-                "trail": " | ".join([f"{int(t*100)}>{int(l*100)}" for t, l in strategy.get("trail_steps", [])]) if strategy.get("trail_steps") else "---",
-                "winrate": round(winrate, 1),
-                "profit_factor": profit_factor_display,
-                "closed": stats.get("closed", 0),
-                "net_profit": round(stats.get("net_profit", 0.0), 2),
-                "disabled_reason": strategy.get("disabled_reason", ""),
-                "auto_disable": strategy.get("auto_disable", False),
-                "last_signal": runtime.get("last_signal", "---"),
-                "last_signal_conf": runtime.get("last_signal_conf", 0.0),
-                "last_signal_symbol": runtime.get("last_signal_symbol", "---"),
-                "last_signal_time": format_runtime_timestamp(runtime.get("last_signal_time")),
-                "last_result": runtime.get("last_result", "---"),
-                "last_result_profit": runtime.get("last_result_profit", 0.0),
-                "last_result_time": format_runtime_timestamp(runtime.get("last_result_time")),
-                "last_event": runtime.get("last_event", "INIT"),
-                "live_block": live_block,
-                "pretrigger": runtime.get("pretrigger", "---"),
-                "tp_plan": runtime.get("last_tp_plan", "---"),
-            }
-        )
-    legacy_total = legacy_stats.get("wins", 0) + legacy_stats.get("losses", 0)
-    if legacy_stats.get("closed", 0) > 0 or abs(legacy_stats.get("net_profit", 0.0)) > 0:
-        legacy_pf = compute_profit_factor(legacy_stats)
-        dashboard.append(
-            {
-                "name": "LEGACY",
-                "family": "MIGRATED",
-                "tag": "LEGACY",
-                "status": "LOCKED",
-                "mode": "HISTORY",
-                "session": "DAY",
-                "risk_multiplier": 0.0,
-                "sl_atr": 0.0,
-                "tp_rr": 0.0,
-                "tp_mode": "N/A",
-                "split_range": "-",
-                "be_trigger": 0,
-                "trail": "---",
-                "winrate": round((legacy_stats.get("wins", 0) / legacy_total) * 100, 1) if legacy_total > 0 else 0.0,
-                "profit_factor": "INF" if legacy_pf == float("inf") else round(legacy_pf, 2),
-                "closed": legacy_stats.get("closed", 0),
-                "net_profit": round(legacy_stats.get("net_profit", 0.0), 2),
-                "disabled_reason": "UNMAPPED TAGS",
-                "auto_disable": False,
-                "last_signal": "---",
-                "last_signal_conf": 0.0,
-                "last_signal_symbol": "---",
-                "last_signal_time": "---",
-                "last_result": "---",
-                "last_result_profit": 0.0,
-                "last_result_time": "---",
-                "last_event": "LEGACY HISTORY",
-                "live_block": "UNMAPPED",
-                "pretrigger": "---",
-                "tp_plan": "---",
-            }
-        )
-    return dashboard
+    with history_state_lock:
+        _rebuild_strategy_matrix_snapshot()
+        return [dict(row) for row in strategy_matrix_snapshot]
 
 
 def toggle_crypto(state):
@@ -1529,6 +2317,7 @@ def toggle_crypto(state):
         set_log("🌐 CRYPTO ENABLED: nessun simbolo crypto configurato")
     else:
         set_log("🌐 CRYPTO DISABLED")
+    _save_runtime_state()
 
 
 def toggle_scalping(state):
@@ -1549,6 +2338,7 @@ def toggle_scalping(state):
         set_log(f"⚡ SCALPING ENABLED: {armed_text}")
     else:
         set_log("⚡ SCALPING DISABLED")
+    _save_runtime_state()
 
 
 # ==============================================================================
@@ -1689,7 +2479,7 @@ def get_strategy_cluster_positions(symbol, strategy_tag):
     for p in safe_positions():
         if p.magic != MAGIC_ID or p.symbol != symbol:
             continue
-        p_tag = position_strategy_map.get(p.ticket) or (p.comment.rsplit("_", 1)[0] if p.comment else None)
+        p_tag = position_strategy_map.get(p.ticket) or extract_strategy_tag(getattr(p, "comment", ""))
         if p_tag == strategy_tag:
             positions.append(p)
     return positions
@@ -1840,6 +2630,79 @@ def get_h1_cached(symbol):
     return h1_cache[symbol]
 
 
+def _prime_symbol_scan_context(symbol, eligible_strategies):
+    names = {str(cfg.get("name", "") or "") for cfg in (eligible_strategies or [])}
+    filter_names = {getattr(cfg.get("filter_func"), "__name__", "") for cfg in (eligible_strategies or [])}
+
+    # M5 is the common base for all branches.
+    get_m5_cached(symbol)
+
+    need_m1 = (
+        any(name.endswith("_SCALP") or name.endswith("_ORB") or name == "XAU_LUKE" for name in names)
+        or "scalping_filter" in filter_names
+        or "luke_filter" in filter_names
+        or any("LIQUIDITY_PULLBACK" in name or "REVERSAL_SWEEP" in name for name in names)
+    )
+    need_m15 = (
+        any(name.endswith("_ORB") or name.endswith("_KUMO_BREAKOUT") for name in names)
+        or any(name.endswith("_TITANYX") for name in names)
+    )
+    need_m30 = any(name.endswith("_SIDUS") or name.endswith("_PURIA") for name in names)
+    need_h1 = (
+        any(
+            name.endswith("_SIDUS")
+            or name.endswith("_PURIA")
+            or name.endswith("_KUMO_BREAKOUT")
+            or name.endswith("_HEIKEN_TDI")
+            or name.endswith("_TITANYX")
+            or "LIQUIDITY_PULLBACK" in name
+            or "REVERSAL_SWEEP" in name
+            for name in names
+        )
+    )
+    need_h4 = (
+        any(
+            name.endswith("_SANTO_GRAAL")
+            or name.endswith("_SIDUS")
+            or name.endswith("_KUMO_BREAKOUT")
+            or name.endswith("_DOUBLE_MACD")
+            or name.endswith("_HEIKEN_TDI")
+            or "LIQUIDITY_PULLBACK" in name
+            or "REVERSAL_SWEEP" in name
+            for name in names
+        )
+    )
+    need_d1 = any(
+        name.endswith("_SANTO_GRAAL")
+        or name.endswith("_DOUBLE_MACD")
+        or name.endswith("_HEIKEN_TDI")
+        or name.endswith("_PURIA")
+        for name in names
+    )
+
+    if need_m1:
+        get_m1_cached(symbol)
+    if need_m15:
+        get_m15_cached(symbol)
+    if need_m30:
+        get_m30_cached(symbol)
+    if need_h1:
+        get_h1_cached(symbol)
+    if need_h4:
+        get_h4_cached(symbol)
+    if need_d1:
+        get_d1_cached(symbol)
+
+    return True
+
+
+def _run_strategy_eval(strategy, df, symbol):
+    try:
+        return {"strategy": strategy, "result": strategy["func"](df, symbol), "error": None}
+    except Exception as exc:
+        return {"strategy": strategy, "result": None, "error": exc}
+
+
 def get_broker_offset_from_df(df):
     if df is None or len(df) == 0:
         return timedelta(0)
@@ -1933,20 +2796,25 @@ def final_filter(symbol, df, score):
     is_crypto = any(symbol_in_family(symbol, family) for family in ["BTCUSD", "ETHUSD"])
     broker_hour = get_broker_hour()
     late_gold = symbol_in_family(symbol, "XAUUSD") and (broker_hour >= 21 or broker_hour <= 2)
-    min_score = 0.40 if attack else 0.45
-    min_momentum = atr * (0.06 if attack else 0.10)
-    min_vol = 0.00035 if attack else 0.0005
-    max_spread = atr * (0.14 if attack else 0.10)
+    min_score = 0.34 if attack else 0.38
+    min_momentum = atr * (0.04 if attack else 0.07)
+    min_vol = 0.00022 if attack else 0.00035
+    max_spread = atr * (0.18 if attack else 0.14)
     if is_crypto:
-        min_score = 0.36 if attack else 0.40
-        min_momentum = atr * (0.04 if attack else 0.07)
-        min_vol = 0.00018 if attack else 0.00028
-        max_spread = atr * (0.22 if attack else 0.16)
+        min_score = 0.30 if attack else 0.34
+        min_momentum = atr * (0.03 if attack else 0.05)
+        min_vol = 0.00012 if attack else 0.00020
+        max_spread = atr * (0.28 if attack else 0.22)
     elif late_gold:
-        min_score = 0.38 if attack else 0.42
-        min_momentum = atr * (0.05 if attack else 0.08)
-        min_vol = 0.00025 if attack else 0.00038
-        max_spread = atr * (0.20 if attack else 0.14)
+        min_score = 0.33 if attack else 0.36
+        min_momentum = atr * (0.04 if attack else 0.06)
+        min_vol = 0.00018 if attack else 0.00028
+        max_spread = atr * (0.24 if attack else 0.18)
+    if STRESS_TEST_ACTIVE:
+        min_score = max(0.28, min_score - 0.03)
+        min_momentum *= 0.88
+        min_vol *= 0.82
+        max_spread *= 1.18
     if score < min_score:
         return False, f"LOW SCORE ({round(score,2)})"
     if momentum < min_momentum:
@@ -1978,10 +2846,15 @@ def swing_filter(symbol, signal, score, market_df, execution_df, strategy_cfg):
     attack = is_attack_runtime()
     is_crypto = is_crypto_family(symbol)
 
-    min_score = 0.44 if attack else 0.48
-    min_momentum = atr * (0.035 if is_crypto else 0.045)
-    min_vol = 0.00014 if is_crypto else 0.00020
-    max_spread = atr * (0.22 if is_crypto else 0.14)
+    min_score = 0.36 if attack else 0.40
+    min_momentum = atr * (0.025 if is_crypto else 0.032)
+    min_vol = 0.00010 if is_crypto else 0.00016
+    max_spread = atr * (0.28 if is_crypto else 0.18)
+    if STRESS_TEST_ACTIVE:
+        min_score = max(0.30, min_score - 0.04)
+        min_momentum *= 0.84
+        min_vol *= 0.78
+        max_spread *= 1.16
 
     if score < min_score:
         return False, f"LOW SCORE ({round(score,2)})"
@@ -2001,15 +2874,15 @@ def allow_trading(symbol):
     if symbol_in_family(symbol, "BTCUSD") or symbol_in_family(symbol, "ETHUSD"):
         return 0 <= hour <= 23
     if symbol_in_family(symbol, "JPN225"):
-        return 2 <= hour <= 12
+        return 1 <= hour <= 13
     if symbol_in_family(symbol, "US2000"):
-        return 10 <= hour <= 23
+        return 8 <= hour <= 23
     if symbol_in_family(symbol, "USTECH"):
-        return 7 <= hour <= 23
+        return 6 <= hour <= 23
     if symbol_in_family(symbol, "US500") or symbol_in_family(symbol, "US30"):
-        return 10 <= hour <= 23
+        return 8 <= hour <= 23
     if symbol_in_family(symbol, "GER40") or symbol_in_family(symbol, "UK100") or symbol_in_family(symbol, "EUSTX50") or symbol_in_family(symbol, "FRA40") or symbol_in_family(symbol, "SMI20"):
-        return 8 <= hour <= 18
+        return 7 <= hour <= 20
     return False
 
 
@@ -2020,7 +2893,7 @@ def fast_market_filter(symbol):
     if not t1 or not t2:
         return False
     move = abs(t2.bid - t1.bid)
-    return move <= t1.bid * 0.004
+    return move <= t1.bid * 0.006
 
 
 def fast_market_filter_scalping(symbol):
@@ -2030,7 +2903,7 @@ def fast_market_filter_scalping(symbol):
     if not t1 or not t2:
         return False
     move = abs(t2.bid - t1.bid)
-    return move <= t1.bid * 0.006
+    return move <= t1.bid * 0.009
 
 
 def compute_dynamic_risk():
@@ -2074,8 +2947,8 @@ def titanyx_filter(symbol, signal, score, market_df, execution_df, strategy_cfg)
         return False, "NO ATR"
 
     spread = abs(float(tick.ask - tick.bid))
-    max_spread = atr * strategy_cfg.get("titanyx_spread_atr", 0.16)
-    min_score = strategy_cfg.get("min_score", 0.50) - 0.02
+    max_spread = atr * strategy_cfg.get("titanyx_spread_atr", 0.20)
+    min_score = strategy_cfg.get("min_score", 0.50) - 0.05
     if score < min_score:
         return False, f"LOW SCORE ({round(score, 2)})"
     if spread > max_spread:
@@ -2099,15 +2972,20 @@ def scalping_filter(symbol, signal, score, market_df, execution_df, strategy_cfg
     attack = is_attack_runtime()
     broker_hour = get_broker_hour()
     late_gold = symbol_in_family(symbol, "XAUUSD") and (broker_hour >= 21 or broker_hour <= 2)
-    min_score = strategy_cfg.get("min_score", 0.55)
-    spread_limit = atr_m1 * 0.16
-    body_floor = atr_m1 * 0.12
-    momentum_floor = atr_m1 * 0.22
+    min_score = strategy_cfg.get("min_score", 0.55) - 0.04
+    spread_limit = atr_m1 * 0.22
+    body_floor = atr_m1 * 0.09
+    momentum_floor = atr_m1 * 0.16
     if late_gold:
-        min_score = max(0.40 if attack else 0.42, min_score - 0.03)
-        spread_limit = atr_m1 * (0.22 if attack else 0.18)
-        body_floor = atr_m1 * (0.08 if attack else 0.10)
-        momentum_floor = atr_m1 * (0.16 if attack else 0.18)
+        min_score = max(0.34 if attack else 0.38, min_score - 0.03)
+        spread_limit = atr_m1 * (0.28 if attack else 0.24)
+        body_floor = atr_m1 * (0.06 if attack else 0.08)
+        momentum_floor = atr_m1 * (0.12 if attack else 0.14)
+    if STRESS_TEST_ACTIVE:
+        min_score = max(0.32, min_score - 0.03)
+        spread_limit *= 1.12
+        body_floor *= 0.88
+        momentum_floor *= 0.84
     if score < min_score:
         return False, f"LOW SCORE ({round(score,2)})"
     if spread > spread_limit:
@@ -2116,6 +2994,15 @@ def scalping_filter(symbol, signal, score, market_df, execution_df, strategy_cfg
         return False, "WEAK CANDLE"
     if momentum < momentum_floor:
         return False, "WEAK SCALP MOM"
+    return True, "OK"
+
+
+def luke_filter(symbol, signal, score, market_df, execution_df, strategy_cfg):
+    if execution_df is None or len(execution_df) < 40:
+        return False, "NO M1 DATA"
+    tick = safe_tick(symbol)
+    if not tick:
+        return False, "NO TICK"
     return True, "OK"
 
 
@@ -2199,6 +3086,437 @@ def blocked_signal(name, reason, pretrigger="---"):
     return {"name": name, "blocked": reason, "pretrigger": pretrigger}
 
 
+LUKE_PROFILES = {
+    "XAUUSD": {
+        "display": "XAUUSD",
+        "session_tz": "Europe/Rome",
+        "session_windows": [("09:30", "18:00")],
+        "news_windows": [],
+        "max_risk_pct": 1.0,
+        "legs": 6,
+        "spread_buffer_points": 0.6,
+        "min_stop_points": 8.0,
+        "max_stop_points": 12.0,
+        "no_chase_points": 4.0,
+        "tp_points": [4, 8, 12, 15, 19, 26],
+        "runner_enabled": False,
+        "runner_points": 35.0,
+        "runner_weight": 0.5,
+        "reentry_tp_points": [12, 15, 19],
+        "reentry_legs": 3,
+        "normal_be_after_tp": 2,
+        "reentry_be_after_tp": 3,
+        "max_reentries_per_zone": 1,
+        "max_minutes_from_first_entry": 30,
+        "max_consecutive_losses": 2,
+        "continuation_zone_low": 0.38,
+        "continuation_zone_high": 0.61,
+        "exhaustion_atr": 2.0,
+        "volatility_ratio_max": 2.2,
+        "range_ratio_max": 1.5,
+        "ema_divergence_atr": 1.7,
+    }
+}
+
+
+def _luke_runtime(symbol):
+    return luke_reentry_state.setdefault(symbol, {"eligible": False, "used": False, "loss_streak": 0})
+
+
+def _luke_reset_reentry(symbol):
+    state = _luke_runtime(symbol)
+    state.update(
+        {
+            "eligible": False,
+            "used": False,
+            "direction": None,
+            "zone_low": None,
+            "zone_high": None,
+            "sl_price": None,
+            "expires_at": None,
+            "tp_points": None,
+            "tp_be_after_legs": None,
+            "entry_time": None,
+            "source_setup": None,
+        }
+    )
+
+
+def _luke_point_value(info):
+    return gold_points_to_price(info, 1.0)
+
+
+def _luke_tp_payload(profile, info, tp_points, reentry=False):
+    tp_targets = list(tp_points)
+    lot_weights = [1.0] * len(tp_targets)
+    if not reentry and profile.get("runner_enabled"):
+        tp_targets.append(float(profile.get("runner_points", 35.0)))
+        lot_weights.append(float(profile.get("runner_weight", 0.5)))
+    return {
+        "force_splits": len(tp_targets),
+        "tp_point_targets": tp_targets,
+        "tp_point_buffer": float(profile["spread_buffer_points"]),
+        "point_value_price": _luke_point_value(info),
+        "lot_weights_override": lot_weights,
+        "tp_be_after_legs_override": int(profile["reentry_be_after_tp"] if reentry else profile["normal_be_after_tp"]),
+        "tp_lock_offset_override": 1,
+        "risk_percent_override": float(profile["max_risk_pct"]),
+    }
+
+
+def _luke_session_slice(df_m5, now_date):
+    if df_m5 is None or df_m5.empty:
+        return df_m5
+    session_df = df_m5[df_m5["time"].dt.date == now_date]
+    return session_df if not session_df.empty else df_m5.iloc[-60:].copy()
+
+
+def _luke_reentry_signal(symbol, branch_name, profile, info, tick, df_m1, atr_m1):
+    state = _luke_runtime(symbol)
+    if not state.get("eligible") or state.get("used"):
+        return None
+    expires_at = state.get("expires_at")
+    if not isinstance(expires_at, datetime) or datetime.now() > expires_at:
+        _luke_reset_reentry(symbol)
+        return blocked_signal(branch_name, "REENTRY EXPIRED")
+
+    direction = state.get("direction")
+    zone_low = float(state.get("zone_low") or 0.0)
+    zone_high = float(state.get("zone_high") or 0.0)
+    sl_price = state.get("sl_price")
+    if not direction or sl_price is None or zone_high <= zone_low:
+        _luke_reset_reentry(symbol)
+        return blocked_signal(branch_name, "REENTRY INVALID")
+
+    entry_price = float(tick.ask if direction == "BUY" else tick.bid)
+    price = float(df_m1["close"].iloc[-1])
+    if price < zone_low or price > zone_high:
+        return blocked_signal(branch_name, "REENTRY WAIT", f"ZONE {zone_low:.2f}-{zone_high:.2f}")
+
+    ema20_m1 = df_m1["close"].ewm(span=20).mean()
+    last = df_m1.iloc[-1]
+    prev = df_m1.iloc[-2]
+    body = abs(float(last["close"] - last["open"]))
+    strong_body = body >= atr_m1 * 0.08
+    if direction == "BUY":
+        confirm_ok = (
+            float(last["close"]) > float(last["open"])
+            and float(last["close"]) > float(prev["high"])
+            and float(last["close"]) >= float(ema20_m1.iloc[-1])
+        )
+    else:
+        confirm_ok = (
+            float(last["close"]) < float(last["open"])
+            and float(last["close"]) < float(prev["low"])
+            and float(last["close"]) <= float(ema20_m1.iloc[-1])
+        )
+    if not strong_body or not confirm_ok:
+        return blocked_signal(branch_name, "REENTRY NO CONFIRM")
+
+    stop_points = price_to_gold_points(info, abs(entry_price - float(sl_price)))
+    if stop_points < profile["min_stop_points"] or stop_points > profile["max_stop_points"]:
+        return blocked_signal(branch_name, "REENTRY SL RANGE", f"SL {stop_points:.1f}pt")
+
+    payload = _luke_tp_payload(profile, info, state.get("tp_points") or profile["reentry_tp_points"], reentry=True)
+    details = {
+        "instrument": profile["display"],
+        "setup": "RE-ENTRY",
+        "reentry": True,
+        "direction": "LONG" if direction == "BUY" else "SHORT",
+        "zone_low": round(zone_low, 2),
+        "zone_high": round(zone_high, 2),
+        "entry_price": round(entry_price, 2),
+        "stop_loss": round(float(sl_price), 2),
+        "take_profit": f"TP {state.get('tp_points') or profile['reentry_tp_points']}",
+        "summary": f"{profile['display']} {direction} | LUKE re-entry | zone {zone_low:.2f}-{zone_high:.2f} | SL {float(sl_price):.2f}",
+    }
+    return {
+        "signal": direction,
+        "confidence": 78,
+        "name": branch_name,
+        "execution_df": df_m1,
+        "sl_price": round(float(sl_price), 5),
+        "signal_key": f"LUKE|REENTRY|{direction}|{int(expires_at.timestamp())}",
+        **payload,
+        "signal_details": details,
+    }
+
+
+def strategy_xau_luke(df, symbol):
+    branch_name = "XAU_LUKE"
+    profile = LUKE_PROFILES["XAUUSD"]
+    if not scalping_enabled:
+        return blocked_signal(branch_name, "SCALP OFF")
+    if not _time_in_exchange_windows(profile["session_tz"], profile["session_windows"]):
+        return blocked_signal(branch_name, "OUT SESSION")
+    if _news_window_blocked(profile["session_tz"], profile["news_windows"]):
+        return blocked_signal(branch_name, "NEWS BLOCK")
+
+    df_m5 = get_m5_cached(symbol)
+    df_m1 = get_m1_cached(symbol)
+    if df_m5 is None or len(df_m5) < 80:
+        return blocked_signal(branch_name, "NO M5 DATA")
+    if df_m1 is None or len(df_m1) < 120:
+        return blocked_signal(branch_name, "NO M1 DATA")
+
+    tick = safe_tick(symbol)
+    info = safe_info(symbol)
+    if not tick or not info:
+        return blocked_signal(branch_name, "NO TICK")
+
+    state = _luke_runtime(symbol)
+    if int(state.get("loss_streak", 0) or 0) >= int(profile["max_consecutive_losses"]):
+        return blocked_signal(branch_name, "LOCKOUT LOSS")
+
+    point_value = _luke_point_value(info)
+    spread_points = abs(float(tick.ask - tick.bid)) / max(point_value, 1e-9)
+    if spread_points > 1.2:
+        return blocked_signal(branch_name, "SPREAD HIGH", f"SP {spread_points:.1f}pt")
+
+    atr_m1 = float(df_m1["atr"].iloc[-2] or 0.0)
+    atr_m5 = float(df_m5["atr"].iloc[-2] or 0.0)
+    atr_m1_avg = float(df_m1["atr"].iloc[-60:-2].mean() or 0.0)
+    if atr_m1 <= 0 or atr_m5 <= 0 or atr_m1_avg <= 0:
+        return blocked_signal(branch_name, "NO ATR")
+    if atr_m1 > atr_m1_avg * profile["volatility_ratio_max"]:
+        return blocked_signal(branch_name, "VOLATILITY BLOCK", pretrigger_text("ATR", atr_m1 - (atr_m1_avg * profile["volatility_ratio_max"]), atr_m1_avg))
+
+    last_1m = df_m1.iloc[-1]
+    current_range = float(last_1m["high"] - last_1m["low"])
+    if current_range > atr_m1 * profile["range_ratio_max"]:
+        return blocked_signal(branch_name, "RANGE ERRATICO", pretrigger_text("RNG", current_range - (atr_m1 * profile["range_ratio_max"]), atr_m1))
+
+    ema20_m5 = df_m5["close"].ewm(span=20).mean()
+    ema50_m5 = df_m5["close"].ewm(span=50).mean()
+    ema_divergence = abs(float(ema20_m5.iloc[-2] - ema50_m5.iloc[-2]))
+    if ema_divergence > atr_m5 * profile["ema_divergence_atr"]:
+        return blocked_signal(branch_name, "TREND TOO STRONG", pretrigger_text("EMA", ema_divergence - (atr_m5 * profile["ema_divergence_atr"]), atr_m5))
+
+    now_broker = get_broker_now()
+    session_df = _luke_session_slice(df_m5, now_broker.date())
+    if len(session_df) >= 12:
+        first_hour = session_df.iloc[:12]
+        first_hour_high = float(first_hour["high"].max())
+        first_hour_low = float(first_hour["low"].min())
+        last_close = float(df_m5["close"].iloc[-2])
+        if last_close > first_hour_high + atr_m5 * 0.65 or last_close < first_hour_low - atr_m5 * 0.65:
+            return blocked_signal(branch_name, "SESSION BREAKOUT ACTIVE")
+
+    reentry = _luke_reentry_signal(symbol, branch_name, profile, info, tick, df_m1, atr_m1)
+    if reentry and not reentry.get("blocked"):
+        return reentry
+
+    ema20_slope = float(ema20_m5.iloc[-2] - ema20_m5.iloc[-5])
+    vwap_m5 = float(df_m5["vwap"].iloc[-2])
+    price_m5 = float(df_m5["close"].iloc[-2])
+    last_m1 = df_m1.iloc[-1]
+    prev_m1 = df_m1.iloc[-2]
+    recent_m1 = df_m1.iloc[-8:-1]
+    bullish_confirm = (
+        float(last_m1["close"]) > float(last_m1["open"])
+        and float(last_m1["close"]) > float(prev_m1["high"])
+        and float(last_m1["close"]) > float(df_m1["vwap"].iloc[-1])
+    )
+    bearish_confirm = (
+        float(last_m1["close"]) < float(last_m1["open"])
+        and float(last_m1["close"]) < float(prev_m1["low"])
+        and float(last_m1["close"]) < float(df_m1["vwap"].iloc[-1])
+    )
+
+    recent_m5 = df_m5.iloc[-18:-2].copy()
+    if len(recent_m5) < 12:
+        return blocked_signal(branch_name, "NO STRUCTURE")
+
+    long_low_idx = int(recent_m5["low"].idxmin())
+    long_impulse = recent_m5.loc[long_low_idx:]
+    short_high_idx = int(recent_m5["high"].idxmax())
+    short_impulse = recent_m5.loc[short_high_idx:]
+    current_ask = float(tick.ask)
+    current_bid = float(tick.bid)
+
+    if (
+        price_m5 > vwap_m5
+        and float(ema20_m5.iloc[-2]) > float(ema50_m5.iloc[-2])
+        and ema20_slope > 0
+        and float(recent_m5["high"].iloc[-2]) > float(recent_m5["high"].iloc[-6])
+        and float(recent_m5["low"].iloc[-2]) > float(recent_m5["low"].iloc[-6])
+        and len(long_impulse) >= 5
+    ):
+        impulse_low = float(long_impulse["low"].iloc[0])
+        impulse_high = float(long_impulse["high"].max())
+        impulse_range = impulse_high - impulse_low
+        if impulse_range >= atr_m5 * 1.2:
+            zone_low = impulse_high - impulse_range * profile["continuation_zone_high"]
+            zone_high = impulse_high - impulse_range * profile["continuation_zone_low"]
+            if current_ask > zone_high + gold_points_to_price(info, profile["no_chase_points"]):
+                return blocked_signal(branch_name, "NO CHASE", "LONG moved past TP1 window")
+            pullback_low = float(recent_m1["low"].min())
+            sl_price = min(pullback_low, impulse_low) - gold_points_to_price(info, profile["spread_buffer_points"])
+            stop_points = price_to_gold_points(info, abs(current_ask - sl_price))
+            if zone_low <= current_ask <= zone_high and bullish_confirm and profile["min_stop_points"] <= stop_points <= profile["max_stop_points"]:
+                payload = _luke_tp_payload(profile, info, profile["tp_points"], reentry=False)
+                details = {
+                    "instrument": profile["display"],
+                    "setup": "CONTINUATION RETEST",
+                    "reentry": False,
+                    "direction": "LONG",
+                    "zone_low": round(zone_low, 2),
+                    "zone_high": round(zone_high, 2),
+                    "entry_price": round(current_ask, 2),
+                    "stop_loss": round(sl_price, 2),
+                    "take_profit": f"TP {profile['tp_points']}",
+                    "summary": f"{profile['display']} LONG | LUKE continuation | zone {zone_low:.2f}-{zone_high:.2f} | SL {sl_price:.2f}",
+                }
+                return {
+                    "signal": "BUY",
+                    "confidence": 80,
+                    "name": branch_name,
+                    "execution_df": df_m1,
+                    "sl_price": round(sl_price, 5),
+                    "signal_key": f"LUKE|CONT|BUY|{df_m1.iloc[-2]['time'].isoformat()}",
+                    **payload,
+                    "signal_details": details,
+                }
+
+    if (
+        price_m5 < vwap_m5
+        and float(ema20_m5.iloc[-2]) < float(ema50_m5.iloc[-2])
+        and ema20_slope < 0
+        and float(recent_m5["high"].iloc[-2]) < float(recent_m5["high"].iloc[-6])
+        and float(recent_m5["low"].iloc[-2]) < float(recent_m5["low"].iloc[-6])
+        and len(short_impulse) >= 5
+    ):
+        impulse_high = float(short_impulse["high"].iloc[0])
+        impulse_low = float(short_impulse["low"].min())
+        impulse_range = impulse_high - impulse_low
+        if impulse_range >= atr_m5 * 1.2:
+            zone_low = impulse_low + impulse_range * profile["continuation_zone_low"]
+            zone_high = impulse_low + impulse_range * profile["continuation_zone_high"]
+            if current_bid < zone_low - gold_points_to_price(info, profile["no_chase_points"]):
+                return blocked_signal(branch_name, "NO CHASE", "SHORT moved past TP1 window")
+            pullback_high = float(recent_m1["high"].max())
+            sl_price = max(pullback_high, impulse_high) + gold_points_to_price(info, profile["spread_buffer_points"])
+            stop_points = price_to_gold_points(info, abs(current_bid - sl_price))
+            if zone_low <= current_bid <= zone_high and bearish_confirm and profile["min_stop_points"] <= stop_points <= profile["max_stop_points"]:
+                payload = _luke_tp_payload(profile, info, profile["tp_points"], reentry=False)
+                details = {
+                    "instrument": profile["display"],
+                    "setup": "CONTINUATION RETEST",
+                    "reentry": False,
+                    "direction": "SHORT",
+                    "zone_low": round(zone_low, 2),
+                    "zone_high": round(zone_high, 2),
+                    "entry_price": round(current_bid, 2),
+                    "stop_loss": round(sl_price, 2),
+                    "take_profit": f"TP {profile['tp_points']}",
+                    "summary": f"{profile['display']} SHORT | LUKE continuation | zone {zone_low:.2f}-{zone_high:.2f} | SL {sl_price:.2f}",
+                }
+                return {
+                    "signal": "SELL",
+                    "confidence": 80,
+                    "name": branch_name,
+                    "execution_df": df_m1,
+                    "sl_price": round(sl_price, 5),
+                    "signal_key": f"LUKE|CONT|SELL|{df_m1.iloc[-2]['time'].isoformat()}",
+                    **payload,
+                    "signal_details": details,
+                }
+
+    session_high = float(session_df["high"].max()) if len(session_df) else float(df_m5["high"].iloc[-24:-2].max())
+    session_low = float(session_df["low"].min()) if len(session_df) else float(df_m5["low"].iloc[-24:-2].min())
+    vwap_m1 = float(df_m1["vwap"].iloc[-1])
+    rejection_body = abs(float(last_m1["close"] - last_m1["open"]))
+    rejection_ok = rejection_body >= atr_m1 * 0.16
+    two_bar_high = float(df_m1["high"].iloc[-3:-1].max())
+    two_bar_low = float(df_m1["low"].iloc[-3:-1].min())
+
+    if (
+        current_bid >= session_high - gold_points_to_price(info, 0.8)
+        and (current_bid - vwap_m1) >= atr_m1 * profile["exhaustion_atr"]
+        and float(last_m1["high"] - max(last_m1["open"], last_m1["close"])) >= rejection_body * 0.6
+        and float(last_m1["close"]) < two_bar_high
+        and rejection_ok
+    ):
+        sl_price = float(last_m1["high"]) + gold_points_to_price(info, profile["spread_buffer_points"])
+        stop_points = price_to_gold_points(info, abs(current_bid - sl_price))
+        if profile["min_stop_points"] <= stop_points <= profile["max_stop_points"]:
+            payload = _luke_tp_payload(profile, info, profile["tp_points"], reentry=False)
+            details = {
+                "instrument": profile["display"],
+                "setup": "EXHAUSTION FADE",
+                "reentry": False,
+                "direction": "SHORT",
+                "zone_low": round(two_bar_low, 2),
+                "zone_high": round(two_bar_high, 2),
+                "entry_price": round(current_bid, 2),
+                "stop_loss": round(sl_price, 2),
+                "take_profit": f"TP {profile['tp_points']}",
+                "summary": f"{profile['display']} SHORT | LUKE fade | session high sweep | SL {sl_price:.2f}",
+            }
+            return {
+                "signal": "SELL",
+                "confidence": 77,
+                "name": branch_name,
+                "execution_df": df_m1,
+                "sl_price": round(sl_price, 5),
+                "signal_key": f"LUKE|FADE|SELL|{df_m1.iloc[-2]['time'].isoformat()}",
+                **payload,
+                "signal_details": details,
+            }
+
+    if (
+        current_ask <= session_low + gold_points_to_price(info, 0.8)
+        and (vwap_m1 - current_ask) >= atr_m1 * profile["exhaustion_atr"]
+        and float(min(last_m1["open"], last_m1["close"]) - last_m1["low"]) >= rejection_body * 0.6
+        and float(last_m1["close"]) > two_bar_low
+        and rejection_ok
+    ):
+        sl_price = float(last_m1["low"]) - gold_points_to_price(info, profile["spread_buffer_points"])
+        stop_points = price_to_gold_points(info, abs(current_ask - sl_price))
+        if profile["min_stop_points"] <= stop_points <= profile["max_stop_points"]:
+            payload = _luke_tp_payload(profile, info, profile["tp_points"], reentry=False)
+            details = {
+                "instrument": profile["display"],
+                "setup": "EXHAUSTION FADE",
+                "reentry": False,
+                "direction": "LONG",
+                "zone_low": round(two_bar_low, 2),
+                "zone_high": round(two_bar_high, 2),
+                "entry_price": round(current_ask, 2),
+                "stop_loss": round(sl_price, 2),
+                "take_profit": f"TP {profile['tp_points']}",
+                "summary": f"{profile['display']} LONG | LUKE fade | session low flush | SL {sl_price:.2f}",
+            }
+            return {
+                "signal": "BUY",
+                "confidence": 77,
+                "name": branch_name,
+                "execution_df": df_m1,
+                "sl_price": round(sl_price, 5),
+                "signal_key": f"LUKE|FADE|BUY|{df_m1.iloc[-2]['time'].isoformat()}",
+                **payload,
+                "signal_details": details,
+            }
+
+    if reentry and reentry.get("blocked"):
+        return reentry
+    if spread_points > 0.9:
+        return blocked_signal(branch_name, "SPREAD HIGH", f"SP {spread_points:.1f}pt")
+    return blocked_signal(branch_name, "LUKE WAIT", "NO CLEAN ZONE")
+
+
+def get_luke_exit_reason(symbol, strategy_cfg, signal):
+    profile = LUKE_PROFILES.get("XAUUSD")
+    if not profile:
+        return None
+    now = get_exchange_now(profile["session_tz"])
+    if now.weekday() >= 5:
+        return "weekend flat"
+    if not _time_in_exchange_windows(profile["session_tz"], profile["session_windows"]):
+        return "session flat"
+    return None
+
+
 LIQUIDITY_SNIPER_PROFILES = {
     "USTECH": {
         "display": "US100",
@@ -2206,7 +3524,7 @@ LIQUIDITY_SNIPER_PROFILES = {
         "preferred": "CONTINUATION",
         "secondary": "REVERSAL",
         "session_tz": "US/Eastern",
-        "session_windows": [("09:30", "11:30")],
+        "session_windows": [("09:30", "15:30")],
         "news_windows": [],
         "max_daily_drawdown_eur": 4.8,
         "max_symbol_trades": 2,
@@ -2218,7 +3536,7 @@ LIQUIDITY_SNIPER_PROFILES = {
         "preferred": "CONTINUATION",
         "secondary": "REVERSAL",
         "session_tz": "Europe/Berlin",
-        "session_windows": [("09:00", "11:00")],
+        "session_windows": [("09:00", "16:30")],
         "news_windows": [],
         "max_daily_drawdown_eur": 4.0,
         "max_symbol_trades": 2,
@@ -2230,7 +3548,7 @@ LIQUIDITY_SNIPER_PROFILES = {
         "preferred": "CONTINUATION",
         "secondary": "REVERSAL",
         "session_tz": "US/Eastern",
-        "session_windows": [("09:30", "11:30")],
+        "session_windows": [("09:30", "15:30")],
         "news_windows": [],
         "max_daily_drawdown_eur": 4.4,
         "max_symbol_trades": 2,
@@ -2242,7 +3560,7 @@ LIQUIDITY_SNIPER_PROFILES = {
         "preferred": "CONTINUATION",
         "secondary": "REVERSAL",
         "session_tz": "Asia/Tokyo",
-        "session_windows": [("09:00", "11:00")],
+        "session_windows": [("09:00", "14:30")],
         "news_windows": [],
         "max_daily_drawdown_eur": 3.8,
         "max_symbol_trades": 2,
@@ -2254,7 +3572,7 @@ LIQUIDITY_SNIPER_PROFILES = {
         "preferred": "CONTINUATION",
         "secondary": "REVERSAL",
         "session_tz": "Europe/Berlin",
-        "session_windows": [("09:00", "11:00")],
+        "session_windows": [("09:00", "16:30")],
         "news_windows": [],
         "max_daily_drawdown_eur": 3.8,
         "max_symbol_trades": 2,
@@ -2266,7 +3584,7 @@ LIQUIDITY_SNIPER_PROFILES = {
         "preferred": "REVERSAL",
         "secondary": "CONTINUATION",
         "session_tz": "US/Eastern",
-        "session_windows": [("09:30", "11:30")],
+        "session_windows": [("09:30", "15:30")],
         "news_windows": [],
         "max_daily_drawdown_eur": 4.6,
         "max_symbol_trades": 2,
@@ -2278,7 +3596,7 @@ LIQUIDITY_SNIPER_PROFILES = {
         "preferred": "REVERSAL",
         "secondary": "CONTINUATION",
         "session_tz": "Europe/London",
-        "session_windows": [("08:00", "10:00")],
+        "session_windows": [("08:00", "16:00")],
         "news_windows": [],
         "max_daily_drawdown_eur": 3.6,
         "max_symbol_trades": 2,
@@ -2290,7 +3608,7 @@ LIQUIDITY_SNIPER_PROFILES = {
         "preferred": "CONTINUATION",
         "secondary": "REVERSAL",
         "session_tz": "US/Eastern",
-        "session_windows": [("09:30", "11:30")],
+        "session_windows": [("09:30", "15:30")],
         "news_windows": [],
         "max_daily_drawdown_eur": 4.0,
         "max_symbol_trades": 2,
@@ -2302,7 +3620,7 @@ LIQUIDITY_SNIPER_PROFILES = {
         "preferred": "CONTINUATION",
         "secondary": "REVERSAL",
         "session_tz": "Europe/Paris",
-        "session_windows": [("09:00", "11:00")],
+        "session_windows": [("09:00", "16:30")],
         "news_windows": [],
         "max_daily_drawdown_eur": 3.5,
         "max_symbol_trades": 2,
@@ -2314,7 +3632,7 @@ LIQUIDITY_SNIPER_PROFILES = {
         "preferred": "REVERSAL",
         "secondary": "CONTINUATION",
         "session_tz": "Europe/Zurich",
-        "session_windows": [("09:00", "11:00")],
+        "session_windows": [("09:00", "16:30")],
         "news_windows": [],
         "max_daily_drawdown_eur": 3.4,
         "max_symbol_trades": 2,
@@ -2436,7 +3754,7 @@ def _build_liquidity_sniper_day_state(seed_deals, position_map):
     state = _blank_liquidity_sniper_day_state(get_broker_session_start().date())
     relevant = [
         d for d in sorted(seed_deals, key=lambda item: (getattr(item, "time", 0), _deal_ticket(item) or 0))
-        if d.magic == MAGIC_ID and d.entry == mt5.DEAL_ENTRY_OUT
+        if d.magic == MAGIC_ID and _is_realized_exit_deal(d)
     ]
     for d in relevant:
         position_id = getattr(d, "position_id", None) or getattr(d, "position", None)
@@ -2477,14 +3795,16 @@ def _liquidity_sniper_limits_ok(symbol, profile):
 
 def _allow_liquidity_sniper_priority(symbol, confluences):
     global liquidity_sniper_cycle_symbols
-    if symbol in liquidity_sniper_cycle_symbols:
-        return True
-    if confluences >= 7:
-        return True
-    if len(liquidity_sniper_cycle_symbols) < 3:
-        liquidity_sniper_cycle_symbols.append(symbol)
-        return True
-    return False
+    with liquidity_sniper_cycle_lock:
+        if symbol in liquidity_sniper_cycle_symbols:
+            return True
+        if confluences >= (6 if STRESS_TEST_ACTIVE else 7):
+            return True
+        max_symbols = 8 if STRESS_TEST_ACTIVE else 5
+        if len(liquidity_sniper_cycle_symbols) < max_symbols:
+            liquidity_sniper_cycle_symbols.append(symbol)
+            return True
+        return False
 
 
 def _price_midrange_block(price, range_low, range_high):
@@ -2508,7 +3828,7 @@ def _find_liquidity_sweep(df_ltf, side):
         body = abs(float(displacement_bar["close"] - displacement_bar["open"]))
         displacement = (
             float(displacement_bar["close"]) > structure_level
-            and body >= atr * 0.80
+            and body >= atr * (0.72 if STRESS_TEST_ACTIVE else 0.80)
             and float(displacement_bar["close"]) > float(displacement_bar["open"])
         )
         if not sweep or not displacement:
@@ -2529,7 +3849,7 @@ def _find_liquidity_sweep(df_ltf, side):
     body = abs(float(displacement_bar["close"] - displacement_bar["open"]))
     displacement = (
         float(displacement_bar["close"]) < structure_level
-        and body >= atr * 0.80
+        and body >= atr * (0.72 if STRESS_TEST_ACTIVE else 0.80)
         and float(displacement_bar["close"]) < float(displacement_bar["open"])
     )
     if not sweep or not displacement:
@@ -2554,10 +3874,10 @@ def _retrace_ok(price, sweep_info, side):
     total_move = max(abs(impulse_high - impulse_low), 1e-9)
     if side == "BUY":
         retrace_ratio = (sweep_info["displacement_close"] - price) / total_move
-        zone_ok = 0.62 <= retrace_ratio <= 0.79
+        zone_ok = (0.52 if STRESS_TEST_ACTIVE else 0.62) <= retrace_ratio <= 0.79
     else:
         retrace_ratio = (price - sweep_info["displacement_close"]) / total_move
-        zone_ok = 0.50 <= retrace_ratio <= 0.79
+        zone_ok = (0.45 if STRESS_TEST_ACTIVE else 0.50) <= retrace_ratio <= 0.79
     return zone_ok, retrace_ratio
 
 
@@ -2626,7 +3946,7 @@ def _build_continuation_liquidity_signal(df, symbol, branch_name, family):
 
     atr_h1 = float(df_h1["atr"].iloc[-2] or 0.0)
     zone = _get_supply_demand_zone(df_h1, signal)
-    in_zone = _price_in_zone((price_bid + price_ask) / 2.0, zone, atr_h1, 0.35)
+    in_zone = _price_in_zone((price_bid + price_ask) / 2.0, zone, atr_h1, 0.48 if STRESS_TEST_ACTIVE else 0.35)
     sweep_info = _find_liquidity_sweep(df, signal)
     if not sweep_info:
         return blocked_signal(branch_name, "NO REAL SWEEP")
@@ -2641,7 +3961,7 @@ def _build_continuation_liquidity_signal(df, symbol, branch_name, family):
     sl_buffer = max(buffer_pct, buffer_atr)
     sl_price = sweep_info["sweep_extreme"] - sl_buffer if signal == "BUY" else sweep_info["sweep_extreme"] + sl_buffer
     rr = abs(tp2 - entry_price) / max(abs(entry_price - sl_price), 1e-9)
-    displacement_ok = bool(sweep_info["body"] >= sweep_info["atr"] * 0.80)
+    displacement_ok = bool(sweep_info["body"] >= sweep_info["atr"] * (0.72 if STRESS_TEST_ACTIVE else 0.80))
     bos_ok = True
 
     confluences = 0
@@ -2653,10 +3973,10 @@ def _build_continuation_liquidity_signal(df, symbol, branch_name, family):
         displacement_ok,
         retrace_ok,
         premium_discount_ok,
-        rr >= 2.0,
+        rr >= (1.8 if STRESS_TEST_ACTIVE else 2.0),
     ]
     confluences = sum(1 for x in checks if x)
-    if confluences < 6:
+    if confluences < (5 if STRESS_TEST_ACTIVE else 6):
         return blocked_signal(branch_name, "LOW CONFLUENCE", f"{confluences}/8")
     if not _allow_liquidity_sniper_priority(symbol, confluences):
         return blocked_signal(branch_name, "LOWER PRIORITY", f"{confluences}/8")
@@ -2724,8 +4044,8 @@ def _build_reversal_external_sweep_signal(df, symbol, branch_name, family):
     h4_high = float(df_h4["high"].iloc[-24:-2].max())
     h4_low = float(df_h4["low"].iloc[-24:-2].min())
     range_pos = _sniper_range_position(price_mid, h4_low, h4_high)
-    long_context = range_pos <= 0.38
-    short_context = range_pos >= 0.62
+    long_context = range_pos <= (0.44 if STRESS_TEST_ACTIVE else 0.38)
+    short_context = range_pos >= (0.56 if STRESS_TEST_ACTIVE else 0.62)
     if not long_context and not short_context:
         return blocked_signal(branch_name, "NO PREMIUM DISCOUNT", f"RNG {range_pos:.2f}")
 
@@ -2748,11 +4068,11 @@ def _build_reversal_external_sweep_signal(df, symbol, branch_name, family):
         return blocked_signal(branch_name, "NO CLEAN RETRACE", f"RET {retrace_ratio:.2f}" if retrace_ratio is not None else "---")
 
     zone = _get_supply_demand_zone(df_h1, signal)
-    in_zone = _price_in_zone(price_mid, zone, float(df_h1["atr"].iloc[-2] or 0.0), 0.45)
+    in_zone = _price_in_zone(price_mid, zone, float(df_h1["atr"].iloc[-2] or 0.0), 0.58 if STRESS_TEST_ACTIVE else 0.45)
     tp1, tp2 = _reversal_tp_levels(df_h4, entry_price, signal)
     sl_price = sweep_info["sweep_extreme"] - atr_m5 * 0.18 if signal == "BUY" else sweep_info["sweep_extreme"] + atr_m5 * 0.18
     rr = abs(tp2 - entry_price) / max(abs(entry_price - sl_price), 1e-9)
-    displacement_ok = sweep_info["body"] >= sweep_info["atr"] * 0.85
+    displacement_ok = sweep_info["body"] >= sweep_info["atr"] * (0.76 if STRESS_TEST_ACTIVE else 0.85)
     bos_ok = True
     confluences = sum(
         1
@@ -2764,11 +4084,11 @@ def _build_reversal_external_sweep_signal(df, symbol, branch_name, family):
             displacement_ok,
             retrace_ok,
             True,
-            rr >= 2.2,
+            rr >= (1.9 if STRESS_TEST_ACTIVE else 2.2),
         ]
         if x
     )
-    if confluences < 6:
+    if confluences < (5 if STRESS_TEST_ACTIVE else 6):
         return blocked_signal(branch_name, "LOW CONFLUENCE", f"{confluences}/8")
     if not _allow_liquidity_sniper_priority(symbol, confluences):
         return blocked_signal(branch_name, "LOWER PRIORITY", f"{confluences}/8")
@@ -4143,15 +5463,18 @@ def strategy_ger40_pullback_scalp(df, symbol):
         return blocked_signal("GER40_PULLBACK_SCALP", "SCALP OFF")
 
     hour = get_broker_hour()
-    if hour < 8 or hour > 18:
+    if hour < 8 or hour > 17:
         return blocked_signal("GER40_PULLBACK_SCALP", "OUT SESSION")
 
     df_m1 = get_data(symbol, mt5.TIMEFRAME_M1, 260)
     df_m15 = get_m15_cached(symbol)
+    df_h1 = get_h1_cached(symbol)
     if df_m1 is None or len(df_m1) < 220:
         return blocked_signal("GER40_PULLBACK_SCALP", "NO M1 DATA")
     if df_m15 is None or len(df_m15) < 60:
         return blocked_signal("GER40_PULLBACK_SCALP", "NO M15 DATA")
+    if df_h1 is None or len(df_h1) < 80:
+        return blocked_signal("GER40_PULLBACK_SCALP", "NO H1 DATA")
 
     tick = safe_tick(symbol)
     if not tick:
@@ -4171,7 +5494,19 @@ def strategy_ger40_pullback_scalp(df, symbol):
         return blocked_signal("GER40_PULLBACK_SCALP", "SPREAD HIGH")
 
     m15_close = df_m15["close"].iloc[-1]
-    ema50_m15 = df_m15["close"].ewm(span=50).mean().iloc[-1]
+    close_m15 = df_m15["close"]
+    ema20_m15_series = close_m15.ewm(span=20).mean()
+    ema50_m15_series = close_m15.ewm(span=50).mean()
+    ema20_m15 = ema20_m15_series.iloc[-1]
+    ema20_m15_prev = ema20_m15_series.iloc[-4]
+    ema50_m15 = ema50_m15_series.iloc[-1]
+    m15_slope = ema20_m15 - ema20_m15_prev
+    h1_close = df_h1["close"]
+    ema20_h1_series = h1_close.ewm(span=20).mean()
+    ema50_h1_series = h1_close.ewm(span=50).mean()
+    ema20_h1 = ema20_h1_series.iloc[-1]
+    ema50_h1 = ema50_h1_series.iloc[-1]
+    h1_slope = ema20_h1 - ema20_h1_series.iloc[-4]
     last = df_m1.iloc[-1]
     prev = df_m1.iloc[-2]
     recent_high = df_m1["high"].tail(6).max()
@@ -4183,12 +5518,27 @@ def strategy_ger40_pullback_scalp(df, symbol):
     clean_long = wick_up <= max(body * (1.28 if attack else 1.08), atr_m1 * (0.24 if attack else 0.16))
     clean_short = wick_down <= max(body * (1.28 if attack else 1.08), atr_m1 * (0.24 if attack else 0.16))
 
-    long_trend = ema50.iloc[-1] > ema200.iloc[-1] and m15_close >= ema50_m15
-    short_trend = ema50.iloc[-1] < ema200.iloc[-1] and m15_close <= ema50_m15
+    long_trend = (
+        ema50.iloc[-1] > ema200.iloc[-1]
+        and ema20_m15 > ema50_m15
+        and ema20_h1 >= ema50_h1
+        and m15_close >= ema20_m15 - atr_m1 * 0.03
+        and m15_slope >= atr_m1 * 0.02
+        and h1_slope >= -atr_m1 * 0.02
+    )
+    short_trend = (
+        ema50.iloc[-1] < ema200.iloc[-1]
+        and ema20_m15 < ema50_m15
+        and ema20_h1 < ema50_h1
+        and m15_close <= ema50_m15 - atr_m1 * 0.08
+        and m15_slope <= -atr_m1 * 0.04
+        and h1_slope <= -atr_m1 * 0.02
+        and last["close"] < ema200.iloc[-1] - atr_m1 * 0.03
+    )
     long_pullback = min(prev["low"], last["low"]) <= ema50.iloc[-1] + atr_m1 * (0.20 if attack else 0.14) and min(prev["low"], last["low"]) >= ema200.iloc[-1] - atr_m1 * 0.10
-    short_pullback = max(prev["high"], last["high"]) >= ema50.iloc[-1] - atr_m1 * (0.20 if attack else 0.14) and max(prev["high"], last["high"]) <= ema200.iloc[-1] + atr_m1 * 0.10
+    short_pullback = max(prev["high"], last["high"]) >= ema50.iloc[-1] - atr_m1 * (0.16 if attack else 0.10) and max(prev["high"], last["high"]) <= ema200.iloc[-1] + atr_m1 * 0.06
     long_confirm = last["close"] > last["open"] and last["close"] > ema50.iloc[-1] and last["close"] >= recent_high - atr_m1 * (0.16 if attack else 0.07)
-    short_confirm = last["close"] < last["open"] and last["close"] < ema50.iloc[-1] and last["close"] <= recent_low + atr_m1 * (0.16 if attack else 0.07)
+    short_confirm = last["close"] < last["open"] and last["close"] < ema50.iloc[-1] and last["close"] <= recent_low - atr_m1 * (0.03 if attack else 0.02)
 
     if long_trend and long_pullback and long_confirm and strong_body and clean_long and rsi.iloc[-1] > 50:
         conf = 75
@@ -4196,14 +5546,15 @@ def strategy_ger40_pullback_scalp(df, symbol):
             conf = 80
         return {"signal": "BUY", "confidence": conf, "name": "GER40_PULLBACK_SCALP", "execution_df": df_m1}
 
-    if short_trend and short_pullback and short_confirm and strong_body and clean_short and rsi.iloc[-1] < 50:
+    if short_trend and short_pullback and short_confirm and strong_body and clean_short and rsi.iloc[-1] < 45:
         conf = 75
-        if rsi.iloc[-1] < 43 and last["close"] <= ema50.iloc[-1] - atr_m1 * 0.07:
+        if rsi.iloc[-1] < 40 and last["close"] <= ema50.iloc[-1] - atr_m1 * 0.10:
             conf = 80
         return {"signal": "SELL", "confidence": conf, "name": "GER40_PULLBACK_SCALP", "execution_df": df_m1}
 
     if not long_trend and not short_trend:
-        return blocked_signal("GER40_PULLBACK_SCALP", "EMA TREND MIXED", pretrigger_text("EMA", abs(ema50.iloc[-1] - ema200.iloc[-1]), atr_m1))
+        trend_gap = max(abs(ema20_m15 - ema50_m15), abs(ema50.iloc[-1] - ema200.iloc[-1]))
+        return blocked_signal("GER40_PULLBACK_SCALP", "EMA TREND MIXED", pretrigger_text("EMA", trend_gap, atr_m1))
     if long_trend:
         if not long_pullback:
             return blocked_signal("GER40_PULLBACK_SCALP", "NO PULLBACK", pretrigger_text("PB", min(prev["low"], last["low"]) - (ema50.iloc[-1] + atr_m1 * (0.20 if attack else 0.14)), atr_m1))
@@ -5209,31 +6560,35 @@ SANTO_GRAAL_PROFILES = {
     "USTECH": {
         "display": "US100",
         "session": (13, 23),
-        "adx_min": 29.0,
-        "d1_adx_min": 24.0,
+        "adx_min": 27.0,
+        "d1_adx_min": 22.0,
         "adx_high_exit": 42.0,
-        "ema_pad": 0.05,
-        "pullback_depth": 0.34,
-        "confirm_pad": 0.08,
+        "ema_pad": 0.04,
+        "pullback_depth": 0.42,
+        "confirm_pad": 0.10,
         "sl_buffer": 0.10,
         "base_conf": 77,
         "boost_conf": 84,
         "boost_adx": 38.0,
+        "adx_drift_tol": 0.8,
+        "d1_adx_drift_tol": 0.7,
         "permissive": True,
     },
     "US500": {
         "display": "US500",
         "session": (13, 23),
-        "adx_min": 31.0,
-        "d1_adx_min": 26.0,
+        "adx_min": 28.5,
+        "d1_adx_min": 23.5,
         "adx_high_exit": 44.0,
-        "ema_pad": 0.04,
-        "pullback_depth": 0.28,
-        "confirm_pad": 0.06,
+        "ema_pad": 0.035,
+        "pullback_depth": 0.36,
+        "confirm_pad": 0.08,
         "sl_buffer": 0.09,
         "base_conf": 75,
         "boost_conf": 82,
         "boost_adx": 39.0,
+        "adx_drift_tol": 0.8,
+        "d1_adx_drift_tol": 0.7,
         "permissive": False,
     },
     "GER40": {
@@ -5249,21 +6604,25 @@ SANTO_GRAAL_PROFILES = {
         "base_conf": 75,
         "boost_conf": 82,
         "boost_adx": 39.0,
+        "adx_drift_tol": 0.5,
+        "d1_adx_drift_tol": 0.4,
         "permissive": False,
     },
     "BTCUSD": {
         "display": "BTC",
         "session": (0, 23),
-        "adx_min": 28.0,
-        "d1_adx_min": 22.0,
+        "adx_min": 26.5,
+        "d1_adx_min": 20.5,
         "adx_high_exit": 40.0,
-        "ema_pad": 0.06,
-        "pullback_depth": 0.38,
-        "confirm_pad": 0.10,
+        "ema_pad": 0.05,
+        "pullback_depth": 0.46,
+        "confirm_pad": 0.12,
         "sl_buffer": 0.12,
         "base_conf": 78,
         "boost_conf": 85,
         "boost_adx": 36.0,
+        "adx_drift_tol": 1.0,
+        "d1_adx_drift_tol": 0.8,
         "permissive": True,
     },
 }
@@ -5363,7 +6722,7 @@ def strategy_santo_graal(df, symbol, branch_name, family):
 
     if adx_h4_now < 15 or adx_d1_now < 15:
         return blocked_signal(branch_name, "ADX TOO LOW", f"H4 {adx_h4_now:.1f} | D1 {adx_d1_now:.1f}")
-    if adx_h4_now <= adx_h4_prev:
+    if adx_h4_now < adx_h4_prev - profile.get("adx_drift_tol", 0.0):
         return blocked_signal(branch_name, "ADX FLAT", f"H4 {adx_h4_prev:.1f}->{adx_h4_now:.1f}")
     if adx_h4_now < profile["adx_min"]:
         return blocked_signal(branch_name, "ADX BELOW 30", f"H4 {adx_h4_now:.1f}")
@@ -5372,13 +6731,13 @@ def strategy_santo_graal(df, symbol, branch_name, family):
         df_d1["close"].iloc[-2] > ema20_d1.iloc[-2]
         and plus_di_d1.iloc[-2] >= minus_di_d1.iloc[-2]
         and adx_d1_now >= profile["d1_adx_min"]
-        and adx_d1_now >= adx_d1_prev
+        and adx_d1_now >= adx_d1_prev - profile.get("d1_adx_drift_tol", 0.0)
     )
     d1_down = (
         df_d1["close"].iloc[-2] < ema20_d1.iloc[-2]
         and minus_di_d1.iloc[-2] >= plus_di_d1.iloc[-2]
         and adx_d1_now >= profile["d1_adx_min"]
-        and adx_d1_now >= adx_d1_prev
+        and adx_d1_now >= adx_d1_prev - profile.get("d1_adx_drift_tol", 0.0)
     )
 
     h4_up_context = anchor["close"] > ema20_h4.iloc[-4] and plus_di_h4.iloc[-2] >= minus_di_h4.iloc[-2]
@@ -5755,50 +7114,50 @@ SIDUS_PROFILES = {
     "GER40": {
         "display": "DAX",
         "session": (8, 18),
-        "cross_pad": 0.05,
-        "close_pad": 0.04,
-        "compression": 0.30,
-        "flat_slope": 0.12,
-        "max_extension": 1.00,
-        "body_floor": 0.10,
-        "wick_ratio": 1.10,
+        "cross_pad": 0.04,
+        "close_pad": 0.03,
+        "compression": 0.24,
+        "flat_slope": 0.09,
+        "max_extension": 1.15,
+        "body_floor": 0.08,
+        "wick_ratio": 1.18,
         "sl_buffer": 0.10,
         "h1_bias_pad": 0.02,
         "base_conf": 74,
         "boost_conf": 82,
-        "whipsaw_limit": 2,
+        "whipsaw_limit": 3,
     },
     "USTECH": {
         "display": "US100",
         "session": (13, 23),
-        "cross_pad": 0.04,
-        "close_pad": 0.03,
-        "compression": 0.26,
-        "flat_slope": 0.10,
-        "max_extension": 1.20,
-        "body_floor": 0.08,
-        "wick_ratio": 1.25,
+        "cross_pad": 0.03,
+        "close_pad": 0.025,
+        "compression": 0.20,
+        "flat_slope": 0.075,
+        "max_extension": 1.35,
+        "body_floor": 0.06,
+        "wick_ratio": 1.35,
         "sl_buffer": 0.10,
         "h1_bias_pad": 0.02,
         "base_conf": 76,
         "boost_conf": 84,
-        "whipsaw_limit": 2,
+        "whipsaw_limit": 3,
     },
     "BTCUSD": {
         "display": "BTC",
         "session": (0, 23),
-        "cross_pad": 0.08,
-        "close_pad": 0.06,
-        "compression": 0.32,
-        "flat_slope": 0.12,
-        "max_extension": 1.45,
-        "body_floor": 0.08,
-        "wick_ratio": 1.35,
+        "cross_pad": 0.06,
+        "close_pad": 0.05,
+        "compression": 0.26,
+        "flat_slope": 0.09,
+        "max_extension": 1.65,
+        "body_floor": 0.06,
+        "wick_ratio": 1.45,
         "sl_buffer": 0.14,
         "h1_bias_pad": 0.03,
         "base_conf": 77,
         "boost_conf": 85,
-        "whipsaw_limit": 2,
+        "whipsaw_limit": 3,
     },
 }
 
@@ -6084,64 +7443,64 @@ PURIA_PROFILES = {
     "GER40": {
         "display": "DAX",
         "session": (8, 18),
-        "cross_pad": 0.05,
-        "close_pad": 0.04,
-        "compression": 0.22,
-        "flat_slope": 0.09,
-        "body_floor": 0.10,
-        "wick_ratio": 1.08,
-        "macd_floor": 0.05,
-        "macd_expand": 0.02,
+        "cross_pad": 0.04,
+        "close_pad": 0.03,
+        "compression": 0.18,
+        "flat_slope": 0.07,
+        "body_floor": 0.08,
+        "wick_ratio": 1.16,
+        "macd_floor": 0.040,
+        "macd_expand": 0.016,
         "sl_buffer": 0.10,
-        "whipsaw_limit": 2,
+        "whipsaw_limit": 3,
         "base_conf": 74,
         "boost_conf": 82,
     },
     "USTECH": {
         "display": "US100",
         "session": (13, 23),
-        "cross_pad": 0.04,
-        "close_pad": 0.03,
-        "compression": 0.20,
-        "flat_slope": 0.08,
-        "body_floor": 0.08,
-        "wick_ratio": 1.18,
-        "macd_floor": 0.045,
-        "macd_expand": 0.018,
+        "cross_pad": 0.03,
+        "close_pad": 0.025,
+        "compression": 0.16,
+        "flat_slope": 0.06,
+        "body_floor": 0.06,
+        "wick_ratio": 1.28,
+        "macd_floor": 0.035,
+        "macd_expand": 0.014,
         "sl_buffer": 0.10,
-        "whipsaw_limit": 2,
+        "whipsaw_limit": 3,
         "base_conf": 76,
         "boost_conf": 84,
     },
     "BTCUSD": {
         "display": "BTC",
         "session": (0, 23),
-        "cross_pad": 0.07,
-        "close_pad": 0.06,
-        "compression": 0.26,
-        "flat_slope": 0.10,
-        "body_floor": 0.08,
-        "wick_ratio": 1.30,
-        "macd_floor": 0.07,
-        "macd_expand": 0.025,
+        "cross_pad": 0.06,
+        "close_pad": 0.05,
+        "compression": 0.22,
+        "flat_slope": 0.08,
+        "body_floor": 0.06,
+        "wick_ratio": 1.40,
+        "macd_floor": 0.055,
+        "macd_expand": 0.020,
         "sl_buffer": 0.15,
-        "whipsaw_limit": 2,
+        "whipsaw_limit": 3,
         "base_conf": 77,
         "boost_conf": 85,
     },
     "ETHUSD": {
         "display": "ETH",
         "session": (0, 23),
-        "cross_pad": 0.07,
-        "close_pad": 0.06,
-        "compression": 0.24,
-        "flat_slope": 0.10,
-        "body_floor": 0.09,
-        "wick_ratio": 1.22,
-        "macd_floor": 0.07,
-        "macd_expand": 0.026,
+        "cross_pad": 0.06,
+        "close_pad": 0.05,
+        "compression": 0.20,
+        "flat_slope": 0.08,
+        "body_floor": 0.07,
+        "wick_ratio": 1.32,
+        "macd_floor": 0.055,
+        "macd_expand": 0.020,
         "sl_buffer": 0.14,
-        "whipsaw_limit": 2,
+        "whipsaw_limit": 3,
         "base_conf": 76,
         "boost_conf": 84,
     },
@@ -6330,8 +7689,8 @@ def strategy_puria(df, symbol, branch_name, family):
         long_confirm = long_confirm and macd_now > macd_floor and float(confirm["close"]) > slow_high_now + atr_m30 * (profile["close_pad"] + 0.01)
         short_confirm = short_confirm and macd_now < -macd_floor and float(confirm["close"]) < slow_low_now - atr_m30 * (profile["close_pad"] + 0.01)
     if family == "BTCUSD":
-        long_macd_ok = long_macd_ok and macd_now > macd_floor and (macd_now - macd_prev) >= -macd_expand * 0.2
-        short_macd_ok = short_macd_ok and macd_now < -macd_floor and (macd_now - macd_prev) <= macd_expand * 0.2
+        long_macd_ok = long_macd_ok and macd_now > macd_floor and (macd_now - macd_prev) >= -macd_expand * 0.4
+        short_macd_ok = short_macd_ok and macd_now < -macd_floor and (macd_now - macd_prev) <= macd_expand * 0.4
 
     if long_cross and long_macd_ok and long_confirm:
         swing_low = float(df_m30["low"].iloc[-7:-1].min())
@@ -6426,13 +7785,13 @@ DOUBLE_MACD_PROFILES = {
     "US500": {
         "display": "US500",
         "session": (0, 23),
-        "sma_sep": 0.32,
-        "senior_floor": 0.08,
-        "senior_hist_floor": 0.020,
-        "junior_floor": 0.05,
-        "junior_near_zero": 0.18,
-        "junior_expand": 0.020,
-        "whipsaw_limit": 2,
+        "sma_sep": 0.24,
+        "senior_floor": 0.055,
+        "senior_hist_floor": 0.014,
+        "junior_floor": 0.035,
+        "junior_near_zero": 0.24,
+        "junior_expand": 0.014,
+        "whipsaw_limit": 3,
         "swing_lookback": 8,
         "sl_buffer": 0.10,
         "base_conf": 75,
@@ -6441,13 +7800,13 @@ DOUBLE_MACD_PROFILES = {
     "BTCUSD": {
         "display": "BTC",
         "session": (0, 23),
-        "sma_sep": 0.42,
-        "senior_floor": 0.11,
-        "senior_hist_floor": 0.028,
-        "junior_floor": 0.08,
-        "junior_near_zero": 0.20,
-        "junior_expand": 0.025,
-        "whipsaw_limit": 2,
+        "sma_sep": 0.30,
+        "senior_floor": 0.080,
+        "senior_hist_floor": 0.020,
+        "junior_floor": 0.055,
+        "junior_near_zero": 0.28,
+        "junior_expand": 0.018,
+        "whipsaw_limit": 3,
         "swing_lookback": 10,
         "sl_buffer": 0.16,
         "base_conf": 77,
@@ -6456,13 +7815,13 @@ DOUBLE_MACD_PROFILES = {
     "ETHUSD": {
         "display": "ETH",
         "session": (0, 23),
-        "sma_sep": 0.44,
-        "senior_floor": 0.12,
-        "senior_hist_floor": 0.030,
-        "junior_floor": 0.09,
-        "junior_near_zero": 0.18,
-        "junior_expand": 0.026,
-        "whipsaw_limit": 2,
+        "sma_sep": 0.32,
+        "senior_floor": 0.085,
+        "senior_hist_floor": 0.022,
+        "junior_floor": 0.060,
+        "junior_near_zero": 0.26,
+        "junior_expand": 0.018,
+        "whipsaw_limit": 3,
         "swing_lookback": 10,
         "sl_buffer": 0.15,
         "base_conf": 76,
@@ -7788,8 +9147,14 @@ def strategy_ger40_scalping(df, symbol):
         return blocked_signal("GER40_SCALP", "OUT SESSION")
 
     df_m1 = get_m1_cached(symbol)
+    df_m15 = get_m15_cached(symbol)
+    df_h1 = get_h1_cached(symbol)
     if df_m1 is None or len(df_m1) < 60:
         return blocked_signal("GER40_SCALP", "NO M1 DATA")
+    if df_m15 is None or len(df_m15) < 60:
+        return blocked_signal("GER40_SCALP", "NO M15 DATA")
+    if df_h1 is None or len(df_h1) < 80:
+        return blocked_signal("GER40_SCALP", "NO H1 DATA")
 
     tick = safe_tick(symbol)
     if not tick:
@@ -7807,9 +9172,23 @@ def strategy_ger40_scalping(df, symbol):
     ema20 = close_m1.ewm(span=20).mean()
     ema50 = close_m1.ewm(span=50).mean()
     rsi = compute_rsi(close_m1, 14)
+    m15_close = df_m15["close"]
+    ema20_m15 = m15_close.ewm(span=20).mean()
+    ema50_m15 = m15_close.ewm(span=50).mean()
+    h1_close = df_h1["close"]
+    ema20_h1 = h1_close.ewm(span=20).mean()
+    ema50_h1 = h1_close.ewm(span=50).mean()
 
     trend_up = df["close"].ewm(span=20).mean().iloc[-1] > df["close"].ewm(span=50).mean().iloc[-1]
     trend_down = df["close"].ewm(span=20).mean().iloc[-1] < df["close"].ewm(span=50).mean().iloc[-1]
+    m15_bull = ema20_m15.iloc[-1] >= ema50_m15.iloc[-1] and ema20_m15.iloc[-1] - ema20_m15.iloc[-4] >= -atr_m1 * 0.01
+    m15_bear = (
+        ema20_m15.iloc[-1] < ema50_m15.iloc[-1]
+        and ema20_m15.iloc[-1] - ema20_m15.iloc[-4] <= -atr_m1 * 0.03
+        and m15_close.iloc[-1] <= ema50_m15.iloc[-1] - atr_m1 * 0.06
+    )
+    h1_bull = ema20_h1.iloc[-1] >= ema50_h1.iloc[-1]
+    h1_bear = ema20_h1.iloc[-1] < ema50_h1.iloc[-1] and ema20_h1.iloc[-1] - ema20_h1.iloc[-4] <= -atr_m1 * 0.02
 
     last = df_m1.iloc[-1]
     prev = df_m1.iloc[-2]
@@ -7821,6 +9200,8 @@ def strategy_ger40_scalping(df, symbol):
 
     long_setup = (
         trend_up
+        and m15_bull
+        and h1_bull
         and ema9.iloc[-1] > ema20.iloc[-1] > ema50.iloc[-1]
         and min(prev["low"], last["low"]) <= long_pullback_band
         and last["close"] > ema9.iloc[-1]
@@ -7833,17 +9214,21 @@ def strategy_ger40_scalping(df, symbol):
 
     short_setup = (
         trend_down
+        and m15_bear
+        and h1_bear
         and ema9.iloc[-1] < ema20.iloc[-1] < ema50.iloc[-1]
         and max(prev["high"], last["high"]) >= short_pullback_band
         and last["close"] < ema9.iloc[-1]
-        and (last["open"] - last["close"]) > atr_m1 * 0.08
-        and last["close"] <= short_break_trigger
-        and 24 <= rsi.iloc[-1] <= 50
+        and (last["open"] - last["close"]) > atr_m1 * 0.10
+        and last["close"] <= short_break_trigger - atr_m1 * 0.02
+        and 24 <= rsi.iloc[-1] <= 45
     )
     if short_setup:
         return {"signal": "SELL", "confidence": 76, "name": "GER40_SCALP", "execution_df": df_m1}
 
     if trend_up:
+        if not (m15_bull and h1_bull):
+            return blocked_signal("GER40_SCALP", "HTF LONG BLOCK", pretrigger_text("HTF", abs(ema20_m15.iloc[-1] - ema50_m15.iloc[-1]), atr_m1))
         if not (ema9.iloc[-1] > ema20.iloc[-1] > ema50.iloc[-1]):
             return blocked_signal("GER40_SCALP", "EMA STACK MISS", pretrigger_text("STACK", max(ema20.iloc[-1] - ema9.iloc[-1], ema50.iloc[-1] - ema20.iloc[-1]), atr_m1))
         if not (min(prev["low"], last["low"]) <= long_pullback_band):
@@ -7856,6 +9241,8 @@ def strategy_ger40_scalping(df, symbol):
             return blocked_signal("GER40_SCALP", "NO BREAKOUT", pretrigger_text("BRK", long_break_trigger - last["close"], atr_m1))
         return blocked_signal("GER40_SCALP", "RSI BLOCKED", f"RSI {round(rsi.iloc[-1], 1)}")
     if trend_down:
+        if not (m15_bear and h1_bear):
+            return blocked_signal("GER40_SCALP", "HTF SHORT BLOCK", pretrigger_text("HTF", abs(ema20_m15.iloc[-1] - ema50_m15.iloc[-1]), atr_m1))
         if not (ema9.iloc[-1] < ema20.iloc[-1] < ema50.iloc[-1]):
             return blocked_signal("GER40_SCALP", "EMA STACK MISS", pretrigger_text("STACK", max(ema9.iloc[-1] - ema20.iloc[-1], ema20.iloc[-1] - ema50.iloc[-1]), atr_m1))
         if not (max(prev["high"], last["high"]) >= short_pullback_band):
@@ -8474,8 +9861,8 @@ def strategy_us30_titanyx(df, symbol):
 LIQUIDITY_SNIPER_REGISTRY = [
     {"name": "USTECH_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "U1CL", "family": "USTECH", "kind": "CONTINUATION", "strategy_id": "SND_CLP_USTECH", "risk": 0.18, "score": 0.62, "cooldown": 1800},
     {"name": "USTECH_REVERSAL_SWEEP", "tag": "U1RV", "family": "USTECH", "kind": "REVERSAL", "strategy_id": "SND_REV_USTECH", "risk": 0.17, "score": 0.64, "cooldown": 2100},
-    {"name": "GER40_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "G4CL", "family": "GER40", "kind": "CONTINUATION", "strategy_id": "SND_CLP_GER40", "risk": 0.17, "score": 0.62, "cooldown": 1800},
-    {"name": "GER40_REVERSAL_SWEEP", "tag": "G4RV", "family": "GER40", "kind": "REVERSAL", "strategy_id": "SND_REV_GER40", "risk": 0.16, "score": 0.64, "cooldown": 2100},
+    {"name": "GER40_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "G4CL", "family": "GER40", "kind": "CONTINUATION", "strategy_id": "SND_CLP_GER40", "risk": 0.12, "score": 0.64, "cooldown": 1800},
+    {"name": "GER40_REVERSAL_SWEEP", "tag": "G4RV", "family": "GER40", "kind": "REVERSAL", "strategy_id": "SND_REV_GER40", "risk": 0.11, "score": 0.66, "cooldown": 2100},
     {"name": "US500_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "U5CL", "family": "US500", "kind": "CONTINUATION", "strategy_id": "SND_CLP_US500", "risk": 0.17, "score": 0.62, "cooldown": 1800},
     {"name": "US500_REVERSAL_SWEEP", "tag": "U5RV", "family": "US500", "kind": "REVERSAL", "strategy_id": "SND_REV_US500", "risk": 0.16, "score": 0.64, "cooldown": 2100},
     {"name": "JPN225_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "J2CL", "family": "JPN225", "kind": "CONTINUATION", "strategy_id": "SND_CLP_JPN225", "risk": 0.16, "score": 0.61, "cooldown": 2100},
@@ -8649,6 +10036,52 @@ register_strategy(
 )
 get_strategy_config("XAU_VWAP_RECLAIM")["disabled_reason"] = "TEST BENCH"
 register_strategy(
+    "XAU_LUKE",
+    strategy_xau_luke,
+    enabled=True,
+    toggle_arm=True,
+    tag="XLUK",
+    symbol_family="XAUUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=1.0,
+    min_score=0.58,
+    cooldown_sec=90,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=luke_filter,
+    market_filter_func=fast_market_filter_scalping,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.0,
+    auto_disable=False,
+    be_trigger_progress=0.18,
+    be_buffer_progress=0.02,
+    trail_steps=[],
+    session_label="09:30-18",
+    multi_tp_eur_min=0.70,
+    multi_tp_eur_max=1.60,
+    multi_tp_target_eur=1.00,
+    multi_tp_first_atr=0.08,
+    multi_tp_curve=[1.0, 2.0, 3.0, 3.75, 4.75, 6.5],
+    multi_tp_tp2_gap_eur=0.38,
+    multi_tp_step_gap_eur=0.18,
+    min_splits=6,
+    max_splits=6,
+    exclusive_symbol=True,
+)
+get_strategy_config("XAU_LUKE").update(
+    {
+        "suite": "LUKE",
+        "strategy_id": "LUKE_XAUUSD",
+        "selection_priority": 16,
+        "fixed_tp_splits": 6,
+        "fixed_tp_points": list(LUKE_PROFILES["XAUUSD"]["tp_points"]),
+        "tp_point_buffer": float(LUKE_PROFILES["XAUUSD"]["spread_buffer_points"]),
+        "point_value_price": gold_points_to_price(safe_info(resolve_broker_symbol("XAUUSD") or "XAUUSD"), 1.0) if safe_info(resolve_broker_symbol("XAUUSD") or "XAUUSD") else 0.1,
+        "lot_weights_override": [1.0] * 6,
+        "runner_enabled": bool(LUKE_PROFILES["XAUUSD"]["runner_enabled"]),
+        "runner_points": float(LUKE_PROFILES["XAUUSD"]["runner_points"]),
+    }
+)
+register_strategy(
     "BTC_TREND",
     strategy_btc_trend,
     enabled=True,
@@ -8687,8 +10120,8 @@ register_strategy(
     symbol_family="BTCUSD",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.18,
-    min_score=0.50,
-    cooldown_sec=900,
+    min_score=0.48,
+    cooldown_sec=600,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -8747,8 +10180,8 @@ register_strategy(
     symbol_family="BTCUSD",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.17,
-    min_score=0.52,
-    cooldown_sec=900,
+    min_score=0.48,
+    cooldown_sec=420,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -8777,8 +10210,8 @@ register_strategy(
     symbol_family="BTCUSD",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.17,
-    min_score=0.52,
-    cooldown_sec=14400,
+    min_score=0.48,
+    cooldown_sec=7200,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -8837,8 +10270,8 @@ register_strategy(
     symbol_family="BTCUSD",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.17,
-    min_score=0.52,
-    cooldown_sec=900,
+    min_score=0.48,
+    cooldown_sec=420,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -8990,8 +10423,8 @@ register_strategy(
     symbol_family="ETHUSD",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.15,
-    min_score=0.52,
-    cooldown_sec=960,
+    min_score=0.48,
+    cooldown_sec=480,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -9020,8 +10453,8 @@ register_strategy(
     symbol_family="ETHUSD",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.15,
-    min_score=0.52,
-    cooldown_sec=14400,
+    min_score=0.48,
+    cooldown_sec=7200,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -9137,7 +10570,8 @@ get_strategy_config("ETH_VWAP_RECLAIM")["disabled_reason"] = "TEST BENCH"
 register_strategy(
     "USTECH_TREND",
     strategy_ustech_trend,
-    enabled=True,
+    enabled=False,
+    toggle_arm=False,
     tag="USTR",
     symbol_family="USTECH",
     execution_mode="MULTI_ONLY",
@@ -9164,11 +10598,12 @@ register_strategy(
     min_splits=4,
     max_splits=5,
 )
-get_strategy_config("USTECH_TREND")["disabled_reason"] = ""
+get_strategy_config("USTECH_TREND")["disabled_reason"] = "LOSS REVIEW"
 register_strategy(
     "USTECH_ORB",
     strategy_ustech_orb,
-    enabled=True,
+    enabled=False,
+    toggle_arm=False,
     tag="UORB",
     symbol_family="USTECH",
     execution_mode="MULTI_ONLY",
@@ -9195,7 +10630,7 @@ register_strategy(
     min_splits=4,
     max_splits=4,
 )
-get_strategy_config("USTECH_ORB")["disabled_reason"] = ""
+get_strategy_config("USTECH_ORB")["disabled_reason"] = "LOSS REVIEW"
 register_strategy(
     "USTECH_BREAK_RETEST",
     strategy_ustech_break_retest,
@@ -9292,8 +10727,8 @@ register_strategy(
     symbol_family="USTECH",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.16,
-    min_score=0.50,
-    cooldown_sec=780,
+    min_score=0.47,
+    cooldown_sec=360,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -9322,8 +10757,8 @@ register_strategy(
     symbol_family="USTECH",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.16,
-    min_score=0.50,
-    cooldown_sec=780,
+    min_score=0.47,
+    cooldown_sec=360,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -9381,8 +10816,8 @@ register_strategy(
     symbol_family="USTECH",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.18,
-    min_score=0.50,
-    cooldown_sec=900,
+    min_score=0.47,
+    cooldown_sec=540,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -9529,7 +10964,8 @@ get_strategy_config("JPN225_BREAK_RETEST")["disabled_reason"] = "TEST BENCH"
 register_strategy(
     "US500_ORB",
     strategy_us500_orb,
-    enabled=True,
+    enabled=False,
+    toggle_arm=False,
     tag="U5OB",
     symbol_family="US500",
     execution_mode="MULTI_ONLY",
@@ -9556,7 +10992,7 @@ register_strategy(
     min_splits=4,
     max_splits=4,
 )
-get_strategy_config("US500_ORB")["disabled_reason"] = ""
+get_strategy_config("US500_ORB")["disabled_reason"] = "LOSS REVIEW"
 register_strategy(
     "US500_TREND",
     strategy_us500_trend,
@@ -9593,8 +11029,8 @@ register_strategy(
     symbol_family="US500",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.15,
-    min_score=0.52,
-    cooldown_sec=1200,
+    min_score=0.48,
+    cooldown_sec=720,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -9623,8 +11059,8 @@ register_strategy(
     symbol_family="US500",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.15,
-    min_score=0.52,
-    cooldown_sec=14400,
+    min_score=0.48,
+    cooldown_sec=5400,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -9739,11 +11175,12 @@ get_strategy_config("US30_BREAK_RETEST")["disabled_reason"] = "TEST BENCH"
 register_strategy(
     "GER40_TREND",
     strategy_ger40_trend,
-    enabled=True,
+    enabled=False,
+    toggle_arm=False,
     tag="G4TR",
     symbol_family="GER40",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.20,
+    risk_multiplier=0.14,
     min_score=0.58,
     cooldown_sec=52,
     allowed_regimes={"TREND"},
@@ -9766,7 +11203,7 @@ register_strategy(
     min_splits=4,
     max_splits=5,
 )
-get_strategy_config("GER40_TREND")["disabled_reason"] = ""
+get_strategy_config("GER40_TREND")["disabled_reason"] = "LOSS REVIEW"
 register_strategy(
     "GER40_SANTO_GRAAL",
     strategy_ger40_santo_graal,
@@ -9774,8 +11211,8 @@ register_strategy(
     symbol_family="GER40",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.14,
-    min_score=0.52,
-    cooldown_sec=1200,
+    min_score=0.58,
+    cooldown_sec=1800,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -9804,8 +11241,8 @@ register_strategy(
     symbol_family="GER40",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.15,
-    min_score=0.52,
-    cooldown_sec=840,
+    min_score=0.58,
+    cooldown_sec=1800,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -9834,8 +11271,8 @@ register_strategy(
     symbol_family="GER40",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.15,
-    min_score=0.52,
-    cooldown_sec=840,
+    min_score=0.58,
+    cooldown_sec=1800,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -9947,46 +11384,58 @@ register_strategy(
 register_strategy(
     "GER40_PULLBACK_SCALP",
     strategy_ger40_pullback_scalp,
-    enabled=False,
-    toggle_arm=False,
+    enabled=True,
+    toggle_arm=True,
     tag="G1PB",
     symbol_family="GER40",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.16,
-    min_score=0.56,
-    cooldown_sec=16,
+    risk_multiplier=0.08,
+    min_score=0.66,
+    cooldown_sec=240,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=scalping_filter,
     market_filter_func=fast_market_filter_scalping,
-    sl_atr_multiplier=0.64,
-    tp_rr_multiplier=1.30,
+    sl_atr_multiplier=0.72,
+    tp_rr_multiplier=1.24,
     auto_disable=False,
-    be_trigger_progress=0.10,
+    be_trigger_progress=0.08,
     be_buffer_progress=0.08,
-    trail_steps=[(0.20, 0.12), (0.34, 0.26), (0.50, 0.44)],
-    session_label="08-18",
+    trail_steps=[(0.16, 0.14), (0.28, 0.32), (0.42, 0.52)],
+    session_label="08-17",
     multi_tp_eur_min=0.55,
     multi_tp_eur_max=1.20,
-    multi_tp_target_eur=0.85,
+    multi_tp_target_eur=0.90,
     multi_tp_first_atr=0.08,
     multi_tp_curve=[1.0, 1.70, 2.45, 3.35, 4.50, 5.95, 7.70, 9.80],
     multi_tp_tp2_gap_eur=0.34,
     multi_tp_step_gap_eur=0.17,
     min_splits=4,
-    max_splits=8,
+    max_splits=4,
 )
-get_strategy_config("GER40_PULLBACK_SCALP")["disabled_reason"] = "SUPERSEDED BY GER40_TOP"
+get_strategy_config("GER40_PULLBACK_SCALP").update(
+    {
+        "disabled_reason": "",
+        "cluster_lock_bias": 0.10,
+        "protect_bias": 0.12,
+        "hard_lock_ratio": 0.24,
+        "cascade_ratio": 0.22,
+        "tp1_guard_ratio": 0.15,
+        "weak_profit_floor": 0.70,
+        "runner_peak_keep_ratio": 0.54,
+        "runner_realized_lock_ratio": 0.88,
+    }
+)
 register_strategy(
     "GER40_SCALP",
     strategy_ger40_scalping,
-    enabled=False,
-    toggle_arm=False,
+    enabled=True,
+    toggle_arm=True,
     tag="G4SC",
     symbol_family="GER40",
     execution_mode="STD_ONLY",
-    risk_multiplier=0.12,
-    min_score=0.60,
-    cooldown_sec=9,
+    risk_multiplier=0.06,
+    min_score=0.68,
+    cooldown_sec=90,
     allowed_regimes=set(),
     filter_func=scalping_filter,
     market_filter_func=fast_market_filter_scalping,
@@ -10013,6 +11462,16 @@ DEPRECATED_STRATEGY_NAMES = {
 
 def _strategy_selection_priority(strategy):
     name = str(strategy.get("name", "") or "")
+    if name == "XAU_LUKE":
+        return 16
+    if name == "GER40_PULLBACK_SCALP":
+        return 10
+    if name == "GER40_SCALP":
+        return 12
+    if name == "GER40_TREND":
+        return 28
+    if name in {"GER40_CONTINUATION_LIQUIDITY_PULLBACK", "GER40_REVERSAL_SWEEP"}:
+        return 19
     if name.endswith("_TITANYX"):
         return 8
     if name in LIQUIDITY_SNIPER_STRATEGY_NAMES:
@@ -10042,6 +11501,21 @@ def _strategy_selection_priority(strategy):
     return 50
 
 
+def _shift_hhmm(value, delta_minutes):
+    total = _time_hhmm_to_minutes(value) + int(delta_minutes)
+    total = max(0, min(23 * 60 + 59, total))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def _expand_exchange_windows(windows, before_minutes=0, after_minutes=0):
+    return [(_shift_hhmm(start, -before_minutes), _shift_hhmm(end, after_minutes)) for start, end in list(windows or [])]
+
+
+def _expand_session_tuple(session, start_pad=0, end_pad=0):
+    start, end = session
+    return max(0, int(start) - int(start_pad)), min(23, int(end) + int(end_pad))
+
+
 def _apply_v160_strategy_governance():
     global STRATEGIES
     kept = []
@@ -10056,19 +11530,355 @@ def _apply_v160_strategy_governance():
         strategy_runtime.pop(deprecated_name, None)
 
     for strategy in STRATEGIES:
-        strategy["enabled"] = True
-        strategy["toggle_arm"] = True
         if strategy.get("disabled_reason") in {
             "S&D LIQUIDITY SNIPER CONTROL",
             "TEST BENCH",
             "SUPERSEDED BY USTECH_TOP",
             "SUPERSEDED BY GER40_TOP",
+            "LOSS REVIEW",
         }:
             strategy["disabled_reason"] = ""
+        if strategy.get("disabled_reason"):
+            strategy["enabled"] = False
+            strategy["toggle_arm"] = False
+        else:
+            strategy["enabled"] = True
+            strategy["toggle_arm"] = True
         strategy["selection_priority"] = _strategy_selection_priority(strategy)
 
 
+def _apply_v160_entry_push_governance():
+    for strategy in STRATEGIES:
+        if strategy.get("disabled_reason"):
+            continue
+
+        name = str(strategy.get("name", "") or "")
+        suite = str(strategy.get("suite", "") or "").upper()
+        filter_name = getattr(strategy.get("filter_func"), "__name__", "")
+        min_score = float(strategy.get("min_score", 0.45) or 0.45)
+        cooldown_sec = int(strategy.get("cooldown_sec", 60) or 60)
+        risk_multiplier = float(strategy.get("risk_multiplier", 0.20) or 0.20)
+
+        if suite == "SND_LIQUIDITY_SNIPER":
+            strategy["min_score"] = round(clamp(min_score - 0.08, 0.52, 0.66), 3)
+            strategy["cooldown_sec"] = max(420, int(cooldown_sec * 0.30))
+            strategy["risk_multiplier"] = round(max(0.10, risk_multiplier * 0.92), 3)
+        elif suite == "TITANYX":
+            strategy["min_score"] = round(clamp(min_score - 0.05, 0.44, 0.56), 3)
+            strategy["cooldown_sec"] = max(35, int(cooldown_sec * 0.60))
+        elif filter_name == "luke_filter":
+            strategy["min_score"] = round(clamp(min_score - 0.05, 0.48, 0.60), 3)
+            strategy["cooldown_sec"] = max(40, int(cooldown_sec * 0.55))
+        elif filter_name == "scalping_filter":
+            strategy["min_score"] = round(clamp(min_score - 0.05, 0.42, 0.58), 3)
+            strategy["cooldown_sec"] = max(15, int(cooldown_sec * 0.50))
+        elif filter_name == "swing_filter":
+            strategy["min_score"] = round(clamp(min_score - 0.05, 0.38, 0.56), 3)
+            strategy["cooldown_sec"] = max(120, int(cooldown_sec * 0.55))
+        else:
+            strategy["min_score"] = round(clamp(min_score - 0.06, 0.44, 0.62), 3)
+            strategy["cooldown_sec"] = max(180, int(cooldown_sec * 0.50))
+
+        if name.endswith("_DOUBLE_MACD"):
+            strategy["cooldown_sec"] = max(1800, int(cooldown_sec * 0.33))
+            strategy["min_score"] = round(clamp(strategy["min_score"] - 0.02, 0.36, 0.52), 3)
+        elif name.endswith("_SANTO_GRAAL"):
+            strategy["cooldown_sec"] = max(180, int(cooldown_sec * 0.35))
+            strategy["min_score"] = round(clamp(strategy["min_score"] - 0.02, 0.38, 0.52), 3)
+        elif name.endswith("_KUMO_BREAKOUT"):
+            strategy["cooldown_sec"] = max(240, int(cooldown_sec * 0.40))
+            strategy["min_score"] = round(clamp(strategy["min_score"] - 0.02, 0.40, 0.54), 3)
+        elif name.endswith("_PURIA") or name.endswith("_SIDUS"):
+            strategy["cooldown_sec"] = max(180, int(cooldown_sec * 0.40))
+            strategy["min_score"] = round(clamp(strategy["min_score"] - 0.02, 0.38, 0.52), 3)
+        elif name.endswith("_ORB"):
+            strategy["cooldown_sec"] = max(30, int(cooldown_sec * 0.45))
+            strategy["min_score"] = round(clamp(strategy["min_score"] - 0.02, 0.42, 0.58), 3)
+        elif name.endswith("_TREND"):
+            strategy["cooldown_sec"] = max(20, int(cooldown_sec * 0.50))
+        elif name.endswith("_BREAK_RETEST") or name.endswith("_VWAP_RECLAIM") or name.endswith("_VWAP_TREND"):
+            strategy["cooldown_sec"] = max(22, int(cooldown_sec * 0.50))
+
+        strategy["enabled"] = True
+        strategy["toggle_arm"] = True
+
+
+def _apply_v163_stress_test_governance():
+    if not STRESS_TEST_ACTIVE:
+        return
+
+    global MAX_NEW_TRADES_PER_CYCLE, MAX_TRADES_PER_CYCLE, MAX_PARALLEL_SYMBOL_SCANS
+    MAX_NEW_TRADES_PER_CYCLE = max(MAX_NEW_TRADES_PER_CYCLE, 5)
+    MAX_TRADES_PER_CYCLE = max(MAX_TRADES_PER_CYCLE, 10)
+    MAX_PARALLEL_SYMBOL_SCANS = max(MAX_PARALLEL_SYMBOL_SCANS, 12)
+
+    protected_live_branches = {
+        "XAU_M1_SCALP",
+        "US500_ORB",
+        "GER40_SCALP",
+        "GER40_PULLBACK_SCALP",
+        "US30_BREAK_RETEST",
+    }
+
+    for strategy in STRATEGIES:
+        if strategy.get("disabled_reason"):
+            continue
+
+        name = str(strategy.get("name", "") or "")
+        if name in protected_live_branches:
+            continue
+
+        suite = str(strategy.get("suite", "") or "").upper()
+        filter_name = getattr(strategy.get("filter_func"), "__name__", "")
+        base_min_score = float(strategy.get("min_score", 0.45) or 0.45)
+        base_cooldown = int(strategy.get("cooldown_sec", 60) or 60)
+        base_risk = float(strategy.get("risk_multiplier", 0.20) or 0.20)
+
+        strategy["min_score"] = round(clamp(base_min_score - 0.03, 0.30, 0.56), 3)
+        strategy["cooldown_sec"] = max(12, int(base_cooldown * 0.72))
+
+        if suite == "SND_LIQUIDITY_SNIPER" or name in LIQUIDITY_SNIPER_STRATEGY_NAMES:
+            strategy["min_score"] = round(clamp(base_min_score - 0.10, 0.34, 0.52), 3)
+            strategy["cooldown_sec"] = max(120, int(base_cooldown * 0.22))
+            strategy["risk_multiplier"] = round(max(0.10, base_risk * 0.94), 3)
+        elif suite == "TITANYX" or name.endswith("_TITANYX"):
+            strategy["min_score"] = round(clamp(base_min_score - 0.08, 0.34, 0.50), 3)
+            strategy["cooldown_sec"] = max(18, int(base_cooldown * 0.45))
+        elif name.endswith("_SANTO_GRAAL"):
+            strategy["min_score"] = round(clamp(base_min_score - 0.08, 0.34, 0.50), 3)
+            strategy["cooldown_sec"] = max(120, int(base_cooldown * 0.24))
+        elif name.endswith("_KUMO_BREAKOUT"):
+            strategy["min_score"] = round(clamp(base_min_score - 0.08, 0.34, 0.50), 3)
+            strategy["cooldown_sec"] = max(150, int(base_cooldown * 0.28))
+        elif name.endswith("_PURIA") or name.endswith("_SIDUS"):
+            strategy["min_score"] = round(clamp(base_min_score - 0.08, 0.32, 0.50), 3)
+            strategy["cooldown_sec"] = max(120, int(base_cooldown * 0.28))
+        elif name.endswith("_DOUBLE_MACD"):
+            strategy["min_score"] = round(clamp(base_min_score - 0.10, 0.30, 0.48), 3)
+            strategy["cooldown_sec"] = max(900, int(base_cooldown * 0.20))
+        elif name.endswith("_HEIKEN_TDI"):
+            strategy["min_score"] = round(clamp(base_min_score - 0.08, 0.32, 0.50), 3)
+            strategy["cooldown_sec"] = max(900, int(base_cooldown * 0.24))
+        elif name.endswith("_BREAK_RETEST") or name.endswith("_VWAP_RECLAIM") or name.endswith("_VWAP_TREND"):
+            strategy["min_score"] = round(clamp(base_min_score - 0.06, 0.34, 0.54), 3)
+            strategy["cooldown_sec"] = max(18, int(base_cooldown * 0.42))
+        elif name.endswith("_TREND") or filter_name == "luke_filter":
+            strategy["min_score"] = round(clamp(base_min_score - 0.05, 0.34, 0.56), 3)
+            strategy["cooldown_sec"] = max(18, int(base_cooldown * 0.45))
+
+        strategy["enabled"] = True
+        strategy["toggle_arm"] = True
+
+    for profile in SANTO_GRAAL_PROFILES.values():
+        profile["session"] = _expand_session_tuple(profile["session"], 1, 1)
+        profile["adx_min"] = max(22.0, float(profile["adx_min"]) - 3.0)
+        profile["d1_adx_min"] = max(18.0, float(profile["d1_adx_min"]) - 2.5)
+        profile["ema_pad"] = max(0.02, float(profile["ema_pad"]) - 0.01)
+        profile["pullback_depth"] = min(0.62, float(profile["pullback_depth"]) + 0.08)
+        profile["confirm_pad"] = min(0.18, float(profile["confirm_pad"]) + 0.03)
+        profile["adx_drift_tol"] = float(profile.get("adx_drift_tol", 0.0)) + 0.35
+        profile["d1_adx_drift_tol"] = float(profile.get("d1_adx_drift_tol", 0.0)) + 0.25
+
+    for profile in KUMO_BREAKOUT_PROFILES.values():
+        profile["session"] = _expand_session_tuple(profile["session"], 1, 1)
+        profile["breakout_pad"] = max(0.03, float(profile["breakout_pad"]) - 0.02)
+        profile["max_extension"] = float(profile["max_extension"]) + 0.35
+        profile["hold_bars"] = max(1, int(profile.get("hold_bars", 1)) - 1)
+
+    for profile in SIDUS_PROFILES.values():
+        profile["session"] = _expand_session_tuple(profile["session"], 1, 1)
+        profile["cross_pad"] = max(0.015, float(profile["cross_pad"]) - 0.01)
+        profile["close_pad"] = max(0.01, float(profile["close_pad"]) - 0.008)
+        profile["compression"] = max(0.10, float(profile["compression"]) - 0.05)
+        profile["flat_slope"] = max(0.035, float(profile["flat_slope"]) - 0.02)
+        profile["max_extension"] = float(profile["max_extension"]) + 0.35
+        profile["body_floor"] = max(0.04, float(profile["body_floor"]) - 0.02)
+        profile["wick_ratio"] = float(profile["wick_ratio"]) + 0.18
+        profile["whipsaw_limit"] = int(profile.get("whipsaw_limit", 3)) + 1
+
+    for profile in PURIA_PROFILES.values():
+        profile["session"] = _expand_session_tuple(profile["session"], 1, 1)
+        profile["cross_pad"] = max(0.015, float(profile["cross_pad"]) - 0.01)
+        profile["close_pad"] = max(0.01, float(profile["close_pad"]) - 0.008)
+        profile["compression"] = max(0.10, float(profile["compression"]) - 0.04)
+        profile["flat_slope"] = max(0.03, float(profile["flat_slope"]) - 0.015)
+        profile["body_floor"] = max(0.04, float(profile["body_floor"]) - 0.02)
+        profile["wick_ratio"] = float(profile["wick_ratio"]) + 0.12
+        profile["macd_floor"] = max(0.020, float(profile["macd_floor"]) - 0.010)
+        profile["macd_expand"] = max(0.008, float(profile["macd_expand"]) - 0.004)
+        profile["whipsaw_limit"] = int(profile.get("whipsaw_limit", 3)) + 1
+
+    for profile in DOUBLE_MACD_PROFILES.values():
+        profile["sma_sep"] = max(0.14, float(profile["sma_sep"]) - 0.05)
+        profile["senior_floor"] = max(0.035, float(profile["senior_floor"]) - 0.015)
+        profile["senior_hist_floor"] = max(0.008, float(profile["senior_hist_floor"]) - 0.004)
+        profile["junior_floor"] = max(0.020, float(profile["junior_floor"]) - 0.010)
+        profile["junior_near_zero"] = float(profile["junior_near_zero"]) + 0.05
+        profile["junior_expand"] = max(0.008, float(profile["junior_expand"]) - 0.004)
+        profile["whipsaw_limit"] = int(profile.get("whipsaw_limit", 3)) + 1
+
+    for profile in HEIKEN_TDI_PROFILES.values():
+        profile["session"] = _expand_session_tuple(profile["session"], 1, 1)
+        profile["tdi_clear"] = max(0.35, float(profile["tdi_clear"]) - 0.12)
+        profile["yellow_slope"] = max(0.08, float(profile["yellow_slope"]) - 0.05)
+        profile["yellow_pad"] = max(0.14, float(profile["yellow_pad"]) - 0.08)
+        profile["tdi_relax"] = float(profile["tdi_relax"]) + 0.05
+        profile["compression"] = max(0.24, float(profile["compression"]) - 0.08)
+        profile["body_floor"] = max(0.05, float(profile["body_floor"]) - 0.02)
+        profile["key_level_pad"] = float(profile["key_level_pad"]) + 0.08
+        profile["whipsaw_limit"] = int(profile.get("whipsaw_limit", 2)) + 1
+
+    for profile in LIQUIDITY_SNIPER_PROFILES.values():
+        profile["session_windows"] = _expand_exchange_windows(profile["session_windows"], before_minutes=20, after_minutes=45)
+        profile["max_symbol_trades"] = max(int(profile.get("max_symbol_trades", 2)), 3)
+        profile["max_total_trades"] = max(int(profile.get("max_total_trades", 4)), 6)
+        profile["max_daily_drawdown_eur"] = round(float(profile.get("max_daily_drawdown_eur", 4.0)) * 1.20, 2)
+
+    for profile in TITANYX_PROFILES.values():
+        profile["entry_windows"] = _expand_exchange_windows(profile["entry_windows"], before_minutes=10, after_minutes=25)
+        profile["z_entry"] = max(1.70, float(profile["z_entry"]) - 0.20)
+        profile["z_readd"] = max(1.35, float(profile["z_readd"]) - 0.12)
+        profile["rsi_long"] = min(36, int(profile["rsi_long"]) + 3)
+        profile["rsi_short"] = max(64, int(profile["rsi_short"]) - 3)
+        profile["rsi_readd_long"] = min(46, int(profile["rsi_readd_long"]) + 3)
+        profile["rsi_readd_short"] = max(54, int(profile["rsi_readd_short"]) - 3)
+        profile["atr_spike_mult"] = float(profile["atr_spike_mult"]) + 0.25
+        profile["bar_range_mult"] = float(profile["bar_range_mult"]) + 0.20
+        profile["gap_atr_mult"] = float(profile["gap_atr_mult"]) + 0.12
+        profile["ema_divergence"] = float(profile["ema_divergence"]) + 0.18
+        profile["score_base"] = int(profile.get("score_base", 70)) - 4
+
+
 _apply_v160_strategy_governance()
+_apply_v160_entry_push_governance()
+_apply_v163_stress_test_governance()
+
+
+def _restore_runtime_switches():
+    refresh_symbols()
+    for strategy in STRATEGIES:
+        if strategy.get("disabled_reason"):
+            strategy["enabled"] = False
+            continue
+        family = strategy.get("symbol_family")
+        name = str(strategy.get("name", "") or "")
+        if is_crypto_family(family):
+            strategy["enabled"] = bool(crypto_enabled and strategy.get("toggle_arm", True))
+        elif name.endswith("_SCALP"):
+            strategy["enabled"] = bool(scalping_enabled and strategy.get("toggle_arm", True))
+        else:
+            strategy["enabled"] = True
+
+
+_restore_runtime_switches()
+
+
+def _asset_weight_for_symbol(symbol):
+    for family, weight in ASSET_WEIGHTS.items():
+        if symbol_in_family(symbol, family):
+            return float(weight)
+    return 0.50
+
+
+def _strategy_archetype(strategy_cfg):
+    strategy_cfg = strategy_cfg or {}
+    name = str(strategy_cfg.get("name", "") or "")
+    suite = str(strategy_cfg.get("suite", "") or "").upper()
+    setup_kind = str(strategy_cfg.get("setup_kind", "") or "").upper()
+
+    if suite == "TITANYX":
+        return "GRID_MEAN_REVERSION"
+    if suite == "LUKE":
+        return "PULLBACK_SCALP"
+    if suite == "SND_LIQUIDITY_SNIPER":
+        return "SND_REVERSAL" if setup_kind == "REVERSAL" else "SND_CONTINUATION"
+    if name.endswith("_PULLBACK_SCALP"):
+        return "PULLBACK_SCALP"
+    if name.endswith("_SCALP"):
+        return "SCALP"
+    if name.endswith("_ORB"):
+        return "OPENING_REVERSION"
+    if name.endswith("_BREAK_RETEST"):
+        return "BREAK_RETEST"
+    if name.endswith("_VWAP_RECLAIM"):
+        return "VWAP_RECLAIM"
+    if name.endswith("_VWAP_TREND"):
+        return "VWAP_TREND"
+    if name.endswith("_TREND"):
+        return "TREND"
+    if name.endswith("_SANTO_GRAAL"):
+        return "SANTO_GRAAL"
+    if name.endswith("_KUMO_BREAKOUT"):
+        return "KUMO_BREAKOUT"
+    if name.endswith("_PURIA"):
+        return "PURIA"
+    if name.endswith("_SIDUS"):
+        return "SIDUS"
+    if name.endswith("_DOUBLE_MACD"):
+        return "DOUBLE_MACD"
+    if name.endswith("_HEIKEN_TDI"):
+        return "HEIKEN_TDI"
+    return name or "GENERIC"
+
+
+def _strategies_compatible(strategy_a, signal_a, strategy_b, signal_b):
+    if not strategy_a or not strategy_b:
+        return False
+    if str(signal_a).upper() != str(signal_b).upper():
+        return False
+    if strategy_a.get("tag") == strategy_b.get("tag"):
+        return False
+
+    arch_a = _strategy_archetype(strategy_a)
+    arch_b = _strategy_archetype(strategy_b)
+    if arch_a == arch_b:
+        return False
+
+    mean_reversion_archetypes = {"GRID_MEAN_REVERSION", "OPENING_REVERSION", "SND_REVERSAL"}
+    fast_archetypes = {"SCALP", "PULLBACK_SCALP"}
+    breakout_archetypes = {"BREAK_RETEST", "KUMO_BREAKOUT"}
+
+    if arch_a in mean_reversion_archetypes and arch_b in mean_reversion_archetypes:
+        return False
+    if arch_a in fast_archetypes and arch_b in fast_archetypes:
+        return False
+    if arch_a in breakout_archetypes and arch_b in breakout_archetypes:
+        return False
+    return True
+
+
+def _get_open_symbol_clusters(symbol, live_positions=None):
+    clusters = {}
+    for p in (live_positions if live_positions is not None else safe_positions()):
+        if p.magic != MAGIC_ID or p.symbol != symbol:
+            continue
+        p_tag = position_strategy_map.get(p.ticket) or extract_strategy_tag(getattr(p, "comment", ""))
+        if not p_tag:
+            continue
+        clusters.setdefault(p_tag, "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL")
+    return clusters
+
+
+def _can_share_symbol_slot(symbol, strategy_cfg, signal, live_positions=None):
+    open_clusters = _get_open_symbol_clusters(symbol, live_positions)
+    strategy_tag = strategy_cfg.get("tag")
+
+    if strategy_tag in open_clusters:
+        return True, "SAME CLUSTER"
+    if not open_clusters:
+        return True, "FREE"
+
+    symbol_limit = min(get_max_clusters_for_symbol(symbol), MAX_COMPATIBLE_STRATEGIES_PER_SYMBOL)
+    if len(open_clusters) >= symbol_limit:
+        return False, "SYMBOL SLOT FULL"
+
+    for open_tag, open_signal in open_clusters.items():
+        open_cfg = get_strategy_by_tag(open_tag)
+        if not open_cfg:
+            return False, "SYMBOL ACTIVE"
+        if not _strategies_compatible(strategy_cfg, signal, open_cfg, open_signal):
+            return False, f"INCOMPATIBLE {open_tag}"
+    return True, "COMPATIBLE"
 
 
 TITANYX_REGISTRY = [
@@ -10113,6 +11923,50 @@ for spec in TITANYX_REGISTRY:
         cfg["selection_priority"] = _strategy_selection_priority(cfg)
 
 
+_DORMANT_STRESS_RELAX_OVERRIDES = {
+    "GBRT": {"min_score": 0.42, "cooldown_sec": 14},
+    "G4CL": {"min_score": 0.42, "cooldown_sec": 90},
+    "G4PU": {"min_score": 0.39, "cooldown_sec": 150},
+    "G4RV": {"min_score": 0.45, "cooldown_sec": 105},
+    "G4SG": {"min_score": 0.39, "cooldown_sec": 120},
+    "G4SC": {"min_score": 0.55, "cooldown_sec": 36},
+    "G4SD": {"min_score": 0.39, "cooldown_sec": 150},
+    "G4TR": {"min_score": 0.44, "cooldown_sec": 14},
+    "U5CL": {"min_score": 0.40, "cooldown_sec": 90},
+    "U5DM": {"min_score": 0.28, "cooldown_sec": 600},
+    "U5RV": {"min_score": 0.42, "cooldown_sec": 96},
+    "U5SG": {"min_score": 0.30, "cooldown_sec": 84},
+    "U5TX": {"min_score": 0.47, "cooldown_sec": 54},
+    "U5TR": {"min_score": 0.38, "cooldown_sec": 14},
+    "UBRT": {"min_score": 0.36, "cooldown_sec": 14},
+    "U1CL": {"min_score": 0.40, "cooldown_sec": 90},
+    "U1HT": {"min_score": 0.33, "cooldown_sec": 600},
+    "U1KB": {"min_score": 0.31, "cooldown_sec": 105},
+    "U1PU": {"min_score": 0.29, "cooldown_sec": 84},
+    "U1RV": {"min_score": 0.42, "cooldown_sec": 96},
+    "U1SG": {"min_score": 0.30, "cooldown_sec": 84},
+    "U1SD": {"min_score": 0.29, "cooldown_sec": 84},
+    "USTR": {"min_score": 0.36, "cooldown_sec": 14},
+    "XBRT": {"min_score": 0.35, "cooldown_sec": 14},
+    "XLUK": {"min_score": 0.44, "cooldown_sec": 16},
+    "XTRD": {"min_score": 0.35, "cooldown_sec": 14},
+    "XVRC": {"min_score": 0.37, "cooldown_sec": 14},
+}
+
+
+def _apply_dormant_stress_relaxation():
+    for cfg in STRATEGIES:
+        override = _DORMANT_STRESS_RELAX_OVERRIDES.get(cfg.get("tag"))
+        if not override:
+            continue
+        cfg["min_score"] = float(override["min_score"])
+        cfg["cooldown_sec"] = int(override["cooldown_sec"])
+        cfg["selection_priority"] = _strategy_selection_priority(cfg)
+
+
+_apply_dormant_stress_relaxation()
+
+
 def compute_asset_score(symbol, df, sig, conf, strategy_cfg=None):
     if sig == "NEUTRAL":
         return 0
@@ -10127,7 +11981,8 @@ def compute_asset_score(symbol, df, sig, conf, strategy_cfg=None):
         raw_score = (base_score * 0.45) + (vol_score * 0.10) + (mom_score * 0.15) + (trend_score * 0.30)
     else:
         raw_score = (base_score + vol_score + mom_score) / 3.0
-    return round(min(1.0, raw_score), 3)
+    entry_push_bonus = 0.05 if str(CURRENT_OPTIMIZER_PROFILE).upper() == "ATTACK" else 0.03
+    return round(min(1.0, raw_score + entry_push_bonus), 3)
 
 
 # ==============================================================================
@@ -10147,15 +12002,17 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
     tp_rr_multiplier = strategy_cfg.get("tp_rr_multiplier", 2.0)
     signal_payload = signal_payload or {}
     risk_multiplier = float(signal_payload.get("risk_multiplier_override", risk_multiplier) or risk_multiplier)
+    risk_percent_override = signal_payload.get("risk_percent_override")
     allow_scale_in_cluster = bool(strategy_cfg.get("allow_scale_in_cluster"))
     max_basket_orders = int(strategy_cfg.get("max_basket_orders", 1) or 1)
 
     live_pos = safe_positions()
     open_clusters = {
-        (p.comment or "MANUAL").rsplit("_", 1)[0]
+        extract_strategy_tag(getattr(p, "comment", ""))
         for p in live_pos
         if p.symbol == symbol and p.magic == MAGIC_ID
     }
+    open_clusters.discard(None)
     existing_cluster_positions = get_strategy_cluster_positions(symbol, strategy_tag) if allow_scale_in_cluster else []
     if strategy_tag in open_clusters:
         if not allow_scale_in_cluster:
@@ -10168,9 +12025,10 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
         if existing_cluster_positions and existing_side != signal:
             set_live_log(symbol, f"⚠️ EXEC CANCEL: {strategy_tag} opposite basket active")
             return False, "OPPOSITE BASKET"
-    if strategy_cfg.get("exclusive_symbol") and not (allow_scale_in_cluster and existing_cluster_positions) and any(p.symbol == symbol and p.magic == MAGIC_ID for p in live_pos):
-        set_live_log(symbol, f"⚠️ EXEC CANCEL: {strategy_tag} exclusive symbol lock")
-        return False, "SYMBOL ACTIVE"
+    can_share_symbol, share_reason = _can_share_symbol_slot(symbol, strategy_cfg, signal, live_pos)
+    if not (allow_scale_in_cluster and existing_cluster_positions) and not can_share_symbol:
+        set_live_log(symbol, f"⚠️ EXEC CANCEL: {strategy_tag} {share_reason}")
+        return False, share_reason
     symbol_cluster_cap = get_max_clusters_for_symbol(symbol)
     if len(open_clusters) >= symbol_cluster_cap:
         set_live_log(symbol, "⚠️ EXEC CANCEL: Max strategy clusters reached")
@@ -10188,7 +12046,10 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
         sl_dist = atr * sl_atr_multiplier
     sl_dist = max(sl_dist, max(info.point * 20, atr * 0.35))
 
-    risk_money = acc.equity * compute_dynamic_risk() * risk_multiplier
+    if risk_percent_override is not None:
+        risk_money = acc.equity * (float(risk_percent_override) / 100.0)
+    else:
+        risk_money = acc.equity * compute_dynamic_risk() * risk_multiplier
     projected_risk = get_total_open_risk() + (risk_money / max(acc.equity, 1e-6))
     if projected_risk > MAX_TOTAL_RISK:
         set_live_log(symbol, f"🚫 {strategy_tag}: MAX TOTAL RISK")
@@ -10232,9 +12093,32 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
         with mt5_lock:
             res = mt5.order_send(request)
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            cluster_key = (symbol, strategy_tag)
+            cluster_state = trade_memory.setdefault(cluster_key, {"legs": {}, "abort_cluster": False})
+            cluster_state.update(
+                {
+                    "opened_at": datetime.now(),
+                    "signal": signal,
+                    "score": round(float(score or 0.0), 3),
+                    "confidence": round(float(confidence if confidence is not None else score * 100.0), 1),
+                    "signal_meta": signal_payload,
+                    "tp_splits": max(1, int(cluster_state.get("tp_splits", 0) or 1)),
+                    "tp_prices": [round(float(tp), info.digits)] if tp else list(cluster_state.get("tp_prices", []) or []),
+                    "probability_below_count": 0,
+                    "probability_cached": {
+                        "mode": _infer_probability_mode(strategy_cfg),
+                        "profile": _infer_probability_profile(strategy_cfg),
+                        "probability": 50.0,
+                        "threshold": PROBABILITY_MIN_THRESHOLD,
+                        "hard_threshold": PROBABILITY_HARD_THRESHOLD,
+                        "reason": "INIT",
+                        "should_exit": False,
+                        "below_count": 0,
+                    },
+                    "probability_last_eval_at": None,
+                }
+            )
             if strategy_cfg.get("suite") == "TITANYX":
-                cluster_key = (symbol, strategy_tag)
-                cluster_state = trade_memory.setdefault(cluster_key, {"legs": {}, "abort_cluster": False})
                 cluster_state.update(
                     {
                         "opened_at": datetime.now(),
@@ -10262,6 +12146,18 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
         info,
         abs(tick.ask - tick.bid),
     )
+    forced_splits = signal_payload.get("force_splits")
+    if forced_splits is not None:
+        plan_cfg["fixed_tp_splits"] = max(1, min(MAX_SPLITS, int(forced_splits)))
+        splits = int(plan_cfg["fixed_tp_splits"])
+    if signal_payload.get("tp_point_targets"):
+        plan_cfg["fixed_tp_points"] = list(signal_payload.get("tp_point_targets") or [])
+    if signal_payload.get("tp_point_buffer") is not None:
+        plan_cfg["tp_point_buffer"] = float(signal_payload.get("tp_point_buffer"))
+    if signal_payload.get("point_value_price") is not None:
+        plan_cfg["point_value_price"] = float(signal_payload.get("point_value_price"))
+    if signal_payload.get("lot_weights_override"):
+        plan_cfg["lot_weights_override"] = list(signal_payload.get("lot_weights_override") or [])
     strategy_cfg = plan_cfg
     record_strategy_tp_plan(strat_name, plan_text)
     lot_plan = build_dynamic_multi_tp_lot_plan(
@@ -10322,8 +12218,10 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
         cluster_profile = get_cluster_profile(strategy_cfg, cluster_state)
         effective_quality = float(strategy_cfg.get("effective_tp_quality", 0.5) or 0.5)
         tp_high_conf = bool(effective_quality >= 0.62 or confidence_value >= 80.0)
-        tp_be_after_legs = 2 if tp_high_conf else 1
-        tp_lock_offset = 2 if tp_high_conf else 1
+        tp_be_after_legs_raw = signal_payload.get("tp_be_after_legs_override")
+        tp_lock_offset_raw = signal_payload.get("tp_lock_offset_override")
+        tp_be_after_legs = int(tp_be_after_legs_raw if tp_be_after_legs_raw is not None else (2 if tp_high_conf else 1))
+        tp_lock_offset = int(tp_lock_offset_raw if tp_lock_offset_raw is not None else (2 if tp_high_conf else 1))
         early_target = sum(successful_projected_profits[: min(2, len(successful_projected_profits))]) if successful_projected_profits else 0.0
         weak_floor = max(cluster_profile["weak_profit_floor"], early_target * clamp(0.52 + (0.5 - cluster_profile["quality"]) * 0.30, 0.34, 0.72))
         cluster_state.update(
@@ -10356,10 +12254,41 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
                 "tp1_projected": successful_projected_profits[0] if successful_projected_profits else 0.0,
                 "tp2_projected": successful_projected_profits[1] if len(successful_projected_profits) > 1 else (successful_projected_profits[0] if successful_projected_profits else 0.0),
                 "peak_open_profit": 0.0,
+                "probability_below_count": 0,
+                "probability_cached": {
+                    "mode": _infer_probability_mode(strategy_cfg),
+                    "profile": _infer_probability_profile(strategy_cfg),
+                    "probability": 50.0,
+                    "threshold": PROBABILITY_MIN_THRESHOLD,
+                    "hard_threshold": PROBABILITY_HARD_THRESHOLD,
+                    "reason": "INIT",
+                    "should_exit": False,
+                    "below_count": 0,
+                },
+                "probability_last_eval_at": None,
                 "abort_cluster": False,
                 "abort_reason": "",
             }
         )
+        if strategy_cfg.get("suite") == "LUKE":
+            luke_details = signal_payload.get("signal_details", {}) or {}
+            cluster_state.update(
+                {
+                    "luke_setup": luke_details.get("setup", "CONTINUATION"),
+                    "luke_reentry": bool(luke_details.get("reentry")),
+                    "luke_zone_low": luke_details.get("zone_low"),
+                    "luke_zone_high": luke_details.get("zone_high"),
+                    "luke_sl_price": round(float(custom_sl_price if custom_sl_price is not None else sl_price), info.digits),
+                    "luke_entry_price": round(float(price), info.digits),
+                    "luke_reentry_tp_points": list(signal_payload.get("tp_point_targets") or []),
+                    "luke_reentry_after_legs": int(tp_be_after_legs_raw if tp_be_after_legs_raw is not None else 2),
+                }
+            )
+            luke_state = _luke_runtime(symbol)
+            if bool(luke_details.get("reentry")):
+                luke_state["used"] = True
+            else:
+                luke_state["used"] = False
         last_trade_time[symbol] = time.time()
         last_signal[symbol] = signal
         return True, "EXECUTED"
@@ -10378,9 +12307,10 @@ def tick_management():
     for p in positions:
         if p.magic != MAGIC_ID:
             continue
-        if p.comment:
-            position_strategy_map[p.ticket] = p.comment.rsplit("_", 1)[0]
-        strategy_tag = position_strategy_map.get(p.ticket) or (p.comment.rsplit("_", 1)[0] if p.comment else None)
+        comment_tag = extract_strategy_tag(getattr(p, "comment", ""))
+        if comment_tag:
+            position_strategy_map[p.ticket] = comment_tag
+        strategy_tag = position_strategy_map.get(p.ticket) or comment_tag
         if not strategy_tag:
             continue
         cluster_key = (p.symbol, strategy_tag)
@@ -10410,11 +12340,26 @@ def tick_management():
                     cluster_state["abort_cluster"] = True
                     cluster_state["abort_reason"] = f"TP{highest_stopped_leg} runner stop cascade"
 
+    cluster_probability_cache = {}
+    for cluster_key, live_positions in cluster_positions.items():
+        strategy_cfg = get_strategy_by_tag(cluster_key[1])
+        if not strategy_cfg:
+            continue
+        cluster_state = trade_memory.setdefault(cluster_key, {"legs": {}, "abort_cluster": False})
+        cluster_probability_cache[cluster_key] = evaluate_cluster_probability(
+            cluster_key[0],
+            strategy_cfg,
+            cluster_state,
+            live_positions,
+            cluster_live.get(cluster_key, {}),
+        )
+
     cluster_abort_logged = set()
+    probability_exit_logged = set()
     for p in positions:
         if p.magic != MAGIC_ID:
             continue
-        strategy_tag = position_strategy_map.get(p.ticket) or (p.comment.rsplit("_", 1)[0] if p.comment else None)
+        strategy_tag = position_strategy_map.get(p.ticket) or extract_strategy_tag(getattr(p, "comment", ""))
         if not strategy_tag:
             continue
         cluster_state = trade_memory.get((p.symbol, strategy_tag), {})
@@ -10426,6 +12371,10 @@ def tick_management():
                 abort_reason = cluster_state.get("abort_reason", "cluster invalidated")
                 set_live_log(p.symbol, f"🛑 CLUSTER ABORT {strategy_tag} | {abort_reason}")
                 record_strategy_event(strategy_name, "CLUSTER ABORT")
+                if strategy_cfg and strategy_cfg["name"].endswith("_LUKE"):
+                    luke_state = _luke_runtime(p.symbol)
+                    luke_state["loss_streak"] = min(int(luke_state.get("loss_streak", 0) or 0) + 1, 5)
+                    luke_state["eligible"] = False
                 cluster_abort_logged.add((p.symbol, strategy_tag))
             continue
 
@@ -10438,6 +12387,25 @@ def tick_management():
         tp_rules = get_tp_management_rules(cluster_state, cluster_profile)
         guard_after_legs = tp_rules["be_after_legs"] if is_dynamic_tp_cluster else 1
         weak_floor = max(cluster_state.get("weak_profit_floor", 0.0), cluster_profile["weak_profit_floor"])
+        if strategy_cfg and strategy_cfg["name"].endswith("_LUKE") and positive_legs >= 2 and not cluster_state.get("luke_reentry"):
+            luke_state = _luke_runtime(p.symbol)
+            if not luke_state.get("used"):
+                luke_state.update(
+                    {
+                        "eligible": True,
+                        "used": False,
+                        "direction": cluster_state.get("signal"),
+                        "zone_low": cluster_state.get("luke_zone_low"),
+                        "zone_high": cluster_state.get("luke_zone_high"),
+                        "sl_price": cluster_state.get("luke_sl_price"),
+                        "expires_at": datetime.now() + timedelta(minutes=int(LUKE_PROFILES["XAUUSD"]["max_minutes_from_first_entry"])),
+                        "tp_points": list(LUKE_PROFILES["XAUUSD"]["reentry_tp_points"]),
+                        "tp_be_after_legs": int(LUKE_PROFILES["XAUUSD"]["reentry_be_after_tp"]),
+                        "entry_time": cluster_state.get("opened_at"),
+                        "source_setup": cluster_state.get("luke_setup", "CONTINUATION"),
+                        "loss_streak": 0,
+                    }
+                )
         if positive_legs >= 2 and early_profit < weak_floor and cluster_meta.get("open_profit", 0.0) <= max(0.15, early_profit * cluster_profile["early_cashout_ratio"]):
             closed = close_strategy_cluster(p.symbol, strategy_tag)
             if closed > 0 and (p.symbol, strategy_tag) not in cluster_abort_logged:
@@ -10445,6 +12413,8 @@ def tick_management():
                 strategy_name = strategy_cfg["name"] if strategy_cfg else strategy_tag
                 set_live_log(p.symbol, f"💸 CLUSTER CASHOUT {strategy_tag} | weak TP1/TP2")
                 record_strategy_event(strategy_name, "WEAK EARLY CASHOUT")
+                if strategy_cfg and strategy_cfg["name"].endswith("_LUKE"):
+                    _luke_runtime(p.symbol)["loss_streak"] = 0 if positive_legs >= 2 else min(int(_luke_runtime(p.symbol).get("loss_streak", 0) or 0) + 1, 5)
                 cluster_abort_logged.add((p.symbol, strategy_tag))
         if strategy_cfg and strategy_cfg["name"].endswith("_ORB"):
             orb_floor = max(weak_floor, strategy_cfg.get("multi_tp_eur_min", 0.50) * clamp(1.22 + (0.5 - cluster_profile["quality"]) * 0.30, 0.90, 1.40))
@@ -10462,8 +12432,9 @@ def tick_management():
     for p in positions:
         if p.magic != MAGIC_ID:
             continue
-        if p.comment:
-            position_strategy_map[p.ticket] = p.comment.rsplit("_", 1)[0]
+        comment_tag = extract_strategy_tag(getattr(p, "comment", ""))
+        if comment_tag:
+            position_strategy_map[p.ticket] = comment_tag
 
         info = safe_info(p.symbol)
         tick = safe_tick(p.symbol)
@@ -10473,10 +12444,35 @@ def tick_management():
         price = tick.bid if p.type == 0 else tick.ask
         entry = p.price_open
         profit_points = (price - entry) / info.point if p.type == 0 else (entry - price) / info.point
-        strategy_tag = position_strategy_map.get(p.ticket) or (p.comment.rsplit("_", 1)[0] if p.comment else None)
+        strategy_tag = position_strategy_map.get(p.ticket) or comment_tag
         strategy_cfg = get_strategy_by_tag(strategy_tag) if strategy_tag else None
         strategy_name = strategy_cfg["name"] if strategy_cfg else strategy_tag
+        cluster_state = trade_memory.get((p.symbol, strategy_tag), {}) if strategy_tag else {}
+        probability_eval = cluster_probability_cache.get((p.symbol, strategy_tag))
+        if strategy_cfg and probability_eval:
+            record_strategy_probability(
+                strategy_name,
+                p.symbol,
+                probability_eval.get("probability", 0.0),
+                probability_eval.get("reason", "---"),
+                probability_eval.get("mode", "OFF"),
+                probability_eval.get("threshold", PROBABILITY_MIN_THRESHOLD),
+            )
         is_orb_cluster = bool(strategy_cfg and strategy_cfg["name"].endswith("_ORB"))
+        if strategy_cfg and strategy_cfg["name"].endswith("_LUKE"):
+            luke_reason = get_luke_exit_reason(p.symbol, strategy_cfg, cluster_state.get("signal", "BUY"))
+            if luke_reason:
+                closed = close_strategy_cluster(p.symbol, strategy_tag)
+                if closed > 0 and (p.symbol, strategy_tag) not in sg_exit_logged:
+                    luke_state = _luke_runtime(p.symbol)
+                    if cluster_state.get("positive_legs", 0) >= 2:
+                        luke_state["loss_streak"] = 0
+                    else:
+                        luke_state["loss_streak"] = min(int(luke_state.get("loss_streak", 0) or 0) + 1, 5)
+                    set_live_log(p.symbol, f"🪙 LUKE EXIT {strategy_tag} | {luke_reason}")
+                    record_strategy_event(strategy_name, "LUKE EXIT")
+                    sg_exit_logged.add((p.symbol, strategy_tag))
+                continue
         if strategy_cfg and strategy_cfg["name"].endswith("_TITANYX"):
             cluster_key = (p.symbol, strategy_tag)
             if cluster_key in titanyx_managed:
@@ -10573,9 +12569,23 @@ def tick_management():
                     record_strategy_event(strategy_name, "SANTO GRAAL EXIT")
                     sg_exit_logged.add((p.symbol, strategy_tag))
                 continue
+        if strategy_cfg and probability_eval and probability_eval.get("mode") == "LIVE":
+            cluster_key = (p.symbol, strategy_tag)
+            if probability_eval.get("should_exit") and cluster_key not in probability_exit_logged:
+                closed = close_strategy_cluster(p.symbol, strategy_tag)
+                if closed > 0:
+                    reason = probability_eval.get("reason", "PROBABILITY COLLAPSE")
+                    prob_value = round(float(probability_eval.get("probability", 0.0) or 0.0), 1)
+                    set_live_log(p.symbol, f"🧠 PROB EXIT {strategy_tag} | {prob_value}% | {reason}")
+                    record_strategy_event(strategy_name, f"PROB EXIT {int(round(prob_value))}%")
+                    probability_exit_logged.add(cluster_key)
+                continue
 
         if int(time.time()) % 10 == 0:
-            set_live_log(p.symbol, f"📌 MANAGING | PnL: {round(p.profit,2)}€ ({round(profit_points,1)} pts)")
+            prob_text = ""
+            if probability_eval:
+                prob_text = f" | Prob {round(float(probability_eval.get('probability', 0.0) or 0.0), 1)}%"
+            set_live_log(p.symbol, f"📌 MANAGING | PnL: {round(p.profit,2)}€ ({round(profit_points,1)} pts){prob_text}")
 
         new_sl = p.sl
         target_points = abs(p.tp - entry) / info.point if p.tp else 0
@@ -10754,36 +12764,45 @@ def tick_management():
 # ==============================================================================
 def learn_from_history():
     global last_history_check, session_stats, performance_memory, legacy_stats, liquidity_sniper_day_state
-
-    now = datetime.now()
-    broker_offset = get_live_broker_offset()
-    broker_session_started_at = get_broker_session_start()
-    broker_now = now + broker_offset
-    seed_start = broker_session_started_at - timedelta(days=2)
-    seed_deals = mt5.history_deals_get(seed_start, broker_now) or []
-    if not seed_deals:
+    global session_trade_ledger, portfolio_snapshot, strategy_matrix_snapshot, session_ignored_position_ids, session_baseline_ready
+    if not session_active:
+        with history_state_lock:
+            _rebuild_visual_snapshots(acc=mt5.account_info(), live_pnl=0.0)
         return
+    if not session_baseline_ready:
+        if not _seed_session_baseline():
+            with history_state_lock:
+                _rebuild_visual_snapshots(acc=mt5.account_info(), live_pnl=0.0)
+            return
+    with history_state_lock:
+        now = datetime.now()
+        broker_offset = get_live_broker_offset()
+        broker_now = now + broker_offset
+        seed_start = now - timedelta(days=5)
+        seed_deals = mt5.history_deals_get(seed_start, broker_now) or []
 
-    fresh_position_map = {}
-    fresh_position_comment_map = {}
-    for d in seed_deals:
-        if d.magic != MAGIC_ID:
-            continue
-        position_id = getattr(d, "position_id", None) or getattr(d, "position", None)
-        if d.entry == mt5.DEAL_ENTRY_IN and d.comment and position_id:
-            strategy_tag = TAG_ALIASES.get(d.comment.rsplit("_", 1)[0], d.comment.rsplit("_", 1)[0])
-            fresh_position_map[position_id] = strategy_tag
-            fresh_position_comment_map[position_id] = d.comment
+        fresh_position_map = {}
+        fresh_position_comment_map = {}
+        for d in seed_deals:
+            if d.magic != MAGIC_ID:
+                continue
+            position_id = getattr(d, "position_id", None) or getattr(d, "position", None)
+            if d.entry == mt5.DEAL_ENTRY_IN and d.comment and position_id:
+                strategy_tag = extract_strategy_tag(d.comment)
+                if not strategy_tag:
+                    continue
+                fresh_position_map[position_id] = strategy_tag
+                fresh_position_comment_map[position_id] = d.comment
 
-    deals = [
-        d
-        for d in seed_deals
-        if d.magic == MAGIC_ID and d.entry == mt5.DEAL_ENTRY_OUT and getattr(d, "time", 0) >= broker_session_started_at.timestamp()
-    ]
-    deals = sorted(deals, key=lambda d: (getattr(d, "time", 0), _deal_ticket(d) or 0))
-    liquidity_sniper_day_state = _build_liquidity_sniper_day_state(deals, fresh_position_map)
+        deals = [
+            d
+            for d in seed_deals
+            if d.magic == MAGIC_ID and _is_realized_exit_deal(d)
+        ]
+        deals = sorted(deals, key=lambda d: (getattr(d, "time", 0), _deal_ticket(d) or 0))
+        liquidity_sniper_day_state = _build_liquidity_sniper_day_state(deals, fresh_position_map)
 
-    def apply_closed_deal(d, session_acc, perf_acc, strategy_acc, legacy_acc, trade_acc, latest_acc):
+    def apply_closed_deal(d, session_acc, perf_acc, strategy_acc, legacy_acc, trade_acc, latest_acc, ledger_acc):
         realized_pnl = get_deal_realized_pnl(d)
         if realized_pnl > 0:
             session_acc["trades"] += 1
@@ -10798,12 +12817,33 @@ def learn_from_history():
         session_acc["profit"] += realized_pnl
 
         position_id = getattr(d, "position_id", None) or getattr(d, "position", None)
-        strategy_tag = fresh_position_map.get(position_id)
+        strategy_tag = fresh_position_map.get(position_id) or extract_strategy_tag(getattr(d, "comment", ""))
         deal_time = datetime.fromtimestamp(getattr(d, "time", 0)) if getattr(d, "time", 0) else now
 
         if strategy_tag:
             strategy_cfg = get_strategy_by_tag(strategy_tag)
-            if strategy_cfg:
+            strategy_family_ok = bool(strategy_cfg and symbol_in_family(getattr(d, "symbol", ""), strategy_cfg.get("symbol_family")))
+            leg_comment = fresh_position_comment_map.get(position_id, "")
+            exit_comment = str(getattr(d, "comment", "") or "").upper()
+            if "[TP" in exit_comment:
+                exit_reason = "TP"
+            elif "[SL" in exit_comment:
+                exit_reason = "SL"
+            else:
+                exit_reason = "OTHER"
+            ledger_acc.append(
+                _build_trade_ledger_entry(
+                    d,
+                    strategy_cfg,
+                    strategy_tag,
+                    realized_pnl,
+                    deal_time,
+                    leg_comment,
+                    exit_reason,
+                    strategy_family_ok,
+                )
+            )
+            if strategy_cfg and strategy_family_ok:
                 stats = strategy_acc[strategy_cfg["name"]]
                 if realized_pnl > 0:
                     stats["wins"] += 1
@@ -10830,115 +12870,315 @@ def learn_from_history():
                     legacy_acc["flat"] += 1
                 legacy_acc["net_profit"] += realized_pnl
 
-            cluster_key = (d.symbol, strategy_tag)
-            cluster_state = trade_acc.setdefault(cluster_key, {"legs": {}, "abort_cluster": False})
-            leg_comment = fresh_position_comment_map.get(position_id, "")
-            leg_index = extract_leg_index(leg_comment)
-            exit_comment = str(getattr(d, "comment", "") or "").upper()
-            if "[TP" in exit_comment:
-                exit_reason = "TP"
-            elif "[SL" in exit_comment:
-                exit_reason = "SL"
-            else:
-                exit_reason = "OTHER"
+            if strategy_cfg and strategy_family_ok:
+                cluster_key = (d.symbol, strategy_tag)
+                cluster_state = trade_acc.setdefault(cluster_key, {"legs": {}, "abort_cluster": False})
+                leg_index = extract_leg_index(leg_comment)
 
-            if leg_index is not None:
-                cluster_state["legs"][leg_index] = {
-                    "reason": exit_reason,
-                    "profit": realized_pnl,
-                    "ticket": position_id,
-                }
-                tp1 = cluster_state["legs"].get(1)
-                tp2 = cluster_state["legs"].get(2)
-                positive_legs = sorted(idx for idx, leg in cluster_state["legs"].items() if leg.get("profit", 0.0) > 0)
-                early_profit = sum(cluster_state["legs"][idx]["profit"] for idx in (1, 2) if idx in cluster_state["legs"])
-                cluster_state["positive_legs"] = len(positive_legs)
-                cluster_state["realized_profit"] = round(sum(leg.get("profit", 0.0) for leg in cluster_state["legs"].values()), 2)
-                weak_profit_floor = 0.35
-                strategy_cfg = get_strategy_by_tag(strategy_tag)
-                if strategy_cfg:
+                if leg_index is not None:
+                    cluster_state["legs"][leg_index] = {
+                        "reason": exit_reason,
+                        "profit": realized_pnl,
+                        "ticket": position_id,
+                    }
+                    tp1 = cluster_state["legs"].get(1)
+                    tp2 = cluster_state["legs"].get(2)
+                    positive_legs = sorted(idx for idx, leg in cluster_state["legs"].items() if leg.get("profit", 0.0) > 0)
+                    early_profit = sum(cluster_state["legs"][idx]["profit"] for idx in (1, 2) if idx in cluster_state["legs"])
+                    cluster_state["positive_legs"] = len(positive_legs)
+                    cluster_state["realized_profit"] = round(sum(leg.get("profit", 0.0) for leg in cluster_state["legs"].values()), 2)
                     weak_profit_floor = max(0.35, strategy_cfg.get("multi_tp_eur_min", 0.50) * 0.85)
-                cluster_state["early_profit"] = round(early_profit, 2)
-                cluster_state["weak_profit_floor"] = round(weak_profit_floor, 2)
-                sl_legs = sorted(idx for idx, leg in cluster_state["legs"].items() if leg.get("reason") == "SL")
-                cluster_state["sl_legs"] = len(sl_legs)
-                cluster_state["sl_profit"] = round(sum(cluster_state["legs"][idx].get("profit", 0.0) for idx in sl_legs), 2)
-                if tp1 and tp1["reason"] == "SL":
-                    cluster_state["abort_cluster"] = True
-                    cluster_state["abort_reason"] = "TP1 stopped"
-                elif tp1 and tp2 and tp1["reason"] != "TP" and tp2["reason"] != "TP":
-                    cluster_state["abort_cluster"] = True
-                    cluster_state["abort_reason"] = "TP1/TP2 rejected"
-                elif tp1 and tp2 and early_profit < weak_profit_floor:
-                    cluster_state["abort_cluster"] = True
-                    cluster_state["abort_reason"] = "TP1/TP2 too weak"
-
-                sorted_legs = sorted(cluster_state["legs"])
-                for idx in range(len(sorted_legs) - 1):
-                    current_leg = sorted_legs[idx]
-                    next_leg = sorted_legs[idx + 1]
-                    if next_leg != current_leg + 1:
-                        continue
-                    current_reason = cluster_state["legs"][current_leg].get("reason")
-                    next_reason = cluster_state["legs"][next_leg].get("reason")
-                    if current_reason == "SL" and next_reason == "SL":
+                    cluster_state["early_profit"] = round(early_profit, 2)
+                    cluster_state["weak_profit_floor"] = round(weak_profit_floor, 2)
+                    sl_legs = sorted(idx for idx, leg in cluster_state["legs"].items() if leg.get("reason") == "SL")
+                    cluster_state["sl_legs"] = len(sl_legs)
+                    cluster_state["sl_profit"] = round(sum(cluster_state["legs"][idx].get("profit", 0.0) for idx in sl_legs), 2)
+                    if tp1 and tp1["reason"] == "SL":
                         cluster_state["abort_cluster"] = True
-                        cluster_state["abort_reason"] = f"TP{current_leg}/TP{next_leg} stopped"
-                        break
-                if not cluster_state.get("abort_cluster") and positive_legs and len(sl_legs) >= 2:
-                    cluster_state["abort_cluster"] = True
-                    cluster_state["abort_reason"] = f"{len(sl_legs)} TP legs stopped"
+                        cluster_state["abort_reason"] = "TP1 stopped"
+                    elif tp1 and tp2 and tp1["reason"] != "TP" and tp2["reason"] != "TP":
+                        cluster_state["abort_cluster"] = True
+                        cluster_state["abort_reason"] = "TP1/TP2 rejected"
+                    elif tp1 and tp2 and early_profit < weak_profit_floor:
+                        cluster_state["abort_cluster"] = True
+                        cluster_state["abort_reason"] = "TP1/TP2 too weak"
+
+                    sorted_legs = sorted(cluster_state["legs"])
+                    for idx in range(len(sorted_legs) - 1):
+                        current_leg = sorted_legs[idx]
+                        next_leg = sorted_legs[idx + 1]
+                        if next_leg != current_leg + 1:
+                            continue
+                        current_reason = cluster_state["legs"][current_leg].get("reason")
+                        next_reason = cluster_state["legs"][next_leg].get("reason")
+                        if current_reason == "SL" and next_reason == "SL":
+                            cluster_state["abort_cluster"] = True
+                            cluster_state["abort_reason"] = f"TP{current_leg}/TP{next_leg} stopped"
+                            break
+                    if not cluster_state.get("abort_cluster") and positive_legs and len(sl_legs) >= 2:
+                        cluster_state["abort_cluster"] = True
+                        cluster_state["abort_reason"] = f"{len(sl_legs)} TP legs stopped"
+        else:
+            legacy_acc["wins"] += 1 if realized_pnl > 0 else 0
+            legacy_acc["losses"] += 1 if realized_pnl < 0 else 0
+            legacy_acc["flat"] += 1 if realized_pnl == 0 else 0
+            legacy_acc["gross_profit"] += realized_pnl if realized_pnl > 0 else 0.0
+            legacy_acc["gross_loss"] += realized_pnl if realized_pnl < 0 else 0.0
+            legacy_acc["net_profit"] += realized_pnl
+            if realized_pnl != 0:
+                legacy_acc["closed"] += 1
+            ledger_acc.append(
+                _build_trade_ledger_entry(
+                    d,
+                    None,
+                    None,
+                    realized_pnl,
+                    deal_time,
+                    "",
+                    "OTHER",
+                    False,
+                )
+            )
 
     latest_strategy_result = {}
-    if not processed_deals:
-        fresh_session_stats = {"profit": 0.0, "trades": 0, "wins": 0, "losses": 0, "flat": 0}
-        fresh_performance = {"wins": 0, "losses": 0}
-        fresh_strategy_stats = _blank_strategy_stats()
-        fresh_legacy_stats = _blank_stats_row()
-        fresh_trade_memory = {}
-        for d in deals:
-            apply_closed_deal(d, fresh_session_stats, fresh_performance, fresh_strategy_stats, fresh_legacy_stats, fresh_trade_memory, latest_strategy_result)
-            deal_ticket = _deal_ticket(d)
-            if deal_ticket is not None:
-                processed_deals.add(deal_ticket)
-        session_stats = fresh_session_stats
-        performance_memory = fresh_performance
-        legacy_stats = fresh_legacy_stats
-        for strategy_name, stats in fresh_strategy_stats.items():
-            strategy_stats[strategy_name] = stats
-        trade_memory.clear()
-        trade_memory.update(fresh_trade_memory)
-    else:
-        fresh_session_stats = dict(session_stats)
-        fresh_performance = dict(performance_memory)
-        fresh_strategy_stats = _blank_strategy_stats()
-        for strategy_name, stats in strategy_stats.items():
-            if strategy_name in fresh_strategy_stats:
-                fresh_strategy_stats[strategy_name].update(stats)
-        fresh_legacy_stats = dict(legacy_stats)
-        fresh_trade_memory = copy.deepcopy(trade_memory)
+    with history_state_lock:
+        position_strategy_map.update(fresh_position_map)
         for d in deals:
             deal_ticket = _deal_ticket(d)
             if deal_ticket is None or deal_ticket in processed_deals:
                 continue
-            apply_closed_deal(d, fresh_session_stats, fresh_performance, fresh_strategy_stats, fresh_legacy_stats, fresh_trade_memory, latest_strategy_result)
+            position_id = getattr(d, "position_id", None) or getattr(d, "position", None)
+            if position_id in session_ignored_position_ids:
+                processed_deals.add(deal_ticket)
+                continue
+
+            apply_closed_deal(
+                d,
+                session_stats,
+                performance_memory,
+                strategy_stats,
+                legacy_stats,
+                trade_memory,
+                latest_strategy_result,
+                session_trade_ledger,
+            )
             processed_deals.add(deal_ticket)
-        session_stats = fresh_session_stats
-        performance_memory = fresh_performance
-        legacy_stats = fresh_legacy_stats
-        for strategy_name, stats in fresh_strategy_stats.items():
-            strategy_stats[strategy_name] = stats
-        trade_memory.clear()
-        trade_memory.update(fresh_trade_memory)
 
-    position_strategy_map.clear()
-    position_strategy_map.update(fresh_position_map)
-    for strategy_name, result_data in latest_strategy_result.items():
-        profit, result_time = result_data
-        record_strategy_result(strategy_name, profit, result_time)
+        for strategy_name, result_data in latest_strategy_result.items():
+            profit, result_time = result_data
+            record_strategy_result(strategy_name, profit, result_time)
 
-    evaluate_strategy_health()
-    last_history_check = datetime.now()
+        _rebuild_visual_snapshots()
+        evaluate_strategy_health()
+        last_history_check = datetime.now()
+
+
+def _scan_symbol_candidates(symbol, strategies_snapshot):
+    result = {
+        "symbol": symbol,
+        "df": None,
+        "regime": "UNKNOWN",
+        "active_signals": [],
+        "blocked_signals": [],
+        "logs": ["🔄 SCAN START"],
+        "debug": {
+            "data": False,
+            "signal": "NEUTRAL",
+            "blocked_by": "NONE",
+            "stage": "INIT",
+            "final": "WAITING",
+        },
+        "radar": {"sig": "SCAN", "conf": 0, "strat": "---", "status": "SCANNING"},
+    }
+
+    if not allow_trading(symbol):
+        for strategy in strategies_snapshot:
+            symbol_family = strategy.get("symbol_family")
+            if symbol_family and symbol_in_family(symbol, symbol_family):
+                set_strategy_pretrigger(strategy["name"], f"SESSION {strategy.get('session_label', '24H')}")
+                record_strategy_event(strategy["name"], "NO SETUP OUT SESSION")
+        result["debug"].update({"stage": "PRE-CHECK", "blocked_by": "OUT OF SESSION", "final": "SKIPPED"})
+        result["radar"] = {"sig": "WAIT", "conf": 0, "strat": "---", "status": "OUT OF SESSION"}
+        result["logs"].append("🚫 BLOCKED: Out of Session")
+        return result
+
+    df = get_data(symbol, mt5.TIMEFRAME_M5, 300)
+    if df is None:
+        result["debug"].update({"stage": "DATA", "blocked_by": "NO M5 DATA", "final": "NO DATA"})
+        result["radar"] = {"sig": "WAIT", "conf": 0, "strat": "---", "status": "NO DATA"}
+        result["logs"].append("🚫 BLOCKED: No Data")
+        return result
+
+    result["df"] = df
+    result["debug"]["data"] = True
+    result["debug"].update({"stage": "DATA", "blocked_by": "OK"})
+    result["logs"].append("📊 DATA OK")
+
+    regime = detect_market_regime(df)
+    result["regime"] = regime
+    result["debug"].update({"stage": "REGIME", "blocked_by": regime})
+    result["logs"].append(f"📈 REGIME: {regime}")
+
+    if regime == "RANGE":
+        result["logs"].append("⚠️ RANGE MODE (Continuing)")
+
+    if regime == "CHAOS":
+        result["debug"]["final"] = "CHAOS"
+        result["radar"] = {"sig": "WAIT", "conf": 0, "strat": "---", "status": "CHAOS"}
+        result["logs"].append("🚫 BLOCKED: Chaos Market")
+        return result
+
+    mode_str = "MULTI" if should_use_multi_tp(df, symbol) else "STD"
+    result["logs"].append(f"⚙️ MODE: {mode_str}")
+
+    active_signals = []
+    blocked_signals = []
+    strategy_results = []
+    strategy_worker_count = (
+        len(strategies_snapshot)
+        if USE_FULL_STRATEGY_EVAL_PARALLELISM
+        else max(1, min(MAX_PARALLEL_STRATEGY_EVAL, len(strategies_snapshot)))
+    )
+
+    if strategy_worker_count <= 1:
+        for strategy in strategies_snapshot:
+            strategy_results.append(_run_strategy_eval(strategy, df, symbol))
+    else:
+        with ThreadPoolExecutor(max_workers=strategy_worker_count, thread_name_prefix=f"kryon-strat-{symbol}") as executor:
+            future_map = {
+                strategy["name"]: executor.submit(_run_strategy_eval, strategy, df, symbol)
+                for strategy in strategies_snapshot
+            }
+            resolved = {}
+            for strategy in strategies_snapshot:
+                resolved[strategy["name"]] = future_map[strategy["name"]].result()
+            strategy_results = [resolved[strategy["name"]] for strategy in strategies_snapshot]
+
+    for evaluation in strategy_results:
+        strategy = evaluation["strategy"]
+        symbol_family = strategy.get("symbol_family")
+        if symbol_family and not symbol_in_family(symbol, symbol_family):
+            continue
+
+        error = evaluation.get("error")
+        if error is not None:
+            error_reason = f"ERROR {type(error).__name__}"
+            set_strategy_pretrigger(strategy["name"], "---")
+            record_strategy_event(strategy["name"], error_reason)
+            blocked_signals.append(
+                {
+                    "name": strategy["name"],
+                    "reason": error_reason,
+                    "pretrigger": "---",
+                    "priority": int(strategy.get("selection_priority", 999)),
+                }
+            )
+            continue
+
+        res = evaluation.get("result")
+
+        if res is None:
+            set_strategy_pretrigger(strategy["name"], "---")
+            record_strategy_event(strategy["name"], "NO SETUP")
+            blocked_signals.append(
+                {
+                    "name": strategy["name"],
+                    "reason": "NO SETUP",
+                    "pretrigger": "---",
+                    "priority": int(strategy.get("selection_priority", 999)),
+                }
+            )
+            continue
+
+        if res.get("blocked"):
+            set_strategy_pretrigger(strategy["name"], res.get("pretrigger", "---"))
+            record_strategy_event(strategy["name"], f"NO SETUP {res['blocked']}")
+            blocked_signals.append(
+                {
+                    "name": strategy["name"],
+                    "reason": str(res.get("blocked", "NO SETUP")),
+                    "pretrigger": res.get("pretrigger", "---"),
+                    "priority": int(strategy.get("selection_priority", 999)),
+                }
+            )
+            continue
+
+        sig = res["signal"]
+        conf = res["confidence"]
+        strat_name = res["name"]
+        record_strategy_signal(strat_name, symbol, sig, conf)
+        active_signals.append(
+            {
+                "signal": sig,
+                "confidence": conf,
+                "name": strat_name,
+                "cfg": strategy,
+                "execution_df": res.get("execution_df", df),
+                "signal_key": res.get("signal_key"),
+                "sl_price": res.get("sl_price"),
+                "tp_price": res.get("tp_price"),
+                "risk_multiplier_override": res.get("risk_multiplier_override"),
+                "risk_percent_override": res.get("risk_percent_override"),
+                "force_splits": res.get("force_splits"),
+                "tp_point_targets": res.get("tp_point_targets"),
+                "tp_point_buffer": res.get("tp_point_buffer"),
+                "point_value_price": res.get("point_value_price"),
+                "lot_weights_override": res.get("lot_weights_override"),
+                "tp_be_after_legs_override": res.get("tp_be_after_legs_override"),
+                "tp_lock_offset_override": res.get("tp_lock_offset_override"),
+                "signal_details": res.get("signal_details"),
+            }
+        )
+        result["logs"].append(f"🧠 {strat_name} -> {sig} ({round(conf, 1)}%)")
+        if res.get("signal_details"):
+            result["logs"].append(f"📐 {format_santo_graal_signal_details(res['signal_details'])}")
+
+    result["blocked_signals"] = blocked_signals
+    result["active_signals"] = active_signals
+    result["debug"]["signal"] = ",".join([x["name"] for x in active_signals]) if active_signals else "NONE"
+
+    if not active_signals:
+        primary_block = None
+        meaningful = sorted(
+            [b for b in blocked_signals if b.get("reason") not in {"NO SETUP", "SCALP OFF", "OUT SESSION"}],
+            key=lambda b: (int(b.get("priority", 999)), str(b.get("name", ""))),
+        )
+        if meaningful:
+            primary_block = meaningful[0]
+        if primary_block is None:
+            secondary = sorted(
+                [b for b in blocked_signals if b.get("reason") not in {"NO SETUP", "SCALP OFF"}],
+                key=lambda b: (int(b.get("priority", 999)), str(b.get("name", ""))),
+            )
+            if secondary:
+                primary_block = secondary[0]
+        if primary_block is None and blocked_signals:
+            primary_block = blocked_signals[0]
+
+        radar_reason = primary_block["reason"] if primary_block else "MONITORING"
+        radar_strat = primary_block["name"] if primary_block else "---"
+        result["debug"].update({"stage": "SIGNAL", "blocked_by": radar_reason, "final": "NO SIGNAL"})
+        result["radar"] = {"sig": "WAIT", "conf": 0, "strat": radar_strat, "status": radar_reason[:26]}
+        result["logs"].append(f"⛔ NO SIGNAL | {radar_strat}: {radar_reason}")
+        return result
+
+    active_signals.sort(
+        key=lambda item: (
+            int(item["cfg"].get("selection_priority", 999)),
+            -float(item.get("confidence", 0.0) or 0.0),
+            -float(item["cfg"].get("min_score", 0.0) or 0.0),
+            str(item.get("name", "")),
+        )
+    )
+    top_signal = active_signals[0]
+    result["debug"].update({"stage": "SIGNAL", "blocked_by": "MULTI SIGNAL", "final": "WAITING"})
+    result["radar"] = {
+        "sig": top_signal["signal"],
+        "conf": int(top_signal["confidence"]),
+        "strat": result["debug"]["signal"],
+        "status": "MULTI SIGNAL",
+    }
+    return result
 
 
 def run_cycle():
@@ -10961,8 +13201,19 @@ def run_cycle():
     learn_from_history()
     tick_management()
     liquidity_sniper_cycle_symbols = []
+    symbols_snapshot = list(symbols)
+    strategies_snapshot = [strategy for strategy in STRATEGIES if strategy["enabled"]]
+    strategies_by_symbol = {
+        s: [
+            strategy
+            for strategy in strategies_snapshot
+            if not strategy.get("symbol_family") or symbol_in_family(s, strategy.get("symbol_family"))
+        ]
+        for s in symbols_snapshot
+    }
+    scan_results = {}
 
-    for s in symbols:
+    for s in symbols_snapshot:
         debug_state[s] = {
             "data": False,
             "signal": "NEUTRAL",
@@ -10972,271 +13223,264 @@ def run_cycle():
         }
         update_radar_state(s, "SCAN", 0, "---", "SCANNING")
 
-        set_live_log(s, "🔄 SCAN START")
-        push_debug(s, "PRE-CHECK", "OK")
+    worker_count = len(symbols_snapshot) if USE_FULL_SYMBOL_SCAN_PARALLELISM else max(1, min(MAX_PARALLEL_SYMBOL_SCANS, len(symbols_snapshot)))
+    if worker_count > 1:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="kryon-prime") as executor:
+            future_map = {
+                executor.submit(_prime_symbol_scan_context, s, strategies_by_symbol.get(s, [])): s
+                for s in symbols_snapshot
+            }
+            for future in as_completed(future_map):
+                s = future_map[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    set_live_log(s, f"⚠️ PRIME ERROR: {type(exc).__name__}")
+    else:
+        for s in symbols_snapshot:
+            try:
+                _prime_symbol_scan_context(s, strategies_by_symbol.get(s, []))
+            except Exception as exc:
+                set_live_log(s, f"⚠️ PRIME ERROR: {type(exc).__name__}")
 
-        if not allow_trading(s):
-            for strategy in STRATEGIES:
-                symbol_family = strategy.get("symbol_family")
-                if symbol_family and symbol_in_family(s, symbol_family):
-                    set_strategy_pretrigger(strategy["name"], f"SESSION {strategy.get('session_label', '24H')}")
-                    record_strategy_event(strategy["name"], "NO SETUP OUT SESSION")
-            push_debug(s, "PRE-CHECK", "OUT OF SESSION")
-            debug_state[s]["final"] = "SKIPPED"
-            update_radar_state(s, "WAIT", 0, "---", "OUT OF SESSION")
-            set_live_log(s, "🚫 BLOCKED: Out of Session")
-            continue
-
-        df = get_data(s, mt5.TIMEFRAME_M5, 300)
-        if df is None:
-            push_debug(s, "DATA", "NO M5 DATA")
-            debug_state[s]["final"] = "NO DATA"
-            update_radar_state(s, "WAIT", 0, "---", "NO DATA")
-            set_live_log(s, "🚫 BLOCKED: No Data")
-            continue
-
-        debug_state[s]["data"] = True
-        set_live_log(s, "📊 DATA OK")
-        push_debug(s, "DATA", "OK")
-
-        regime = detect_market_regime(df)
-        set_live_log(s, f"📈 REGIME: {regime}")
-        push_debug(s, "REGIME", regime)
-
-        if regime == "RANGE":
-            set_live_log(s, "⚠️ RANGE MODE (Continuing)")
-
-        if regime == "CHAOS":
-            push_debug(s, "REGIME", "CHAOS")
-            debug_state[s]["final"] = "CHAOS"
-            update_radar_state(s, "WAIT", 0, "---", "CHAOS")
-            set_live_log(s, "🚫 BLOCKED: Chaos Market")
-            continue
-
-        mode_str = "MULTI" if should_use_multi_tp(df, s) else "STD"
-        set_live_log(s, f"⚙️ MODE: {mode_str}")
-
-        active_signals = []
-        blocked_signals = []
-        for strategy in STRATEGIES:
-            if not strategy["enabled"]:
-                continue
-            symbol_family = strategy.get("symbol_family")
-            if symbol_family and not symbol_in_family(s, symbol_family):
-                continue
-
-            res = strategy["func"](df, s)
-            if res is None:
-                set_strategy_pretrigger(strategy["name"], "---")
-                record_strategy_event(strategy["name"], "NO SETUP")
-                blocked_signals.append({"name": strategy["name"], "reason": "NO SETUP", "pretrigger": "---"})
-                continue
-            if res.get("blocked"):
-                set_strategy_pretrigger(strategy["name"], res.get("pretrigger", "---"))
-                record_strategy_event(strategy["name"], f"NO SETUP {res['blocked']}")
-                blocked_signals.append(
-                    {
-                        "name": strategy["name"],
-                        "reason": str(res.get("blocked", "NO SETUP")),
-                        "pretrigger": res.get("pretrigger", "---"),
+    if worker_count == 1:
+        for s in symbols_snapshot:
+            scan_results[s] = _scan_symbol_candidates(s, strategies_by_symbol.get(s, []))
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="kryon-scan") as executor:
+            future_map = {
+                executor.submit(_scan_symbol_candidates, s, strategies_by_symbol.get(s, [])): s
+                for s in symbols_snapshot
+            }
+            for future in as_completed(future_map):
+                s = future_map[future]
+                try:
+                    scan_results[s] = future.result()
+                except Exception as exc:
+                    scan_results[s] = {
+                        "symbol": s,
+                        "df": None,
+                        "regime": "ERROR",
+                        "active_signals": [],
+                        "blocked_signals": [],
+                        "logs": [f"❌ SCAN ERROR: {type(exc).__name__}"],
+                        "debug": {
+                            "data": False,
+                            "signal": "NONE",
+                            "blocked_by": "SCAN ERROR",
+                            "stage": "SCAN",
+                            "final": "SCAN ERROR",
+                        },
+                        "radar": {"sig": "WAIT", "conf": 0, "strat": "---", "status": "SCAN ERROR"},
                     }
-                )
-                continue
 
-            sig = res["signal"]
-            conf = res["confidence"]
-            strat_name = res["name"]
-            record_strategy_signal(strat_name, s, sig, conf)
+    execution_candidates = []
+    symbol_exec_state = {}
 
-            active_signals.append(
-                {
-                    "signal": sig,
-                    "confidence": conf,
-                    "name": strat_name,
-                    "cfg": strategy,
-                    "execution_df": res.get("execution_df", df),
-                    "signal_key": res.get("signal_key"),
-                    "sl_price": res.get("sl_price"),
-                    "tp_price": res.get("tp_price"),
-                    "risk_multiplier_override": res.get("risk_multiplier_override"),
-                    "signal_details": res.get("signal_details"),
-                }
-            )
-            set_live_log(s, f"🧠 {strat_name} -> {sig} ({round(conf, 1)}%)")
-            if res.get("signal_details"):
-                set_live_log(s, f"📐 {format_santo_graal_signal_details(res['signal_details'])}")
+    for s in symbols_snapshot:
+        res = scan_results.get(s)
+        if not res:
+            continue
 
-        debug_state[s]["signal"] = ",".join([x["name"] for x in active_signals]) if active_signals else "NONE"
+        for msg in res.get("logs", []):
+            set_live_log(s, msg)
 
+        debug_state[s] = res.get("debug", debug_state.get(s, {}))
+        push_debug(s, debug_state[s].get("stage", "SCAN"), debug_state[s].get("blocked_by", "NONE"))
+
+        radar = res.get("radar", {})
+        update_radar_state(
+            s,
+            radar.get("sig", "WAIT"),
+            int(radar.get("conf", 0) or 0),
+            radar.get("strat", "---"),
+            radar.get("status", "MONITORING"),
+        )
+
+        symbol_exec_state[s] = {
+            "executed": 0,
+            "last_reason": debug_state[s].get("final", "WAITING"),
+            "planned": [],
+        }
+
+        active_signals = res.get("active_signals", [])
         if not active_signals:
-            primary_block = None
-            for blocked in blocked_signals:
-                if blocked["reason"] not in {"NO SETUP", "SCALP OFF", "OUT SESSION"}:
-                    primary_block = blocked
-                    break
-            if primary_block is None:
-                for blocked in blocked_signals:
-                    if blocked["reason"] not in {"NO SETUP", "SCALP OFF"}:
-                        primary_block = blocked
-                        break
-            if primary_block is None and blocked_signals:
-                primary_block = blocked_signals[0]
-
-            radar_reason = primary_block["reason"] if primary_block else "MONITORING"
-            radar_strat = primary_block["name"] if primary_block else "---"
-            push_debug(s, "SIGNAL", "NO SETUP")
-            debug_state[s]["blocked_by"] = radar_reason
-            debug_state[s]["final"] = "NO SIGNAL"
-            set_live_log(s, f"⛔ NO SIGNAL | {radar_strat}: {radar_reason}")
-            update_radar_state(s, "WAIT", 0, radar_strat, radar_reason[:26])
             continue
 
         decision_stats["signals"] += len(active_signals)
         session_decision_stats["signals"] += len(active_signals)
-        active_signals.sort(
-            key=lambda item: (
-                int(item["cfg"].get("selection_priority", 999)),
-                -float(item.get("confidence", 0.0) or 0.0),
-                -float(item["cfg"].get("min_score", 0.0) or 0.0),
-                str(item.get("name", "")),
+
+        for signal_index, signal_data in enumerate(active_signals):
+            execution_candidates.append(
+                {
+                    "symbol": s,
+                    "regime": res.get("regime", "UNKNOWN"),
+                    "df": res.get("df"),
+                    "signal_index": signal_index,
+                    **signal_data,
+                }
             )
+
+    execution_candidates.sort(
+        key=lambda item: (
+            int(item["cfg"].get("selection_priority", 999)),
+            item.get("signal_index", 0),
+            -float(item.get("confidence", 0.0) or 0.0),
+            -_asset_weight_for_symbol(item["symbol"]),
+            -float(item["cfg"].get("min_score", 0.0) or 0.0),
+            str(item.get("name", "")),
         )
-        push_debug(s, "SIGNAL", debug_state[s]["signal"])
-        update_radar_state(
-            s,
-            active_signals[0]["signal"],
-            int(active_signals[0]["confidence"]),
-            debug_state[s]["signal"],
-            "MULTI SIGNAL",
-        )
+    )
 
-        executed = 0
-        last_reason = "WAITING"
+    cycle_trade_cap = max(
+        MAX_NEW_TRADES_PER_CYCLE,
+        min(MAX_TRADES_PER_CYCLE, len(symbols_snapshot) * MAX_COMPATIBLE_STRATEGIES_PER_SYMBOL),
+    )
+    new_trades_executed = 0
+    for candidate in execution_candidates:
+        if new_trades_executed >= cycle_trade_cap:
+            break
 
-        for signal_data in active_signals:
-            if executed >= MAX_TRADES_PER_CYCLE:
-                set_live_log(s, f"⏸️ LIMIT REACHED: {MAX_TRADES_PER_CYCLE} trades/cycle")
-                last_reason = "CYCLE LIMIT"
+        s = candidate["symbol"]
+        state = symbol_exec_state.setdefault(s, {"executed": 0, "last_reason": "WAITING", "planned": []})
+        if state["executed"] >= MAX_COMPATIBLE_STRATEGIES_PER_SYMBOL:
+            continue
+
+        sig = candidate["signal"]
+        conf = candidate["confidence"]
+        strat_name = candidate["name"]
+        strategy_cfg = candidate["cfg"]
+        df = candidate["df"]
+        execution_df = candidate.get("execution_df", df)
+        regime = candidate.get("regime", "UNKNOWN")
+        cooldown_key = (s, strat_name)
+
+        incompatible_slot = False
+        for planned in state["planned"]:
+            if not _strategies_compatible(strategy_cfg, sig, planned["cfg"], planned["signal"]):
+                set_live_log(s, f"🚫 {strat_name}: INCOMPATIBLE SLOT")
+                state["last_reason"] = "INCOMPATIBLE SLOT"
+                incompatible_slot = True
                 break
+        if incompatible_slot:
+            continue
 
-            sig = signal_data["signal"]
-            conf = signal_data["confidence"]
-            strat_name = signal_data["name"]
-            strategy_cfg = signal_data["cfg"]
-            execution_df = signal_data.get("execution_df", df)
-            cooldown_key = (s, strat_name)
-            allowed_regimes = strategy_cfg.get("allowed_regimes", set())
+        allowed_regimes = strategy_cfg.get("allowed_regimes", set())
+        if allowed_regimes and regime not in allowed_regimes:
+            record_strategy_event(strat_name, f"REGIME {regime}")
+            set_live_log(s, f"🚫 {strat_name}: REGIME {regime}")
+            state["last_reason"] = f"REGIME {regime}"
+            continue
 
-            if allowed_regimes and regime not in allowed_regimes:
-                record_strategy_event(strat_name, f"REGIME {regime}")
-                set_live_log(s, f"🚫 {strat_name}: REGIME {regime}")
-                last_reason = f"REGIME {regime}"
-                continue
+        cooldown_sec = strategy_cfg.get("cooldown_sec", 60)
+        if time.time() - last_strategy_trade_time.get(cooldown_key, 0) < cooldown_sec:
+            record_strategy_event(strat_name, "COOLDOWN")
+            set_live_log(s, f"🚫 {strat_name}: COOLDOWN {cooldown_sec}s")
+            state["last_reason"] = f"{strat_name} COOLDOWN"
+            continue
 
-            cooldown_sec = strategy_cfg.get("cooldown_sec", 60)
-            if time.time() - last_strategy_trade_time.get(cooldown_key, 0) < cooldown_sec:
-                record_strategy_event(strat_name, "COOLDOWN")
-                set_live_log(s, f"🚫 {strat_name}: COOLDOWN {cooldown_sec}s")
-                last_reason = f"{strat_name} COOLDOWN"
-                continue
+        runtime = strategy_runtime.get(strat_name, {})
+        signal_key = candidate.get("signal_key")
+        if signal_key and runtime.get("last_signal_key_by_symbol", {}).get(s) == signal_key:
+            record_strategy_event(strat_name, "DUPLICATE LEG")
+            set_live_log(s, f"🚫 {strat_name}: DUPLICATE LEG")
+            state["last_reason"] = f"{strat_name} DUPLICATE"
+            continue
 
-            runtime = strategy_runtime.get(strat_name, {})
-            signal_key = signal_data.get("signal_key")
-            if signal_key and runtime.get("last_signal_key_by_symbol", {}).get(s) == signal_key:
-                record_strategy_event(strat_name, "DUPLICATE LEG")
-                set_live_log(s, f"🚫 {strat_name}: DUPLICATE LEG")
-                last_reason = f"{strat_name} DUPLICATE"
-                continue
-            last_loss_time = runtime.get("last_loss_time")
-            last_loss_profit = float(runtime.get("last_loss_profit", 0.0) or 0.0)
-            if (
-                strat_name.endswith("_ORB")
-                and isinstance(last_loss_time, datetime)
-                and last_loss_profit <= -1.0
-                and (datetime.now() - last_loss_time).total_seconds() < 75
-            ):
-                record_strategy_event(strat_name, "LOSS BRAKE")
-                set_live_log(s, f"🚫 {strat_name}: LOSS BRAKE 75s")
-                last_reason = f"{strat_name} LOSS BRAKE"
-                continue
+        last_loss_time = runtime.get("last_loss_time")
+        last_loss_profit = float(runtime.get("last_loss_profit", 0.0) or 0.0)
+        if (
+            strat_name.endswith("_ORB")
+            and isinstance(last_loss_time, datetime)
+            and last_loss_profit <= -1.0
+            and (datetime.now() - last_loss_time).total_seconds() < 75
+        ):
+            record_strategy_event(strat_name, "LOSS BRAKE")
+            set_live_log(s, f"🚫 {strat_name}: LOSS BRAKE 75s")
+            state["last_reason"] = f"{strat_name} LOSS BRAKE"
+            continue
 
-            market_filter = strategy_cfg.get("market_filter_func") or fast_market_filter
-            if not market_filter(s):
-                record_strategy_event(strat_name, "FAST MARKET")
-                push_debug(s, "FILTER", "FAST_MKT")
-                decision_stats["filtered"] += 1
-                session_decision_stats["filtered"] += 1
-                debug_state[s]["final"] = "FAST MKT"
-                update_radar_state(s, sig, int(conf), strat_name, "FAST MARKET")
-                set_live_log(s, f"🚫 {strat_name}: FAST MARKET")
-                last_reason = "FAST MARKET"
-                continue
+        market_filter = strategy_cfg.get("market_filter_func") or fast_market_filter
+        if not market_filter(s):
+            record_strategy_event(strat_name, "FAST MARKET")
+            push_debug(s, "FILTER", "FAST_MKT")
+            decision_stats["filtered"] += 1
+            session_decision_stats["filtered"] += 1
+            debug_state[s]["final"] = "FAST MKT"
+            update_radar_state(s, sig, int(conf), strat_name, "FAST MARKET")
+            set_live_log(s, f"🚫 {strat_name}: FAST MARKET")
+            state["last_reason"] = "FAST MARKET"
+            continue
 
-            score = compute_asset_score(s, execution_df if execution_df is not None else df, sig, conf, strategy_cfg)
-            if score < strategy_cfg.get("min_score", 0.45):
-                record_strategy_event(strat_name, f"LOW SCORE {round(score,2)}")
-                push_debug(s, "FILTER", f"{strat_name}_LOW_SCORE")
-                decision_stats["filtered"] += 1
-                session_decision_stats["filtered"] += 1
-                debug_state[s]["final"] = "FILTERED"
-                set_live_log(s, f"🚫 {strat_name}: LOW SCORE ({round(score, 2)})")
-                update_radar_state(s, sig, int(score * 100), strat_name, "FILTERED: STRAT SCORE")
-                last_reason = "LOW SCORE"
-                continue
+        score = compute_asset_score(s, execution_df if execution_df is not None else df, sig, conf, strategy_cfg)
+        if score < strategy_cfg.get("min_score", 0.45):
+            record_strategy_event(strat_name, f"LOW SCORE {round(score,2)}")
+            push_debug(s, "FILTER", f"{strat_name}_LOW_SCORE")
+            decision_stats["filtered"] += 1
+            session_decision_stats["filtered"] += 1
+            debug_state[s]["final"] = "FILTERED"
+            set_live_log(s, f"🚫 {strat_name}: LOW SCORE ({round(score, 2)})")
+            update_radar_state(s, sig, int(score * 100), strat_name, "FILTERED: STRAT SCORE")
+            state["last_reason"] = "LOW SCORE"
+            continue
 
-            filter_func = strategy_cfg.get("filter_func") or default_strategy_filter
-            v, reason = filter_func(s, sig, score, df, execution_df, strategy_cfg)
-            if not v:
-                record_strategy_event(strat_name, f"FILTER {reason}")
-                push_debug(s, "FILTER", reason)
-                decision_stats["filtered"] += 1
-                session_decision_stats["filtered"] += 1
-                debug_state[s]["final"] = "FILTERED"
-                update_radar_state(s, sig, int(score * 100), strat_name, f"FILTERED: {reason}")
-                set_live_log(s, f"🚫 {strat_name}: {reason}")
-                last_reason = reason
-                continue
+        filter_func = strategy_cfg.get("filter_func") or default_strategy_filter
+        valid, reason = filter_func(s, sig, score, df, execution_df, strategy_cfg)
+        if not valid:
+            record_strategy_event(strat_name, f"FILTER {reason}")
+            push_debug(s, "FILTER", reason)
+            decision_stats["filtered"] += 1
+            session_decision_stats["filtered"] += 1
+            debug_state[s]["final"] = "FILTERED"
+            update_radar_state(s, sig, int(score * 100), strat_name, f"FILTERED: {reason}")
+            set_live_log(s, f"🚫 {strat_name}: {reason}")
+            state["last_reason"] = reason
+            continue
 
-            set_live_log(s, f"✅ {strat_name}: ENTRY {sig}")
-            record_strategy_event(strat_name, f"ENTRY {sig}")
-            push_debug(s, "EXECUTION", f"ATTEMPTING {strat_name}")
-            debug_state[s]["final"] = "READY"
+        set_live_log(s, f"✅ {strat_name}: ENTRY {sig}")
+        record_strategy_event(strat_name, f"ENTRY {sig}")
+        push_debug(s, "EXECUTION", f"ATTEMPTING {strat_name}")
+        debug_state[s]["final"] = "READY"
 
-            trade_ok, trade_status = open_scaled_trade(s, sig, df, strat_name, score, conf, strategy_cfg, execution_df, signal_data)
-            if trade_ok:
-                executed += 1
-                last_global_trade_time = time.time()
-                last_strategy_trade_time[cooldown_key] = time.time()
-                if signal_key:
-                    runtime.setdefault("last_signal_key_by_symbol", {})[s] = signal_key
-                if signal_data.get("signal_details"):
-                    runtime["last_signal_details"] = signal_data["signal_details"]
-                decision_stats["executed"] += 1
-                session_decision_stats["executed"] += 1
-                record_strategy_event(strat_name, "LIVE")
-                set_live_log(s, f"🚀 {strat_name}: EXECUTED")
-                push_debug(s, "DONE", "CLEARED")
-                debug_state[s]["final"] = "EXECUTED"
-                update_radar_state(s, sig, int(score * 100), strat_name, "EXECUTED")
-                last_reason = "EXECUTED"
-                break
-            else:
-                normalized_status = str(trade_status or "ORDER FAIL").upper()
-                if normalized_status == "ALREADY ACTIVE":
-                    record_strategy_event(strat_name, "LIVE")
-                    push_debug(s, "DONE", "LIVE")
-                    debug_state[s]["final"] = "LIVE"
-                    update_radar_state(s, sig, int(score * 100), strat_name, "LIVE")
-                    last_reason = "LIVE"
-                    break
-                else:
-                    record_strategy_event(strat_name, normalized_status)
-                    push_debug(s, "DONE", normalized_status)
-                    debug_state[s]["final"] = normalized_status
-                    update_radar_state(s, sig, int(score * 100), strat_name, normalized_status)
-                    last_reason = normalized_status
+        trade_ok, trade_status = open_scaled_trade(s, sig, df, strat_name, score, conf, strategy_cfg, execution_df, candidate)
+        if trade_ok:
+            state["executed"] += 1
+            state["planned"].append(candidate)
+            new_trades_executed += 1
+            last_global_trade_time = time.time()
+            last_strategy_trade_time[cooldown_key] = time.time()
+            if signal_key:
+                runtime.setdefault("last_signal_key_by_symbol", {})[s] = signal_key
+            if candidate.get("signal_details"):
+                runtime["last_signal_details"] = candidate["signal_details"]
+            decision_stats["executed"] += 1
+            session_decision_stats["executed"] += 1
+            record_strategy_event(strat_name, "LIVE")
+            set_live_log(s, f"🚀 {strat_name}: EXECUTED")
+            push_debug(s, "DONE", "CLEARED")
+            debug_state[s]["final"] = "EXECUTED"
+            update_radar_state(s, sig, int(score * 100), strat_name, "EXECUTED")
+            state["last_reason"] = "EXECUTED"
+            continue
 
-        if executed == 0 and debug_state[s]["final"] == "WAITING":
-            debug_state[s]["final"] = last_reason
+        normalized_status = str(trade_status or "ORDER FAIL").upper()
+        if normalized_status == "ALREADY ACTIVE":
+            record_strategy_event(strat_name, "LIVE")
+            push_debug(s, "DONE", "LIVE")
+            debug_state[s]["final"] = "LIVE"
+            update_radar_state(s, sig, int(score * 100), strat_name, "LIVE")
+            state["last_reason"] = "LIVE"
+            continue
 
-    time.sleep(0.3)
+        record_strategy_event(strat_name, normalized_status)
+        push_debug(s, "DONE", normalized_status)
+        debug_state[s]["final"] = normalized_status
+        update_radar_state(s, sig, int(score * 100), strat_name, normalized_status)
+        state["last_reason"] = normalized_status
+
+    for s in symbols_snapshot:
+        state = symbol_exec_state.get(s)
+        if not state:
+            continue
+        if debug_state[s]["final"] == "WAITING":
+            debug_state[s]["final"] = state.get("last_reason", "MONITORING")
