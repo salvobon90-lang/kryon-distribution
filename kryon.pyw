@@ -16,14 +16,15 @@ from kryon_license import LicenseManager
 from kryon_update import UpdateManager
 from kryon_runtime import get_runtime_dir
 
-VERSION = "KRYON ULTIMATE PRO V 15.4.5"
-AUTHOR_BRAND = "POWERED BY BONS ⚡ FOR MY DAUGHTER EMMA ❤️ AND MY TRUE LOVE LAUPHI ❤️  "
+VERSION = "KRYON ULTIMATE PRO V 16.0.1"
+AUTHOR_BRAND = ""
 running = False
 
 session_start_time = datetime.now()
 initial_balance = None
 scalping_active = False
 crypto_active = False
+last_forced_update_check_at = 0.0
 
 
 def get_base_dir():
@@ -84,6 +85,10 @@ WARNING = "#f1be63"
 DANGER = "#ff6b82"
 INFO = "#66cfff"
 
+SIDEBAR_ACTION_WIDTH = 176
+SIDEBAR_ACTION_HEIGHT = 34
+SIDEBAR_ACTION_FONT = ("Segoe UI", 10, "bold")
+
 # ==============================================================================
 # LOGICA UI & BOT
 # ==============================================================================
@@ -126,11 +131,11 @@ def toggle_scalping_mode():
     scalping_active = not scalping_active
     bot_core.toggle_scalping(scalping_active)
     if scalping_active:
-        scalping_status_var.set("SCALPING: ON")
+        scalping_status_var.set("⚡ SCALPING: ON")
         scalping_status_label.config(fg=SUCCESS)
         btn_scalping.change_style("⚡ SCALPING: ON", BTN_GOLD)
     else:
-        scalping_status_var.set("SCALPING: OFF")
+        scalping_status_var.set("⚡ SCALPING: OFF")
         scalping_status_label.config(fg=DANGER)
         btn_scalping.change_style("⚡ SCALPING: OFF", TEXT_DIM)
 
@@ -143,11 +148,11 @@ def toggle_crypto_mode():
     crypto_active = not crypto_active
     bot_core.toggle_crypto(crypto_active)
     if crypto_active:
-        crypto_mode_var.set("CRYPTO: ON")
+        crypto_mode_var.set("🌐 CRYPTO: ON")
         crypto_mode_label.config(fg=SUCCESS)
         btn_crypto.change_style("🌐 CRYPTO: ON", BTN_BLUE)
     else:
-        crypto_mode_var.set("CRYPTO: OFF")
+        crypto_mode_var.set("🌐 CRYPTO: OFF")
         crypto_mode_label.config(fg=DANGER)
         btn_crypto.change_style("🌐 CRYPTO: OFF", TEXT_DIM)
 
@@ -163,9 +168,9 @@ def apply_optimizer_profile(profile_name):
 def refresh_optimizer_buttons():
     active = bot_core.get_optimizer_profile().get("name", "BALANCED")
     button_styles = {
-        "SAFE": ("SAFE", "#1a7f64"),
-        "BALANCED": ("BALANCED", BTN_BLUE),
-        "ATTACK": ("ATTACK", BTN_ORANGE),
+        "SAFE": ("🛡️ SAFE", "#1a7f64"),
+        "BALANCED": ("⚖️ BALANCED", BTN_BLUE),
+        "ATTACK": ("🚀 ATTACK", BTN_ORANGE),
     }
     for name, button in optimizer_buttons.items():
         label, color = button_styles[name]
@@ -204,6 +209,30 @@ def open_runtime_folder():
         os.startfile(runtime_dir)
     except Exception as exc:
         log_error(f"Impossibile aprire runtime dir: {exc}")
+
+
+def run_startup_auto_update():
+    try:
+        result = update_manager.startup_auto_update()
+    except Exception as exc:
+        log_error(f"Auto-update fallito all'avvio: {exc}")
+        return False
+
+    if not result.get("applied", False):
+        if not result.get("ok", True):
+            log_error(f"Auto-update non completato: {result.get('reason', 'errore sconosciuto')}")
+        return False
+
+    target_version = result.get("to_version", "--")
+    try:
+        messagebox.showinfo(
+            "KRYON Update",
+            f"Aggiornamento automatico in corso verso la versione {target_version}.\nKRYON verra' riavviato da solo tra pochi secondi.",
+        )
+    except Exception:
+        pass
+
+    return True
 
 
 def open_activation_dialog():
@@ -393,16 +422,16 @@ def open_activation_dialog():
         _refresh_license_overview()
         update_distribution_panel()
 
-    RoundedButton(footer, "🌐 ATTIVA SU QUESTO PC", BTN_ORANGE, activate_online, 220, 36).pack(side="left", padx=(0, 8))
-    RoundedButton(footer, "🔄 AGGIORNA TOKEN", BTN_VIOLET, refresh_token, 180, 36).pack(side="left", padx=8)
-    btn_advanced = RoundedButton(footer, "⚙️ AVANZATO", TEXT_DIM, _toggle_advanced, 140, 36)
+    RoundedButton(footer, "🌐 ATTIVA SU QUESTO PC", BTN_ORANGE, activate_online, 236, 36).pack(side="left", padx=(0, 8))
+    RoundedButton(footer, "🔄 AGGIORNA TOKEN", BTN_VIOLET, refresh_token, 192, 36).pack(side="left", padx=8)
+    btn_advanced = RoundedButton(footer, "⚙️ AVANZATO", TEXT_DIM, _toggle_advanced, 152, 36)
     btn_advanced.pack(side="left", padx=8)
-    RoundedButton(footer, "📂 FILES", TEXT_DIM, open_runtime_folder, 100, 36).pack(side="right")
+    RoundedButton(footer, "📂 FILES", TEXT_DIM, open_runtime_folder, 110, 36).pack(side="right")
 
     advanced_actions = tk.Frame(advanced_frame, bg=CARD_BG)
     advanced_actions.pack(fill="x", padx=0, pady=(0, 6))
-    RoundedButton(advanced_actions, "🔐 CREA RICHIESTA", BTN_BLUE, build_request, 180, 34).pack(side="left", padx=(0, 8))
-    RoundedButton(advanced_actions, "✅ APPLICA RISPOSTA", BTN_START, apply_response, 180, 34).pack(side="left", padx=8)
+    RoundedButton(advanced_actions, "🔐 CREA RICHIESTA", BTN_BLUE, build_request, 196, 34).pack(side="left", padx=(0, 8))
+    RoundedButton(advanced_actions, "✅ APPLICA RISPOSTA", BTN_START, apply_response, 196, 34).pack(side="left", padx=8)
 
     state = license_manager.load_state()
     if state.get("email"):
@@ -435,13 +464,13 @@ def format_duration(seconds):
 
 
 class RoundedButton(tk.Canvas):
-    def __init__(self, parent, text, bg_color, command, width, height=40):
+    def __init__(self, parent, text, bg_color, command, width, height=40, font_spec=("Segoe UI", 11, "bold")):
         super().__init__(parent, bg=CARD_BG, highlightthickness=0, width=width, height=height)
         self.command = command
         self.bg_color = bg_color
         self.hover_color = self._adjust_color(bg_color, 1.2)
         self.rect = self.create_rounded_rect(2, 2, width - 2, height - 2, r=15, fill=bg_color, outline=bg_color)
-        self.text = self.create_text(width / 2, height / 2, text=text, fill=TEXT_MAIN, font=("Segoe UI", 11, "bold"))
+        self.text = self.create_text(width / 2, height / 2, text=text, fill=TEXT_MAIN, font=font_spec)
         self.bind("<Button-1>", self._on_click)
         self.bind("<Enter>", self._on_hover)
         self.bind("<Leave>", self._on_leave)
@@ -641,37 +670,40 @@ except:
     tk.Label(sidebar, text="KRYON", bg=CARD_BG_2, fg=FG, font=("Impact", 24, "bold")).pack(pady=(22, 10))
 
 tk.Label(sidebar, text=VERSION, bg=CARD_BG_2, fg=TEXT_SOFT, font=("Segoe UI Semibold", 10)).pack()
-tk.Label(sidebar, text="Trade Engine Console", bg=CARD_BG_2, fg=TEXT_DIM, font=("Segoe UI", 9)).pack(pady=(2, 2))
-tk.Label(sidebar, text="Mercati accesi, regole lucide", bg=CARD_BG_2, fg=TEXT_DIM, font=("Segoe UI", 9)).pack()
-tk.Label(sidebar, text="Il denaro qua non dorme mai", bg=CARD_BG_2, fg=TEXT_DIM, font=("Segoe UI", 9)).pack(pady=(0, 18))
+tk.Label(sidebar, text="PER MIA FIGLIA EMMA ❤️", bg=CARD_BG_2, fg=TEXT_DIM, font=("Segoe UI", 9)).pack(pady=(2, 2))
+tk.Label(sidebar, text="LA MIA PICCOLA SOPHIA ❤️", bg=CARD_BG_2, fg=TEXT_DIM, font=("Segoe UI", 9)).pack()
+tk.Label(sidebar, text="E IL MIO AMORE GRANDE LAURA ❤️", bg=CARD_BG_2, fg=TEXT_DIM, font=("Segoe UI", 9)).pack(pady=(0, 18))
 
-RoundedButton(sidebar, "🚀 START", BTN_START, start_bot, 190, 42).pack(pady=5)
-RoundedButton(sidebar, "🛑 STOP", "#b34a5d", stop_bot, 190, 42).pack(pady=5)
-RoundedButton(sidebar, "❌ PANIC", "#cf6a45", bot_core.close_all_now, 190, 42).pack(pady=5)
-RoundedButton(sidebar, "💰 TAKE PROFIT", "#1ca8a0", bot_core.close_only_profit, 190, 42).pack(pady=5)
-RoundedButton(sidebar, "🛡️ BE+", BTN_VIOLET, bot_core.force_break_even_plus, 190, 42).pack(pady=5)
+RoundedButton(sidebar, "🚀 START", BTN_START, start_bot, SIDEBAR_ACTION_WIDTH, SIDEBAR_ACTION_HEIGHT, SIDEBAR_ACTION_FONT).pack(pady=4)
+RoundedButton(sidebar, "🛑 STOP", "#b34a5d", stop_bot, SIDEBAR_ACTION_WIDTH, SIDEBAR_ACTION_HEIGHT, SIDEBAR_ACTION_FONT).pack(pady=4)
+RoundedButton(sidebar, "❌ CLOSE ALL POSITION", "#cf6a45", bot_core.close_all_now, SIDEBAR_ACTION_WIDTH, SIDEBAR_ACTION_HEIGHT, SIDEBAR_ACTION_FONT).pack(pady=4)
+RoundedButton(sidebar, "💰 TAKE PROFIT", "#1ca8a0", bot_core.close_only_profit, SIDEBAR_ACTION_WIDTH, SIDEBAR_ACTION_HEIGHT, SIDEBAR_ACTION_FONT).pack(pady=4)
+RoundedButton(sidebar, "🛡️ BREAKEVEN", BTN_VIOLET, bot_core.force_break_even_plus, SIDEBAR_ACTION_WIDTH, SIDEBAR_ACTION_HEIGHT, SIDEBAR_ACTION_FONT).pack(pady=4)
 
-btn_scalping = RoundedButton(sidebar, "⚡ SCALPING: OFF", TEXT_DIM, toggle_scalping_mode, 190, 42)
-btn_scalping.pack(pady=5)
-btn_crypto = RoundedButton(sidebar, "🌐 CRYPTO: OFF", TEXT_DIM, toggle_crypto_mode, 190, 42)
-btn_crypto.pack(pady=5)
+btn_scalping = RoundedButton(sidebar, "⚡ SCALPING: OFF", TEXT_DIM, toggle_scalping_mode, SIDEBAR_ACTION_WIDTH, SIDEBAR_ACTION_HEIGHT, SIDEBAR_ACTION_FONT)
+btn_scalping.pack(pady=4)
+btn_crypto = RoundedButton(sidebar, "🌐 CRYPTO: OFF", TEXT_DIM, toggle_crypto_mode, SIDEBAR_ACTION_WIDTH, SIDEBAR_ACTION_HEIGHT, SIDEBAR_ACTION_FONT)
+btn_crypto.pack(pady=4)
 
 status_box = tk.Frame(sidebar, bg=CARD_BG, highlightthickness=1, highlightbackground=BORDER_SOFT)
 status_box.pack(fill="x", padx=18, pady=(14, 8))
 tk.Label(status_box, text="ENGINE", bg=CARD_BG, fg=TEXT_DIM, font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=10, pady=(8, 0))
 status_var = tk.StringVar(value="ENGINE: OFFLINE")
 status_label = tk.Label(status_box, textvariable=status_var, fg=DANGER, bg=CARD_BG, font=("Segoe UI Semibold", 13))
-status_label.pack(anchor="w", padx=10, pady=(2, 8))
+status_label.pack(anchor="w", padx=10, pady=(2, 2))
+engine_session_var = tk.StringVar(value="SESSIONE --:-- | MT5 --:--")
+engine_session_label = tk.Label(status_box, textvariable=engine_session_var, fg=TEXT_DIM, bg=CARD_BG, font=("Segoe UI", 8))
+engine_session_label.pack(anchor="w", padx=10, pady=(0, 8))
 
 scalp_box = tk.Frame(sidebar, bg=CARD_BG, highlightthickness=1, highlightbackground=BORDER_SOFT)
 scalp_box.pack(fill="x", padx=18, pady=(0, 10))
 tk.Label(scalp_box, text="MODES", bg=CARD_BG, fg=TEXT_DIM, font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=10, pady=(8, 0))
 tk.Label(scalp_box, text="SCALPING", bg=CARD_BG, fg=TEXT_DIM, font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=10, pady=(4, 0))
-scalping_status_var = tk.StringVar(value="SCALPING: OFF")
+scalping_status_var = tk.StringVar(value="⚡ SCALPING: OFF")
 scalping_status_label = tk.Label(scalp_box, textvariable=scalping_status_var, font=("Segoe UI Semibold", 11), bg=CARD_BG, fg=DANGER)
 scalping_status_label.pack(anchor="w", padx=10, pady=(2, 4))
 tk.Label(scalp_box, text="CRYPTO", bg=CARD_BG, fg=TEXT_DIM, font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=10, pady=(2, 0))
-crypto_mode_var = tk.StringVar(value="CRYPTO: OFF")
+crypto_mode_var = tk.StringVar(value="🌐 CRYPTO: OFF")
 crypto_mode_label = tk.Label(scalp_box, textvariable=crypto_mode_var, font=("Segoe UI Semibold", 11), bg=CARD_BG, fg=DANGER)
 crypto_mode_label.pack(anchor="w", padx=10, pady=(2, 8))
 
@@ -690,10 +722,11 @@ update_status_label.pack(anchor="w", padx=10, pady=(2, 0))
 tk.Label(dist_box, textvariable=update_detail_var, font=("Segoe UI", 8), bg=CARD_BG, fg=TEXT_DIM, wraplength=180, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 dist_actions = tk.Frame(dist_box, bg=CARD_BG)
 dist_actions.pack(fill="x", padx=10, pady=(0, 8))
-RoundedButton(dist_actions, "🔐 LICENZA", BTN_BLUE, open_activation_dialog, 84, 32).pack(side="left")
-RoundedButton(dist_actions, "📂 FILES", TEXT_DIM, open_runtime_folder, 84, 32).pack(side="right")
+RoundedButton(dist_actions, "🔐 LICENZA", BTN_BLUE, open_activation_dialog, 96, 32).pack(side="left")
+RoundedButton(dist_actions, "📂 FILES", TEXT_DIM, open_runtime_folder, 92, 32).pack(side="right")
 
-tk.Label(sidebar, text=AUTHOR_BRAND, bg=CARD_BG_2, fg=BTN_GOLD, font=("Segoe UI", 8, "italic"), wraplength=190, justify="left").pack(side="bottom", pady=18)
+if AUTHOR_BRAND.strip():
+    tk.Label(sidebar, text=AUTHOR_BRAND, bg=CARD_BG_2, fg=BTN_GOLD, font=("Segoe UI", 8, "italic"), wraplength=190, justify="left").pack(side="bottom", pady=18)
 
 # ==============================================================================
 # WORKSPACE
@@ -728,7 +761,7 @@ def add_title(parent, text, subtitle=""):
 
 mod_analyzer = make_card(workspace)
 mod_analyzer.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-add_title(mod_analyzer, "Radar", "Segnali live e stato asset")
+add_title(mod_analyzer, "RADAR", "Segnali live e stato asset")
 
 radar_status_var = tk.StringVar(value="📡 Inizializzazione...")
 tk.Label(mod_analyzer, textvariable=radar_status_var, bg=CARD_BG, fg=TEXT_DIM, font=("Segoe UI", 9), anchor="center", justify="center").pack(fill="x", padx=8, pady=(6, 0))
@@ -752,7 +785,7 @@ tree.tag_configure("low_vol", foreground=BTN_GOLD)
 
 mod_control = make_card(workspace)
 mod_control.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
-add_title(mod_control, "Control", "Modalita, drawdown e motore decisionale")
+add_title(mod_control, "CONTROL", "Modalita, drawdown e motore decisionale")
 
 control_split = tk.Frame(mod_control, bg=CARD_BG)
 control_split.pack(fill="both", expand=True, padx=10, pady=(10, 10))
@@ -803,9 +836,9 @@ tk.Label(optimizer_bar, text="OPTIMIZER", fg=TEXT_DIM, bg=CARD_BG, font=("Segoe 
 optimizer_buttons_wrap = tk.Frame(optimizer_bar, bg=CARD_BG)
 optimizer_buttons_wrap.pack(fill="x")
 optimizer_buttons = {
-    "SAFE": RoundedButton(optimizer_buttons_wrap, "SAFE", TEXT_DIM, lambda: apply_optimizer_profile("SAFE"), 95, 34),
-    "BALANCED": RoundedButton(optimizer_buttons_wrap, "BALANCED", BTN_BLUE, lambda: apply_optimizer_profile("BALANCED"), 115, 34),
-    "ATTACK": RoundedButton(optimizer_buttons_wrap, "ATTACK", TEXT_DIM, lambda: apply_optimizer_profile("ATTACK"), 95, 34),
+    "SAFE": RoundedButton(optimizer_buttons_wrap, "🛡️ SAFE", TEXT_DIM, lambda: apply_optimizer_profile("SAFE"), 114, 34),
+    "BALANCED": RoundedButton(optimizer_buttons_wrap, "⚖️ BALANCED", BTN_BLUE, lambda: apply_optimizer_profile("BALANCED"), 146, 34),
+    "ATTACK": RoundedButton(optimizer_buttons_wrap, "🚀 ATTACK", TEXT_DIM, lambda: apply_optimizer_profile("ATTACK"), 120, 34),
 }
 optimizer_buttons["SAFE"].pack(side="left", padx=(0, 6))
 optimizer_buttons["BALANCED"].pack(side="left", padx=6)
@@ -822,18 +855,18 @@ strategy_frame = tk.LabelFrame(
     highlightbackground=BORDER_SOFT,
 )
 strategy_frame.pack(fill="both", expand=True, padx=0, pady=0)
-strategy_overview_var = tk.StringVar(value="Active 0 | Positive 0 | Net 0.0€")
+strategy_overview_var = tk.StringVar(value="Assets 0 | Branch 0 | Active 0 | Live 0 | Positive 0 | Net 0.0€")
 strategy_overview = tk.Frame(strategy_frame, bg=CARD_BG)
 strategy_overview.pack(fill="x", padx=6, pady=(6, 0))
 tk.Label(strategy_overview, text="LIVE MATRIX", bg=CARD_BG, fg=FG, font=("Segoe UI Semibold", 8)).pack(side="left")
 tk.Label(strategy_overview, textvariable=strategy_overview_var, bg=CARD_BG, fg=TEXT_DIM, font=("Segoe UI", 8)).pack(side="right")
 
-strategy_summary = ttk.Treeview(strategy_frame, columns=("Branch", "State", "Block", "Net", "WR", "Trd"), show="headings", height=8)
+strategy_summary = ttk.Treeview(strategy_frame, columns=("Branch", "State", "Block", "Net", "WR", "Trd"), show="headings", height=9)
 for col in ("Branch", "State", "Block", "Net", "WR", "Trd"):
     strategy_summary.heading(col, text=col, anchor="center")
-strategy_summary.column("Branch", width=116, minwidth=110, stretch=True, anchor="w")
+strategy_summary.column("Branch", width=126, minwidth=118, stretch=True, anchor="w")
 strategy_summary.column("State", width=68, minwidth=64, stretch=False, anchor="center")
-strategy_summary.column("Block", width=108, minwidth=98, stretch=False, anchor="center")
+strategy_summary.column("Block", width=118, minwidth=106, stretch=False, anchor="center")
 strategy_summary.column("Net", width=74, minwidth=68, stretch=False, anchor="e")
 strategy_summary.column("WR", width=56, minwidth=52, stretch=False, anchor="e")
 strategy_summary.column("Trd", width=46, minwidth=42, stretch=False, anchor="center")
@@ -864,7 +897,7 @@ strategy_canvas.bind(
 
 mod_positions = make_card(workspace)
 mod_positions.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
-add_title(mod_positions, "Positions", "Trade aperti, direzione e cluster")
+add_title(mod_positions, "POSITIONS", "Trade aperti, direzione e cluster")
 
 monitor_tree = ttk.Treeview(mod_positions, columns=("Asset", "Dir", "Time", "Profit", "Info"), show="headings")
 pos_scroll = ttk.Scrollbar(mod_positions, orient="vertical", command=monitor_tree.yview)
@@ -883,7 +916,7 @@ monitor_tree.tag_configure("loss", foreground=DANGER)
 
 mod_telemetry = make_card(workspace)
 mod_telemetry.grid(row=1, column=1, sticky="nsew", padx=5, pady=5)
-add_title(mod_telemetry, "Portfolio", "Saldo, heatmap, esposizione e rischio")
+add_title(mod_telemetry, "PORTFOLIO", "Saldo, sessione chiusa e live map estesa")
 
 dash_top = tk.Frame(mod_telemetry, bg=CARD_BG)
 dash_top.pack(fill="x", padx=5, pady=5)
@@ -897,29 +930,23 @@ lbl_pnl.pack(side="left")
 
 session_frame = tk.Frame(dash_top, bg=CARD_BG)
 session_frame.pack(side="right")
-session_pnl_var = tk.StringVar(value="Session: 0.0€")
+session_pnl_var = tk.StringVar(value="Session 0.0€ | WR Tot 0.0% | Trd 0")
 lbl_sess_pnl = tk.Label(session_frame, textvariable=session_pnl_var, bg=CARD_BG, font=("Segoe UI", 10, "bold"), fg=INFO)
 lbl_sess_pnl.pack(side="right", padx=5)
 
 heat_frame = tk.LabelFrame(mod_telemetry, text="LIVE MAP", bg=CARD_BG, fg=FG, bd=0, highlightthickness=1, highlightbackground=BORDER_SOFT)
-heat_frame.pack(fill="x", padx=5, pady=5)
-heat_frame.configure(height=72)
+heat_frame.pack(fill="both", expand=True, padx=5, pady=5)
+heat_frame.configure(height=168)
 heat_frame.pack_propagate(False)
 
-dash_bot = tk.Frame(mod_telemetry, bg=CARD_BG)
-dash_bot.pack(fill="both", expand=True, padx=5, pady=5)
-dash_bot.columnconfigure((0, 1), weight=1)
-
-exp_frame = tk.LabelFrame(dash_bot, text="EXPOSURE", bg=CARD_BG, fg=FG, bd=0, highlightthickness=1, highlightbackground=BORDER_SOFT)
-exp_frame.grid(row=0, column=0, sticky="nsew", padx=2)
-risk_frame = tk.LabelFrame(dash_bot, text="RISK", bg=CARD_BG, fg=FG, bd=0, highlightthickness=1, highlightbackground=BORDER_SOFT)
-risk_frame.grid(row=0, column=1, sticky="nsew", padx=2)
-risk_label = tk.Label(risk_frame, font=("Segoe UI", 14, "bold"), bg=CARD_BG)
-risk_label.pack(expand=True)
+live_map_grid = tk.Frame(heat_frame, bg=CARD_BG)
+live_map_grid.pack(fill="both", expand=True, padx=4, pady=4)
+for _col in range(3):
+    live_map_grid.grid_columnconfigure(_col, weight=1, uniform="live_map")
 
 mod_log = make_card(workspace)
 mod_log.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
-add_title(mod_log, "Flow", "Scanner live e registro operativo")
+add_title(mod_log, "FLOW", "Scanner live e registro operativo")
 
 scan_cont = tk.Frame(mod_log, bg=LOG_BG_2, highlightthickness=1, highlightbackground=BORDER_SOFT)
 scan_cont.pack(fill="x", padx=5, pady=(5, 2))
@@ -945,7 +972,7 @@ style_text_widget(log_box, LOG_BG, TEXT_MAIN)
 
 mod_debug = make_card(workspace)
 mod_debug.grid(row=2, column=1, sticky="nsew", padx=5, pady=5)
-add_title(mod_debug, "Debug", "Stato engine ed errori critici")
+add_title(mod_debug, "DEBUG", "Stato engine ed errori critici")
 
 debug_cont = tk.Frame(mod_debug, bg=LOG_BG_2, highlightthickness=1, highlightbackground=BORDER_SOFT)
 debug_cont.pack(fill="x", padx=5, pady=(5, 2))
@@ -999,17 +1026,14 @@ def update_prop_panel():
             lbl_opt.config(fg=INFO if data.get("optimizer_profile") == "BALANCED" else (SUCCESS if data.get("optimizer_profile") == "SAFE" else BTN_ORANGE))
             refresh_optimizer_buttons()
 
-            sess_prof = data.get("session_profit", 0)
             sess_closed = data.get("session_closed_profit", 0)
-            sess_open = data.get("session_open_pnl", 0)
             closed_num = data.get("closed_trades", 0)
             session_start_lbl = data.get("session_started_at_label", "--:--")
-            flat_num = data.get("flat_trades", 0)
-            flat_chunk = f" | Flat {flat_num}" if flat_num else ""
             session_pnl_var.set(
-                f"Session {session_start_lbl}: {sess_prof}€ | Closed {sess_closed}€ | Open {sess_open}€ | {closed_num} Trd{flat_chunk} | WR {data.get('winrate', 0.0)}%"
+                f"Session {sess_closed}€ | WR Tot {data.get('total_winrate', 0.0)}% | Trd {closed_num}"
             )
-            lbl_sess_pnl.config(fg=SUCCESS if sess_prof >= 0 else DANGER)
+            lbl_sess_pnl.config(fg=SUCCESS if sess_closed >= 0 else DANGER)
+            engine_session_var.set(f"SESSIONE {session_start_lbl}")
 
             if mt5.terminal_info():
                 acc = mt5.account_info()
@@ -1035,14 +1059,18 @@ def update_strategy_panel():
             s["name"],
         ),
     )
-    strategy_summary.configure(height=min(max(len(strategies), 6), 12))
+    strategy_summary.configure(height=min(max(len(strategies), 8), 14))
 
+    asset_count = len({s.get("family", "---") for s in strategies})
+    strategy_count = len(strategies)
     active_count = len([s for s in strategies if s["status"] == "ACTIVE"])
     live_count = len([s for s in strategies if s.get("live_block") in ("LIVE", "READY")])
     positive_count = len([s for s in strategies if s.get("net_profit", 0.0) > 0])
     net_total = round(sum(s.get("net_profit", 0.0) for s in strategies), 2)
     best_branch = max(strategies, key=lambda s: s.get("net_profit", 0.0))["name"] if strategies else "---"
-    strategy_overview_var.set(f"Active {active_count} | Live {live_count} | Positive {positive_count} | Net {net_total}€ | Best {best_branch}")
+    strategy_overview_var.set(
+        f"Assets {asset_count} | Branch {strategy_count} | Active {active_count} | Live {live_count} | Positive {positive_count} | Net {net_total}€ | Best {best_branch}"
+    )
 
     for strategy in strategies:
         if strategy["status"] == "LOCKED":
@@ -1226,9 +1254,17 @@ def update_debug_panel():
 
 def update_telemetry():
     if running:
-        for widget in heat_frame.winfo_children():
+        for widget in live_map_grid.winfo_children():
             widget.destroy()
-        for s, state in bot_core.radar_state.items():
+        active_symbols = list(getattr(bot_core, "symbols", []) or list(bot_core.radar_state.keys()))
+        columns = 3
+        rows = max(1, (len(active_symbols) + columns - 1) // columns)
+        for row_idx in range(rows):
+            live_map_grid.grid_rowconfigure(row_idx, weight=1, uniform="live_map_row")
+
+        for idx, s in enumerate(active_symbols):
+            row_idx, col_idx = divmod(idx, columns)
+            state = bot_core.radar_state.get(s, {})
             sig = state.get("sig", "NEUTRAL")
             conf = state.get("conf", 0)
             status = str(state.get("status", "INIT"))
@@ -1242,42 +1278,25 @@ def update_telemetry():
                 color = WARNING
             else:
                 color = TEXT_DIM
-            short_status = status[:12]
+            short_status = status[:16]
             heat_text = f"{s}\n{sig} {conf}%\n{short_status}"
-            tk.Label(heat_frame, text=heat_text, bg=color, fg=TEXT_MAIN, font=("Segoe UI", 8, "bold"), justify="center").pack(
-                side="left", padx=2, pady=5, expand=True, fill="x"
+            tk.Label(
+                live_map_grid,
+                text=heat_text,
+                bg=color,
+                fg=TEXT_MAIN,
+                font=("Segoe UI", 8, "bold"),
+                justify="center",
+                anchor="center",
+                padx=6,
+                pady=8,
+            ).grid(
+                row=row_idx,
+                column=col_idx,
+                sticky="nsew",
+                padx=3,
+                pady=3,
             )
-
-        acc = mt5.account_info() if mt5.terminal_info() else None
-        if not acc:
-            risk_label.config(text="RISK: NO DATA", fg=TEXT_DIM)
-        else:
-            dd = (acc.balance - acc.equity) / acc.balance if acc.balance > 0 else 0
-            if dd < 0.02:
-                risk_label.config(text="RISK: SAFE", fg=SUCCESS)
-            elif dd < 0.05:
-                risk_label.config(text="RISK: MEDIUM", fg=WARNING)
-            else:
-                risk_label.config(text="RISK: DANGER", fg=DANGER)
-
-        for w in exp_frame.winfo_children():
-            w.destroy()
-        pos = mt5.positions_get() or [] if mt5.terminal_info() else []
-        exposure = {}
-        for p in pos:
-            if p.magic == bot_core.MAGIC_ID:
-                exposure[p.symbol] = exposure.get(p.symbol, 0) + p.volume
-        if not exposure:
-            tk.Label(exp_frame, text="FLAT", fg=TEXT_DIM, bg=CARD_BG, font=("Consolas", 10)).pack(anchor="w", padx=5, pady=5)
-        else:
-            for s, vol in exposure.items():
-                tk.Label(
-                    exp_frame,
-                    text=f"▪ {s}: {round(vol,2)} Lts",
-                    fg=TEXT_MAIN,
-                    bg=CARD_BG_2,
-                    font=("Consolas", 10, "bold"),
-                ).pack(anchor="w", padx=5, pady=2, fill="x")
 
     root.after(1500, update_telemetry)
 
@@ -1360,6 +1379,7 @@ def _status_color_from_text(text):
 
 
 def update_distribution_panel():
+    global last_forced_update_check_at
     license_manager.auto_refresh(force=False)
     license_status = license_manager.get_runtime_status()
     license_state = license_manager.load_state()
@@ -1375,7 +1395,11 @@ def update_distribution_panel():
     license_status_label.config(fg=_status_color_from_text(license_status.get("headline")))
 
     if update_manager.config.get("auto_check"):
-        update_status = update_manager.check_for_updates(force=False)
+        now_ts = time.time()
+        force_update_check = (last_forced_update_check_at <= 0.0) or ((now_ts - last_forced_update_check_at) >= 300)
+        update_status = update_manager.check_for_updates(force=force_update_check)
+        if force_update_check:
+            last_forced_update_check_at = now_ts
         if update_manager.config.get("auto_download") and update_status.get("update_available"):
             update_manager.download_update(force=False)
             update_status = update_manager.get_status()
@@ -1417,6 +1441,12 @@ def on_closing():
 
 
 root.protocol("WM_DELETE_WINDOW", on_closing)
+
+if os.getenv("KRYON_SKIP_STARTUP_UPDATE") != "1":
+    if run_startup_auto_update():
+        root.destroy()
+        os._exit(0)
+
 threading.Thread(target=main_loop, daemon=True).start()
 
 update_analysis()

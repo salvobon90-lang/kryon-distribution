@@ -9,22 +9,23 @@ from datetime import datetime, timedelta
 import threading
 import warnings
 import traceback
+from zoneinfo import ZoneInfo
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ==============================================================================
-# CONFIGURAZIONE (KRYON ULTIMATE PRO V 15.4.5 - LICENSE & VERSION HARD GATE)
+# CONFIGURAZIONE (KRYON ULTIMATE PRO V 16.0.1 - OPEN STRATEGY GOVERNANCE + TITANYX + SIGNAL PRIORITY)
 # ==============================================================================
 PROFIT_MODE = True
 PRIMARY_SYMBOL = "XAUUSD"
-SECONDARY_SYMBOLS = ["USTECH", "US500", "GER40", "JPN225"]
+SECONDARY_SYMBOLS = ["USTECH", "GER40", "US500", "JPN225", "EUSTX50", "US30", "UK100", "US2000", "FRA40", "SMI20"]
 CRYPTO_SYMBOLS = ["BTCUSD", "ETHUSD"]
 
 symbols_list = [PRIMARY_SYMBOL, *SECONDARY_SYMBOLS]
 symbols = symbols_list.copy()
 
 TIMEFRAME_MAIN = mt5.TIMEFRAME_M5
-MAX_UNIQUE_SYMBOLS = 7
+MAX_UNIQUE_SYMBOLS = 13
 MAX_CLUSTERS_PER_SYMBOL = 3
 SYMBOL_CLUSTER_CAPS = {"USTECH": 4, "GER40": 4}
 
@@ -40,7 +41,21 @@ OPTIMIZER_PROFILES = {
     "ATTACK": {"risk_per_trade_percent": 0.75, "max_total_risk": 0.12, "max_trades_per_cycle": 7},
 }
 
-ASSET_WEIGHTS = {"XAUUSD": 1.0, "USTECH": 0.8, "US500": 0.7, "GER40": 0.65, "JPN225": 0.58, "BTCUSD": 0.62, "ETHUSD": 0.54}
+ASSET_WEIGHTS = {
+    "XAUUSD": 1.0,
+    "USTECH": 0.8,
+    "US500": 0.7,
+    "GER40": 0.65,
+    "JPN225": 0.58,
+    "EUSTX50": 0.60,
+    "US30": 0.69,
+    "UK100": 0.61,
+    "US2000": 0.63,
+    "FRA40": 0.57,
+    "SMI20": 0.56,
+    "BTCUSD": 0.62,
+    "ETHUSD": 0.54,
+}
 
 MAX_RETRIES = 3
 BASE_DEVIATION = 10
@@ -58,7 +73,13 @@ SYMBOL_ALIASES = {
     "US500": ["US500", "SPX500", "SP500", "USSPX500", "US500."],
     "GER40": ["GER40", "DE40", "DAX40", "DAX40.fs", "DAX"],
     "JPN225": ["JPN225", "JP225", "NIKKEI225", "NIKKEI", "JAP225", "JPN225.fs"],
+    "EUSTX50": ["EUSTX50", "EU50", "EU50.fs", "STOXX50", "EUROSTOXX50", "FESX", "STX50"],
     "UK100": ["UK100", "FTSE100", "FTSE", "UK100."],
+    "US30": ["US30", "DJ30", "DJ30.fs", "US30.", "DOW30", "WALLSTREET30"],
+    "US2000": ["US2000", "RTY", "RUSSELL2000", "US2000.", "US2000.fs"],
+    "FRA40": ["FRA40", "CAC40", "FR40", "FRA40.", "CAC"],
+    "SMI20": ["SMI20", "SWI20", "SMI", "SWISS20", "SMI20."],
+    "VIX": ["VIX", "USVIX", "VIX.", "VOLX", "CBOE VIX"],
     "BTCUSD": ["BTCUSD", "XBTUSD", "BTCUSD.", "BTCUSDm", "BTC-USD"],
     "ETHUSD": ["ETHUSD", "ETHUSD.", "ETHUSDm", "ETH-USD"],
 }
@@ -118,13 +139,32 @@ processed_deals = set()
 trade_memory = {}
 position_strategy_map = {}
 resolved_symbol_map = {}
+liquidity_sniper_cycle_symbols = []
+titanyx_week_state = {"week": None, "balance": None}
+liquidity_sniper_day_state = {
+    "day": None,
+    "total_trades": 0,
+    "total_pnl": 0.0,
+    "consecutive_losses": 0,
+    "per_symbol": {},
+}
 
 last_history_check = datetime.now()
 
 m1_cache = {}
 m1_cache_time = {}
+m5_cache = {}
+m5_cache_time = {}
 m15_cache = {}
 m15_cache_time = {}
+m30_cache = {}
+m30_cache_time = {}
+h4_cache = {}
+h4_cache_time = {}
+d1_cache = {}
+d1_cache_time = {}
+h1_cache = {}
+h1_cache_time = {}
 broker_time_offset = timedelta(0)
 broker_offset_updated_at = 0.0
 
@@ -170,6 +210,7 @@ def register_strategy(
     name,
     func,
     enabled=True,
+    toggle_arm=True,
     tag=None,
     symbol_family=None,
     execution_mode="AUTO",
@@ -198,11 +239,13 @@ def register_strategy(
     multi_tp_step_gap_eur=0.18,
     min_splits=4,
     max_splits=MAX_SPLITS,
+    exclusive_symbol=False,
 ):
     cfg = {
         "name": name,
         "func": func,
         "enabled": enabled,
+        "toggle_arm": toggle_arm,
         "tag": tag or name[:8],
         "symbol_family": symbol_family,
         "execution_mode": execution_mode,
@@ -231,6 +274,7 @@ def register_strategy(
         "multi_tp_step_gap_eur": multi_tp_step_gap_eur,
         "min_splits": max(1, int(min_splits)),
         "max_splits": max(1, int(max_splits)),
+        "exclusive_symbol": bool(exclusive_symbol),
         "disabled_reason": "",
     }
     STRATEGIES.append(cfg)
@@ -521,7 +565,13 @@ def refresh_symbols():
     resolved_crypto_symbols = [resolve_broker_symbol(symbol) for symbol in crypto_symbols]
     active_symbols = _unique_symbols([*resolved_base_symbols, *resolved_crypto_symbols])
     if MAX_UNIQUE_SYMBOLS > 0:
-        active_symbols = active_symbols[:MAX_UNIQUE_SYMBOLS]
+        if resolved_crypto_symbols and len(active_symbols) > MAX_UNIQUE_SYMBOLS:
+            crypto_keep = _unique_symbols(resolved_crypto_symbols)
+            base_slots = max(0, MAX_UNIQUE_SYMBOLS - len(crypto_keep))
+            base_keep = _unique_symbols(resolved_base_symbols)[:base_slots]
+            active_symbols = _unique_symbols([*base_keep, *crypto_keep])
+        else:
+            active_symbols = active_symbols[:MAX_UNIQUE_SYMBOLS]
     symbols_list = active_symbols
     symbols = active_symbols
     for symbol in active_symbols:
@@ -661,6 +711,7 @@ def get_cluster_profile(strategy_cfg, cluster_state):
     strategy_cfg = strategy_cfg or {}
     cluster_state = cluster_state or {}
     is_orb_cluster = str(strategy_cfg.get("name", "")).endswith("_ORB")
+    is_gold_cluster = symbol_in_family(strategy_cfg.get("symbol_family", ""), "XAUUSD")
     try:
         quality = float(cluster_state.get("tp_quality", strategy_cfg.get("effective_tp_quality", 0.5)))
     except Exception:
@@ -680,10 +731,14 @@ def get_cluster_profile(strategy_cfg, cluster_state):
     lock_bias = cluster_state.get("cluster_lock_bias")
     if lock_bias is None:
         lock_bias = (0.5 - quality) * (0.20 if is_orb_cluster else 0.14)
+    if is_gold_cluster:
+        lock_bias += 0.04
 
     protect_bias = cluster_state.get("protect_bias")
     if protect_bias is None:
         protect_bias = (0.5 - quality) * (0.26 if is_orb_cluster else 0.18)
+    if is_gold_cluster:
+        protect_bias += 0.06
 
     early_cashout_ratio = cluster_state.get("early_cashout_ratio")
     if early_cashout_ratio is None:
@@ -704,10 +759,24 @@ def get_cluster_profile(strategy_cfg, cluster_state):
     tp1_guard_ratio = cluster_state.get("tp1_guard_ratio")
     if tp1_guard_ratio is None:
         tp1_guard_ratio = clamp(0.08 + (0.5 - quality) * (0.12 if is_orb_cluster else 0.08), 0.03, 0.18)
+    if is_gold_cluster:
+        tp1_guard_ratio = clamp(tp1_guard_ratio + 0.02, 0.04, 0.24)
 
     weak_floor = cluster_state.get("weak_profit_floor")
     if weak_floor is None:
         weak_floor = max(0.35, strategy_cfg.get("multi_tp_eur_min", 0.50) * clamp(1.00 + (0.5 - quality) * 0.40, 0.70, 1.20))
+
+    tp3_bridge_ratio = cluster_state.get("tp3_bridge_ratio")
+    if tp3_bridge_ratio is None:
+        tp3_bridge_ratio = clamp(0.46 + (quality - 0.5) * 0.22 + (0.06 if is_gold_cluster else 0.0), 0.34, 0.70)
+
+    runner_peak_keep_ratio = cluster_state.get("runner_peak_keep_ratio")
+    if runner_peak_keep_ratio is None:
+        runner_peak_keep_ratio = clamp(0.60 - quality * (0.18 if is_orb_cluster else 0.22) + (0.10 if is_gold_cluster else 0.0), 0.36, 0.76)
+
+    runner_realized_lock_ratio = cluster_state.get("runner_realized_lock_ratio")
+    if runner_realized_lock_ratio is None:
+        runner_realized_lock_ratio = clamp(0.70 + (0.5 - quality) * (0.18 if is_orb_cluster else 0.16) + (0.10 if is_gold_cluster else 0.0), 0.52, 0.96)
 
     return {
         "quality": quality,
@@ -721,6 +790,9 @@ def get_cluster_profile(strategy_cfg, cluster_state):
         "cascade_ratio": cascade_ratio,
         "tp1_guard_ratio": tp1_guard_ratio,
         "weak_profit_floor": round(weak_floor, 2),
+        "tp3_bridge_ratio": tp3_bridge_ratio,
+        "runner_peak_keep_ratio": runner_peak_keep_ratio,
+        "runner_realized_lock_ratio": runner_realized_lock_ratio,
     }
 
 
@@ -729,8 +801,8 @@ def build_dynamic_multi_tp_prices(symbol, signal, entry_price, info, lot_per_tra
     eur_max = strategy_cfg.get("multi_tp_eur_max", 1.50)
     target_eur = min(max(strategy_cfg.get("effective_multi_tp_target_eur", strategy_cfg.get("multi_tp_target_eur", 1.00)), eur_min), eur_max)
     curve = list(strategy_cfg.get("effective_multi_tp_curve") or strategy_cfg.get("multi_tp_curve") or [1.0, 1.8, 2.8, 4.0, 5.6, 7.6, 10.0, 13.0])
-    tp2_gap_eur = max(0.25, strategy_cfg.get("multi_tp_tp2_gap_eur", 0.35))
-    step_gap_eur = max(0.10, strategy_cfg.get("multi_tp_step_gap_eur", 0.18))
+    tp2_gap_eur = max(0.25, strategy_cfg.get("effective_multi_tp_tp2_gap_eur", strategy_cfg.get("multi_tp_tp2_gap_eur", 0.35)))
+    step_gap_eur = max(0.10, strategy_cfg.get("effective_multi_tp_step_gap_eur", strategy_cfg.get("multi_tp_step_gap_eur", 0.18)))
 
     money_floor = profit_to_price_distance(info, lot_per_trade, eur_min)
     money_target = profit_to_price_distance(info, lot_per_trade, target_eur)
@@ -775,31 +847,121 @@ def build_dynamic_multi_tp_plan(strategy_cfg, score, confidence, df, info, sprea
     max_splits = max(min_splits, min(MAX_SPLITS, int(strategy_cfg.get("max_splits", MAX_SPLITS))))
 
     split_span = max_splits - min_splits
-    splits = min_splits + int(round(quality * split_span)) if split_span > 0 else min_splits
-    splits = max(min_splits, min(max_splits, splits))
+    if split_span <= 0:
+        splits = min_splits
+    else:
+        extra_budget = 0
+        if quality >= 0.58:
+            extra_budget = min(split_span, 1)
+        if quality >= 0.68:
+            extra_budget = min(split_span, 2)
+        if quality >= 0.78:
+            extra_budget = min(split_span, 3)
+        if quality >= 0.86:
+            extra_budget = split_span
+        splits = min_splits + extra_budget
 
     eur_min = max(0.50, strategy_cfg.get("multi_tp_eur_min", 0.50))
     eur_max = max(eur_min, strategy_cfg.get("multi_tp_eur_max", 1.50))
     base_target = min(max(strategy_cfg.get("multi_tp_target_eur", eur_min), eur_min), eur_max)
-    dynamic_target = eur_min + (eur_max - eur_min) * clamp(quality * 1.04, 0.0, 1.0)
+    dynamic_target = eur_min + (eur_max - eur_min) * clamp(quality * 1.10, 0.0, 1.0)
     target_floor = min(eur_max, eur_min + max(0.12, (eur_max - eur_min) * 0.12))
-    target_eur = min(eur_max, max(target_floor, (base_target * 0.22) + (dynamic_target * 0.78)))
+    target_eur = min(eur_max, max(target_floor, (base_target * 0.16) + (dynamic_target * 0.84)))
 
     base_first_atr = strategy_cfg.get("multi_tp_first_atr", 0.12)
-    first_atr = base_first_atr * (0.88 + quality * 0.34)
+    first_atr = base_first_atr * (0.94 + quality * 0.38)
     base_curve = list(strategy_cfg.get("multi_tp_curve") or [1.0, 1.8, 2.8, 4.0, 5.6, 7.6, 10.0, 13.0])
-    curve_scale = 0.90 + quality * 0.26
+    curve_scale = 0.96 + quality * 0.36
     effective_curve = [round(max(1.0, factor * curve_scale), 3) for factor in base_curve]
+    base_tp2_gap = max(0.25, strategy_cfg.get("multi_tp_tp2_gap_eur", 0.35))
+    base_step_gap = max(0.10, strategy_cfg.get("multi_tp_step_gap_eur", 0.18))
 
     plan_cfg = dict(strategy_cfg)
     plan_cfg["effective_multi_tp_target_eur"] = round(target_eur, 2)
     plan_cfg["effective_multi_tp_first_atr"] = round(first_atr, 4)
     plan_cfg["effective_multi_tp_curve"] = effective_curve
+    plan_cfg["effective_multi_tp_tp2_gap_eur"] = round(base_tp2_gap * (1.02 + quality * 0.28), 2)
+    plan_cfg["effective_multi_tp_step_gap_eur"] = round(base_step_gap * (0.98 + quality * 0.24), 2)
     plan_cfg["effective_tp_quality"] = round(quality, 3)
     plan_cfg["effective_be_trigger"] = round(clamp(strategy_cfg.get("be_trigger_progress", 0.45) + (quality - 0.5) * 0.18, 0.06, 0.82), 4)
     plan_cfg["effective_be_buffer_progress"] = round(clamp(strategy_cfg.get("be_buffer_progress", 0.05) * (0.86 + quality * 0.28), 0.02, 0.25), 4)
-    plan_text = f"{splits}TP | C{int(round(confidence))} | S{int(round(score * 100))} | TP1~{round(target_eur, 2)}€"
+    plan_text = f"{splits}TP | C{int(round(confidence))} | S{int(round(score * 100))} | Q{int(round(quality * 100))} | TP1~{round(target_eur, 2)}€"
     return plan_cfg, splits, plan_text
+
+
+def _multi_tp_weight_template(strategy_cfg, quality):
+    name = str(strategy_cfg.get("name", "") or "")
+    family = strategy_cfg.get("symbol_family", "")
+    if name.endswith("_ORB"):
+        weights = [1.20, 1.15, 1.08, 1.00, 0.82, 0.68, 0.56, 0.46]
+        base_scale = 0.90
+    elif name.endswith("_TOP"):
+        weights = [1.16, 1.12, 1.08, 1.00, 0.88, 0.76, 0.66, 0.58]
+        base_scale = 0.93
+    elif "TREND" in name or "BREAK_RETEST" in name:
+        weights = [1.14, 1.12, 1.08, 1.00, 0.90, 0.80, 0.70, 0.62]
+        base_scale = 0.96
+    else:
+        weights = [1.16, 1.12, 1.08, 1.00, 0.88, 0.76, 0.66, 0.58]
+        base_scale = 0.94
+
+    if symbol_in_family(family, "BTCUSD") or symbol_in_family(family, "ETHUSD"):
+        base_scale -= 0.03
+    elif symbol_in_family(family, "XAUUSD"):
+        base_scale -= 0.02
+
+    if quality >= 0.78:
+        weights = [round(w * (0.97 if idx < 2 else 1.04), 4) for idx, w in enumerate(weights)]
+        base_scale += 0.02
+    return weights, clamp(base_scale, 0.80, 1.00)
+
+
+def build_dynamic_multi_tp_lot_plan(total_lot, info, strategy_cfg, splits, quality):
+    if splits <= 0:
+        return []
+    step = float(info.volume_step or 0.01)
+    min_vol = float(info.volume_min or step)
+    weights, base_scale = _multi_tp_weight_template(strategy_cfg, quality)
+    split_penalty = max(0, splits - 4) * 0.04
+    quality_bonus = max(0.0, quality - 0.70) * 0.12
+    risk_scale = clamp(base_scale - split_penalty + quality_bonus, 0.76, 1.00)
+    scaled_total = np.floor((total_lot * risk_scale) / step) * step
+    if scaled_total < min_vol:
+        return []
+
+    use_weights = weights[:splits]
+    weight_sum = sum(use_weights) or float(splits)
+    normalized = [w / weight_sum for w in use_weights]
+    raw_lots = [scaled_total * w for w in normalized]
+    lot_plan = [np.floor(raw / step) * step for raw in raw_lots]
+
+    remainder_steps = int(round((scaled_total - sum(lot_plan)) / step))
+    order = sorted(range(len(raw_lots)), key=lambda idx: ((raw_lots[idx] - lot_plan[idx]), normalized[idx]), reverse=True)
+    for idx in order:
+        if remainder_steps <= 0:
+            break
+        lot_plan[idx] += step
+        remainder_steps -= 1
+
+    while lot_plan and lot_plan[-1] + 1e-9 < min_vol:
+        lot_plan.pop()
+    if not lot_plan:
+        return []
+
+    for idx in range(len(lot_plan) - 1, -1, -1):
+        if lot_plan[idx] + 1e-9 >= min_vol:
+            continue
+        if idx == 0:
+            return []
+        lot_plan[idx - 1] += lot_plan[idx]
+        lot_plan[idx] = 0.0
+
+    final_lots = [round(lot, 8) for lot in lot_plan if lot + 1e-9 >= min_vol]
+    while final_lots and sum(final_lots) - scaled_total > step * 0.5:
+        final_lots[-1] = round(max(0.0, final_lots[-1] - step), 8)
+        if final_lots[-1] + 1e-9 < min_vol:
+            final_lots.pop()
+    return final_lots
 
 
 def get_tp_management_rules(cluster_state, cluster_profile):
@@ -835,6 +997,17 @@ def get_cluster_tp_ladder_stop(pos_type, entry, buffer_points, info, cluster_sta
     be_price = entry + buffer_price if pos_type == 0 else entry - buffer_price
     if positive_legs <= tp_rules["lock_offset"]:
         return be_price, f"TP{positive_legs}>BE"
+
+    if tp_rules["high_conf"] and positive_legs == (tp_rules["be_after_legs"] + 1) and len(tp_prices) >= 2:
+        tp1 = float(tp_prices[0])
+        tp2 = float(tp_prices[1])
+        bridge_ratio = clamp(float(cluster_state.get("tp3_bridge_ratio", 0.5) or 0.5), 0.25, 0.75)
+        ladder_price = tp1 + ((tp2 - tp1) * bridge_ratio)
+        if pos_type == 0:
+            ladder_price = max(be_price, ladder_price)
+        else:
+            ladder_price = min(be_price, ladder_price)
+        return ladder_price, f"TP{positive_legs}>TP1+"
 
     lock_leg = min(len(tp_prices), max(1, positive_legs - tp_rules["lock_offset"]))
     ladder_price = float(tp_prices[lock_leg - 1])
@@ -893,6 +1066,118 @@ def compute_rsi(series, period=14):
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50)
+
+
+def compute_zscore(series, lookback=50):
+    rolling_mean = series.rolling(lookback).mean()
+    rolling_std = series.rolling(lookback).std().replace(0, np.nan)
+    zscore = (series - rolling_mean) / rolling_std
+    return zscore.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def compute_adx(df, period=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+
+    tr0 = (high - low).abs()
+    tr1 = (high - close.shift(1)).abs()
+    tr2 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr0, tr1, tr2], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean().replace(0, np.nan)
+
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr
+    di_sum = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+    adx = dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0)
+    return adx.fillna(0), plus_di.fillna(0), minus_di.fillna(0)
+
+
+def compute_awesome_oscillator(df, fast=5, slow=34):
+    median_price = (df["high"] + df["low"]) / 2.0
+    ao = median_price.rolling(fast).mean() - median_price.rolling(slow).mean()
+    return ao.fillna(0)
+
+
+def compute_wma(series, period):
+    weights = np.arange(1, period + 1, dtype=float)
+    divisor = weights.sum()
+    return series.rolling(period).apply(lambda values: float(np.dot(values, weights) / divisor), raw=True)
+
+
+def compute_macd_hist(series, fast=15, slow=26):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    return ema_fast - ema_slow
+
+
+def compute_macd(series, fast=12, slow=26, signal_period=9):
+    macd_line = compute_macd_hist(series, fast, slow)
+    signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line.fillna(0), signal_line.fillna(0), hist.fillna(0)
+
+
+def compute_heiken_ashi_smoothed(df, pre_fast=2, pre_slow=6, post_open=3, post_close=2):
+    smooth_open = df["open"].ewm(span=pre_fast, adjust=False).mean().ewm(span=pre_slow, adjust=False).mean()
+    smooth_high = df["high"].ewm(span=pre_fast, adjust=False).mean().ewm(span=pre_slow, adjust=False).mean()
+    smooth_low = df["low"].ewm(span=pre_fast, adjust=False).mean().ewm(span=pre_slow, adjust=False).mean()
+    smooth_close = df["close"].ewm(span=pre_fast, adjust=False).mean().ewm(span=pre_slow, adjust=False).mean()
+
+    ha_close_raw = (smooth_open + smooth_high + smooth_low + smooth_close) / 4.0
+    ha_open_raw = ha_close_raw.copy()
+    if len(ha_open_raw) > 0:
+        ha_open_raw.iloc[0] = (smooth_open.iloc[0] + smooth_close.iloc[0]) / 2.0
+    for idx in range(1, len(ha_open_raw)):
+        ha_open_raw.iloc[idx] = (ha_open_raw.iloc[idx - 1] + ha_close_raw.iloc[idx - 1]) / 2.0
+
+    ha_high_raw = pd.concat([smooth_high, ha_open_raw, ha_close_raw], axis=1).max(axis=1)
+    ha_low_raw = pd.concat([smooth_low, ha_open_raw, ha_close_raw], axis=1).min(axis=1)
+
+    ha_open = ha_open_raw.ewm(span=post_open, adjust=False).mean()
+    ha_close = ha_close_raw.ewm(span=post_close, adjust=False).mean()
+    ha_high = pd.concat([ha_high_raw, ha_open, ha_close], axis=1).max(axis=1)
+    ha_low = pd.concat([ha_low_raw, ha_open, ha_close], axis=1).min(axis=1)
+    return ha_open.fillna(0), ha_high.fillna(0), ha_low.fillna(0), ha_close.fillna(0)
+
+
+def compute_tdi(series, rsi_period=13, mbl_period=34, green_period=2, red_period=7):
+    rsi = compute_rsi(series, rsi_period)
+    green = rsi.ewm(span=green_period, adjust=False).mean()
+    red = green.ewm(span=red_period, adjust=False).mean()
+    yellow = rsi.ewm(span=mbl_period, adjust=False).mean()
+    return green.fillna(50), red.fillna(50), yellow.fillna(50), rsi.fillna(50)
+
+
+def count_consecutive_state(series, end_offset=2):
+    if len(series) < end_offset:
+        return 0, None
+    idx = len(series) - end_offset
+    current = bool(series.iloc[idx])
+    count = 0
+    for pos in range(idx, -1, -1):
+        if bool(series.iloc[pos]) != current:
+            break
+        count += 1
+    return count, current
+
+
+def compute_kumo_cloud(df, conv_period=8, base_period=29, span_b_period=34, displacement=29):
+    high = df["high"]
+    low = df["low"]
+    tenkan = (high.rolling(conv_period).max() + low.rolling(conv_period).min()) / 2.0
+    kijun = (high.rolling(base_period).max() + low.rolling(base_period).min()) / 2.0
+    span_a = ((tenkan + kijun) / 2.0).shift(displacement)
+    span_b = ((high.rolling(span_b_period).max() + low.rolling(span_b_period).min()) / 2.0).shift(displacement)
+    kumo_top = pd.concat([span_a, span_b], axis=1).max(axis=1)
+    kumo_bottom = pd.concat([span_a, span_b], axis=1).min(axis=1)
+    return span_a.fillna(0), span_b.fillna(0), kumo_top.fillna(0), kumo_bottom.fillna(0)
 
 
 def atr_gap_pct(gap, atr):
@@ -1230,6 +1515,8 @@ def toggle_crypto(state):
     for strategy in STRATEGIES:
         if not is_crypto_family(strategy.get("symbol_family")):
             continue
+        if not strategy.get("toggle_arm", True):
+            continue
         strategy["enabled"] = crypto_enabled
         if crypto_enabled:
             strategy["disabled_reason"] = ""
@@ -1250,6 +1537,8 @@ def toggle_scalping(state):
     armed = []
     for strategy in STRATEGIES:
         if not str(strategy.get("name", "")).endswith("_SCALP"):
+            continue
+        if not strategy.get("toggle_arm", True):
             continue
         strategy["enabled"] = scalping_enabled
         if scalping_enabled:
@@ -1294,6 +1583,7 @@ def close_only_profit():
 def force_break_even_plus(buffer_ratio=0.2):
     adjusted = 0
     positions = safe_positions()
+    sg_exit_logged = set()
     for p in positions:
         if p.magic != MAGIC_ID:
             continue
@@ -1356,6 +1646,55 @@ def close_all_now():
             close_position(p)
 
 
+def update_position_sltp(p, info, new_sl):
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": p.symbol,
+        "position": p.ticket,
+        "sl": round(new_sl, info.digits),
+        "tp": p.tp,
+    }
+    with mt5_lock:
+        res = mt5.order_send(request)
+    retcode = getattr(res, "retcode", None) if res is not None else None
+    ok_codes = {
+        mt5.TRADE_RETCODE_DONE,
+        getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", -1),
+        getattr(mt5, "TRADE_RETCODE_PLACED", -1),
+    }
+    return retcode in ok_codes, retcode
+
+
+def update_position_sltp_levels(p, info, new_sl=None, new_tp=None):
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": p.symbol,
+        "position": p.ticket,
+        "sl": round(float(new_sl if new_sl is not None else p.sl), info.digits) if (new_sl is not None or p.sl) else 0.0,
+        "tp": round(float(new_tp if new_tp is not None else p.tp), info.digits) if (new_tp is not None or p.tp) else 0.0,
+    }
+    with mt5_lock:
+        res = mt5.order_send(request)
+    retcode = getattr(res, "retcode", None) if res is not None else None
+    ok_codes = {
+        mt5.TRADE_RETCODE_DONE,
+        getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", -1),
+        getattr(mt5, "TRADE_RETCODE_PLACED", -1),
+    }
+    return retcode in ok_codes, retcode
+
+
+def get_strategy_cluster_positions(symbol, strategy_tag):
+    positions = []
+    for p in safe_positions():
+        if p.magic != MAGIC_ID or p.symbol != symbol:
+            continue
+        p_tag = position_strategy_map.get(p.ticket) or (p.comment.rsplit("_", 1)[0] if p.comment else None)
+        if p_tag == strategy_tag:
+            positions.append(p)
+    return positions
+
+
 def close_position(p):
     deviation = BASE_DEVIATION
     info = safe_info(p.symbol)
@@ -1395,15 +1734,22 @@ def close_position(p):
 
 def close_strategy_cluster(symbol, strategy_tag):
     closed = 0
-    positions = safe_positions()
-    for p in positions:
-        if p.magic != MAGIC_ID or p.symbol != symbol:
-            continue
-        p_tag = position_strategy_map.get(p.ticket) or (p.comment.rsplit("_", 1)[0] if p.comment else None)
-        if p_tag != strategy_tag:
-            continue
-        if close_position(p):
-            closed += 1
+    remaining = []
+    for _ in range(3):
+        positions = get_strategy_cluster_positions(symbol, strategy_tag)
+        if not positions:
+            return closed
+        pass_closed = 0
+        for p in positions:
+            if close_position(p):
+                closed += 1
+                pass_closed += 1
+        remaining = get_strategy_cluster_positions(symbol, strategy_tag)
+        if not remaining or pass_closed == 0:
+            break
+        time.sleep(RETRY_DELAY)
+    if remaining:
+        set_log(f"⚠️ CLUSTER PARTIAL CLOSE: {symbol} {strategy_tag} remain={len(remaining)}")
     return closed
 
 
@@ -1446,12 +1792,52 @@ def get_m1_cached(symbol):
     return m1_cache[symbol]
 
 
+def get_m5_cached(symbol):
+    global m5_cache, m5_cache_time
+    if symbol not in m5_cache or time.time() - m5_cache_time.get(symbol, 0) > 12:
+        m5_cache[symbol] = get_data(symbol, mt5.TIMEFRAME_M5, 220)
+        m5_cache_time[symbol] = time.time()
+    return m5_cache[symbol]
+
+
 def get_m15_cached(symbol):
     global m15_cache, m15_cache_time
     if symbol not in m15_cache or time.time() - m15_cache_time.get(symbol, 0) > 60:
         m15_cache[symbol] = get_data(symbol, mt5.TIMEFRAME_M15, 100)
         m15_cache_time[symbol] = time.time()
     return m15_cache[symbol]
+
+
+def get_m30_cached(symbol):
+    global m30_cache, m30_cache_time
+    if symbol not in m30_cache or time.time() - m30_cache_time.get(symbol, 0) > 90:
+        m30_cache[symbol] = get_data(symbol, mt5.TIMEFRAME_M30, 220)
+        m30_cache_time[symbol] = time.time()
+    return m30_cache[symbol]
+
+
+def get_h4_cached(symbol):
+    global h4_cache, h4_cache_time
+    if symbol not in h4_cache or time.time() - h4_cache_time.get(symbol, 0) > 120:
+        h4_cache[symbol] = get_data(symbol, mt5.TIMEFRAME_H4, 180)
+        h4_cache_time[symbol] = time.time()
+    return h4_cache[symbol]
+
+
+def get_d1_cached(symbol):
+    global d1_cache, d1_cache_time
+    if symbol not in d1_cache or time.time() - d1_cache_time.get(symbol, 0) > 600:
+        d1_cache[symbol] = get_data(symbol, mt5.TIMEFRAME_D1, 180)
+        d1_cache_time[symbol] = time.time()
+    return d1_cache[symbol]
+
+
+def get_h1_cached(symbol):
+    global h1_cache, h1_cache_time
+    if symbol not in h1_cache or time.time() - h1_cache_time.get(symbol, 0) > 120:
+        h1_cache[symbol] = get_data(symbol, mt5.TIMEFRAME_H1, 220)
+        h1_cache_time[symbol] = time.time()
+    return h1_cache[symbol]
 
 
 def get_broker_offset_from_df(df):
@@ -1573,6 +1959,41 @@ def final_filter(symbol, df, score):
     return True, "OK"
 
 
+def swing_filter(symbol, signal, score, market_df, execution_df, strategy_cfg):
+    working_df = execution_df if execution_df is not None else market_df
+    if working_df is None or len(working_df) < 40:
+        return False, "NO TF DATA"
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return False, "NO TICK"
+
+    atr = float(working_df["atr"].iloc[-2] or 0.0)
+    if atr <= 0:
+        return False, "NO ATR"
+
+    close_price = float(working_df["close"].iloc[-2])
+    momentum = abs(float(working_df["close"].iloc[-2] - working_df["close"].iloc[-6]))
+    vol = atr / max(close_price, 1e-6)
+    attack = is_attack_runtime()
+    is_crypto = is_crypto_family(symbol)
+
+    min_score = 0.44 if attack else 0.48
+    min_momentum = atr * (0.035 if is_crypto else 0.045)
+    min_vol = 0.00014 if is_crypto else 0.00020
+    max_spread = atr * (0.22 if is_crypto else 0.14)
+
+    if score < min_score:
+        return False, f"LOW SCORE ({round(score,2)})"
+    if momentum < min_momentum:
+        return False, "WEAK SWING"
+    if vol < min_vol:
+        return False, "LOW SWING VOL"
+    if (tick.ask - tick.bid) > max_spread:
+        return False, "HIGH SPREAD"
+    return True, "OK"
+
+
 def allow_trading(symbol):
     hour = get_broker_hour()
     if symbol_in_family(symbol, "XAUUSD"):
@@ -1581,11 +2002,13 @@ def allow_trading(symbol):
         return 0 <= hour <= 23
     if symbol_in_family(symbol, "JPN225"):
         return 2 <= hour <= 12
+    if symbol_in_family(symbol, "US2000"):
+        return 10 <= hour <= 23
     if symbol_in_family(symbol, "USTECH"):
         return 7 <= hour <= 23
-    if symbol_in_family(symbol, "US500"):
+    if symbol_in_family(symbol, "US500") or symbol_in_family(symbol, "US30"):
         return 10 <= hour <= 23
-    if symbol_in_family(symbol, "GER40") or symbol_in_family(symbol, "UK100"):
+    if symbol_in_family(symbol, "GER40") or symbol_in_family(symbol, "UK100") or symbol_in_family(symbol, "EUSTX50") or symbol_in_family(symbol, "FRA40") or symbol_in_family(symbol, "SMI20"):
         return 8 <= hour <= 18
     return False
 
@@ -1637,6 +2060,29 @@ def default_strategy_filter(symbol, signal, score, market_df, execution_df, stra
     return final_filter(symbol, market_df, score)
 
 
+def titanyx_filter(symbol, signal, score, market_df, execution_df, strategy_cfg):
+    working_df = execution_df if execution_df is not None else market_df
+    if working_df is None or len(working_df) < 60:
+        return False, "NO M5 DATA"
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return False, "NO TICK"
+
+    atr = float(working_df["atr"].iloc[-2] or 0.0)
+    if atr <= 0:
+        return False, "NO ATR"
+
+    spread = abs(float(tick.ask - tick.bid))
+    max_spread = atr * strategy_cfg.get("titanyx_spread_atr", 0.16)
+    min_score = strategy_cfg.get("min_score", 0.50) - 0.02
+    if score < min_score:
+        return False, f"LOW SCORE ({round(score, 2)})"
+    if spread > max_spread:
+        return False, "HIGH SPREAD"
+    return True, "OK"
+
+
 def scalping_filter(symbol, signal, score, market_df, execution_df, strategy_cfg):
     if execution_df is None or len(execution_df) < 30:
         return False, "NO M1 DATA"
@@ -1674,7 +2120,7 @@ def scalping_filter(symbol, signal, score, market_df, execution_df, strategy_cfg
 
 
 def get_correlation_group(symbol):
-    if any(symbol_in_family(symbol, family) for family in ["USTECH", "US500", "GER40", "UK100"]):
+    if any(symbol_in_family(symbol, family) for family in ["USTECH", "US500", "US30", "GER40", "UK100"]):
         return "INDEX"
     if any(symbol_in_family(symbol, family) for family in ["BTCUSD", "ETHUSD"]):
         return "CRYPTO"
@@ -1753,28 +2199,689 @@ def blocked_signal(name, reason, pretrigger="---"):
     return {"name": name, "blocked": reason, "pretrigger": pretrigger}
 
 
+LIQUIDITY_SNIPER_PROFILES = {
+    "USTECH": {
+        "display": "US100",
+        "priority_rank": 1,
+        "preferred": "CONTINUATION",
+        "secondary": "REVERSAL",
+        "session_tz": "US/Eastern",
+        "session_windows": [("09:30", "11:30")],
+        "news_windows": [],
+        "max_daily_drawdown_eur": 4.8,
+        "max_symbol_trades": 2,
+        "max_total_trades": 4,
+    },
+    "GER40": {
+        "display": "DAX",
+        "priority_rank": 2,
+        "preferred": "CONTINUATION",
+        "secondary": "REVERSAL",
+        "session_tz": "Europe/Berlin",
+        "session_windows": [("09:00", "11:00")],
+        "news_windows": [],
+        "max_daily_drawdown_eur": 4.0,
+        "max_symbol_trades": 2,
+        "max_total_trades": 4,
+    },
+    "US500": {
+        "display": "US500",
+        "priority_rank": 3,
+        "preferred": "CONTINUATION",
+        "secondary": "REVERSAL",
+        "session_tz": "US/Eastern",
+        "session_windows": [("09:30", "11:30")],
+        "news_windows": [],
+        "max_daily_drawdown_eur": 4.4,
+        "max_symbol_trades": 2,
+        "max_total_trades": 4,
+    },
+    "JPN225": {
+        "display": "JP225",
+        "priority_rank": 4,
+        "preferred": "CONTINUATION",
+        "secondary": "REVERSAL",
+        "session_tz": "Asia/Tokyo",
+        "session_windows": [("09:00", "11:00")],
+        "news_windows": [],
+        "max_daily_drawdown_eur": 3.8,
+        "max_symbol_trades": 2,
+        "max_total_trades": 4,
+    },
+    "EUSTX50": {
+        "display": "EU50",
+        "priority_rank": 5,
+        "preferred": "CONTINUATION",
+        "secondary": "REVERSAL",
+        "session_tz": "Europe/Berlin",
+        "session_windows": [("09:00", "11:00")],
+        "news_windows": [],
+        "max_daily_drawdown_eur": 3.8,
+        "max_symbol_trades": 2,
+        "max_total_trades": 4,
+    },
+    "US30": {
+        "display": "US30",
+        "priority_rank": 6,
+        "preferred": "REVERSAL",
+        "secondary": "CONTINUATION",
+        "session_tz": "US/Eastern",
+        "session_windows": [("09:30", "11:30")],
+        "news_windows": [],
+        "max_daily_drawdown_eur": 4.6,
+        "max_symbol_trades": 2,
+        "max_total_trades": 4,
+    },
+    "UK100": {
+        "display": "UK100",
+        "priority_rank": 7,
+        "preferred": "REVERSAL",
+        "secondary": "CONTINUATION",
+        "session_tz": "Europe/London",
+        "session_windows": [("08:00", "10:00")],
+        "news_windows": [],
+        "max_daily_drawdown_eur": 3.6,
+        "max_symbol_trades": 2,
+        "max_total_trades": 4,
+    },
+    "US2000": {
+        "display": "US2000",
+        "priority_rank": 8,
+        "preferred": "CONTINUATION",
+        "secondary": "REVERSAL",
+        "session_tz": "US/Eastern",
+        "session_windows": [("09:30", "11:30")],
+        "news_windows": [],
+        "max_daily_drawdown_eur": 4.0,
+        "max_symbol_trades": 2,
+        "max_total_trades": 4,
+    },
+    "FRA40": {
+        "display": "FRA40",
+        "priority_rank": 9,
+        "preferred": "CONTINUATION",
+        "secondary": "REVERSAL",
+        "session_tz": "Europe/Paris",
+        "session_windows": [("09:00", "11:00")],
+        "news_windows": [],
+        "max_daily_drawdown_eur": 3.5,
+        "max_symbol_trades": 2,
+        "max_total_trades": 4,
+    },
+    "SMI20": {
+        "display": "SMI20",
+        "priority_rank": 10,
+        "preferred": "REVERSAL",
+        "secondary": "CONTINUATION",
+        "session_tz": "Europe/Zurich",
+        "session_windows": [("09:00", "11:00")],
+        "news_windows": [],
+        "max_daily_drawdown_eur": 3.4,
+        "max_symbol_trades": 2,
+        "max_total_trades": 4,
+    },
+}
+
+LIQUIDITY_SNIPER_STRATEGY_NAMES = set()
+
+
+def _blank_liquidity_sniper_day_state(ref_day=None):
+    return {
+        "day": ref_day or datetime.now().date(),
+        "total_trades": 0,
+        "total_pnl": 0.0,
+        "consecutive_losses": 0,
+        "per_symbol": {},
+    }
+
+
+def get_exchange_now(tz_name):
+    return datetime.now(ZoneInfo(tz_name))
+
+
+def broker_time_to_exchange(ts, tz_name):
+    if ts is None:
+        return None
+    if hasattr(ts, "to_pydatetime"):
+        ts = ts.to_pydatetime()
+    local_naive = ts - get_live_broker_offset()
+    local_aware = local_naive.replace(tzinfo=ZoneInfo("Europe/Rome"))
+    return local_aware.astimezone(ZoneInfo(tz_name))
+
+
+def _time_hhmm_to_minutes(value):
+    hour, minute = str(value).split(":")
+    return int(hour) * 60 + int(minute)
+
+
+def _time_in_exchange_windows(tz_name, windows):
+    now = get_exchange_now(tz_name)
+    now_minutes = now.hour * 60 + now.minute
+    for start_text, end_text in windows:
+        start_minutes = _time_hhmm_to_minutes(start_text)
+        end_minutes = _time_hhmm_to_minutes(end_text)
+        if start_minutes <= end_minutes:
+            if start_minutes <= now_minutes <= end_minutes:
+                return True
+        else:
+            if now_minutes >= start_minutes or now_minutes <= end_minutes:
+                return True
+    return False
+
+
+def _news_window_blocked(tz_name, news_windows):
+    if not news_windows:
+        return False
+    now = get_exchange_now(tz_name)
+    now_minutes = now.hour * 60 + now.minute
+    for center_text in news_windows:
+        center_minutes = _time_hhmm_to_minutes(center_text)
+        if abs(now_minutes - center_minutes) <= 10:
+            return True
+    return False
+
+
+def _sniper_range_position(price, low, high):
+    span = max(high - low, 1e-9)
+    return clamp((price - low) / span, 0.0, 1.0)
+
+
+def _compute_htf_structure(df_tf):
+    if df_tf is None or len(df_tf) < 30:
+        return "MIXED"
+    highs = df_tf["high"]
+    lows = df_tf["low"]
+    closes = df_tf["close"]
+    recent_high = float(highs.iloc[-6:-1].max())
+    prev_high = float(highs.iloc[-12:-6].max())
+    recent_low = float(lows.iloc[-6:-1].min())
+    prev_low = float(lows.iloc[-12:-6].min())
+    close_now = float(closes.iloc[-2])
+    close_prev = float(closes.iloc[-6])
+    if recent_high > prev_high and recent_low > prev_low and close_now >= close_prev:
+        return "UP"
+    if recent_high < prev_high and recent_low < prev_low and close_now <= close_prev:
+        return "DOWN"
+    return "MIXED"
+
+
+def _get_supply_demand_zone(df_h1, bias):
+    if df_h1 is None or len(df_h1) < 40:
+        return None
+    lookback = df_h1.iloc[-16:-1]
+    if bias == "BUY":
+        candidates = lookback[lookback["close"] < lookback["open"]]
+        if candidates.empty:
+            idx = int(lookback["low"].idxmin())
+            row = df_h1.loc[idx]
+        else:
+            row = candidates.iloc[-1]
+        return {"low": float(row["low"]), "high": float(max(row["open"], row["close"]))}
+    candidates = lookback[lookback["close"] > lookback["open"]]
+    if candidates.empty:
+        idx = int(lookback["high"].idxmax())
+        row = df_h1.loc[idx]
+    else:
+        row = candidates.iloc[-1]
+    return {"low": float(min(row["open"], row["close"])), "high": float(row["high"])}
+
+
+def _price_in_zone(price, zone, atr, pad_mult=0.30):
+    if not zone:
+        return False
+    return (zone["low"] - atr * pad_mult) <= price <= (zone["high"] + atr * pad_mult)
+
+
+def _build_liquidity_sniper_day_state(seed_deals, position_map):
+    state = _blank_liquidity_sniper_day_state(get_broker_session_start().date())
+    relevant = [
+        d for d in sorted(seed_deals, key=lambda item: (getattr(item, "time", 0), _deal_ticket(item) or 0))
+        if d.magic == MAGIC_ID and d.entry == mt5.DEAL_ENTRY_OUT
+    ]
+    for d in relevant:
+        position_id = getattr(d, "position_id", None) or getattr(d, "position", None)
+        strategy_tag = position_map.get(position_id)
+        if not strategy_tag:
+            continue
+        strategy_cfg = get_strategy_by_tag(strategy_tag)
+        if not strategy_cfg or strategy_cfg["name"] not in LIQUIDITY_SNIPER_STRATEGY_NAMES:
+            continue
+        pnl = get_deal_realized_pnl(d)
+        symbol_state = state["per_symbol"].setdefault(d.symbol, {"trades": 0, "pnl": 0.0, "consecutive_losses": 0})
+        state["total_trades"] += 1
+        state["total_pnl"] += pnl
+        symbol_state["trades"] += 1
+        symbol_state["pnl"] += pnl
+        if pnl < 0:
+            state["consecutive_losses"] += 1
+            symbol_state["consecutive_losses"] += 1
+        else:
+            state["consecutive_losses"] = 0
+            symbol_state["consecutive_losses"] = 0
+    return state
+
+
+def _liquidity_sniper_limits_ok(symbol, profile):
+    state = liquidity_sniper_day_state or _blank_liquidity_sniper_day_state()
+    if state.get("total_trades", 0) >= profile["max_total_trades"]:
+        return False, "DAILY TOTAL LIMIT"
+    if state.get("consecutive_losses", 0) >= 2:
+        return False, "2 LOSSES STOP"
+    symbol_state = state.get("per_symbol", {}).get(symbol, {})
+    if symbol_state.get("trades", 0) >= profile["max_symbol_trades"]:
+        return False, "SYMBOL DAILY LIMIT"
+    if symbol_state.get("pnl", 0.0) <= -abs(profile["max_daily_drawdown_eur"]):
+        return False, "SYMBOL DD STOP"
+    return True, "OK"
+
+
+def _allow_liquidity_sniper_priority(symbol, confluences):
+    global liquidity_sniper_cycle_symbols
+    if symbol in liquidity_sniper_cycle_symbols:
+        return True
+    if confluences >= 7:
+        return True
+    if len(liquidity_sniper_cycle_symbols) < 3:
+        liquidity_sniper_cycle_symbols.append(symbol)
+        return True
+    return False
+
+
+def _price_midrange_block(price, range_low, range_high):
+    range_pos = _sniper_range_position(price, range_low, range_high)
+    return 0.42 <= range_pos <= 0.58, range_pos
+
+
+def _find_liquidity_sweep(df_ltf, side):
+    if df_ltf is None or len(df_ltf) < 20:
+        return None
+    sweep_bar = df_ltf.iloc[-3]
+    displacement_bar = df_ltf.iloc[-2]
+    prior = df_ltf.iloc[-12:-3]
+    atr = float(df_ltf["atr"].iloc[-2] or 0.0)
+    if atr <= 0:
+        return None
+    if side == "BUY":
+        liquidity_level = float(prior["low"].min())
+        sweep = float(sweep_bar["low"]) < liquidity_level and float(sweep_bar["close"]) > liquidity_level
+        structure_level = float(prior["high"].max())
+        body = abs(float(displacement_bar["close"] - displacement_bar["open"]))
+        displacement = (
+            float(displacement_bar["close"]) > structure_level
+            and body >= atr * 0.80
+            and float(displacement_bar["close"]) > float(displacement_bar["open"])
+        )
+        if not sweep or not displacement:
+            return None
+        return {
+            "liquidity_level": liquidity_level,
+            "sweep_extreme": float(sweep_bar["low"]),
+            "displacement_close": float(displacement_bar["close"]),
+            "displacement_open": float(displacement_bar["open"]),
+            "direction": "BUY",
+            "body": body,
+            "atr": atr,
+            "bos_level": structure_level,
+        }
+    liquidity_level = float(prior["high"].max())
+    sweep = float(sweep_bar["high"]) > liquidity_level and float(sweep_bar["close"]) < liquidity_level
+    structure_level = float(prior["low"].min())
+    body = abs(float(displacement_bar["close"] - displacement_bar["open"]))
+    displacement = (
+        float(displacement_bar["close"]) < structure_level
+        and body >= atr * 0.80
+        and float(displacement_bar["close"]) < float(displacement_bar["open"])
+    )
+    if not sweep or not displacement:
+        return None
+    return {
+        "liquidity_level": liquidity_level,
+        "sweep_extreme": float(sweep_bar["high"]),
+        "displacement_close": float(displacement_bar["close"]),
+        "displacement_open": float(displacement_bar["open"]),
+        "direction": "SELL",
+        "body": body,
+        "atr": atr,
+        "bos_level": structure_level,
+    }
+
+
+def _retrace_ok(price, sweep_info, side):
+    if not sweep_info:
+        return False, None
+    impulse_low = sweep_info["sweep_extreme"] if side == "BUY" else sweep_info["displacement_close"]
+    impulse_high = sweep_info["displacement_close"] if side == "BUY" else sweep_info["sweep_extreme"]
+    total_move = max(abs(impulse_high - impulse_low), 1e-9)
+    if side == "BUY":
+        retrace_ratio = (sweep_info["displacement_close"] - price) / total_move
+        zone_ok = 0.62 <= retrace_ratio <= 0.79
+    else:
+        retrace_ratio = (price - sweep_info["displacement_close"]) / total_move
+        zone_ok = 0.50 <= retrace_ratio <= 0.79
+    return zone_ok, retrace_ratio
+
+
+def _continuation_tp_levels(df_h1, entry_price, side):
+    swing_high = float(df_h1["high"].iloc[-10:-2].max())
+    swing_low = float(df_h1["low"].iloc[-10:-2].min())
+    external_high = float(df_h1["high"].iloc[-24:-2].max())
+    external_low = float(df_h1["low"].iloc[-24:-2].min())
+    if side == "BUY":
+        tp1 = max(entry_price, swing_high)
+        tp2 = max(tp1, external_high)
+    else:
+        tp1 = min(entry_price, swing_low)
+        tp2 = min(tp1, external_low)
+    return tp1, tp2
+
+
+def _reversal_tp_levels(df_h4, entry_price, side):
+    range_high = float(df_h4["high"].iloc[-24:-2].max())
+    range_low = float(df_h4["low"].iloc[-24:-2].min())
+    mid = (range_high + range_low) / 2.0
+    if side == "BUY":
+        return max(entry_price, mid), range_high
+    return min(entry_price, mid), range_low
+
+
+def _build_continuation_liquidity_signal(df, symbol, branch_name, family):
+    profile = LIQUIDITY_SNIPER_PROFILES[family]
+    if not _time_in_exchange_windows(profile["session_tz"], profile["session_windows"]):
+        return blocked_signal(branch_name, "OUT SESSION")
+    if _news_window_blocked(profile["session_tz"], profile.get("news_windows", [])):
+        return blocked_signal(branch_name, "NEWS BLOCK")
+
+    limits_ok, limit_reason = _liquidity_sniper_limits_ok(symbol, profile)
+    if not limits_ok:
+        return blocked_signal(branch_name, limit_reason)
+
+    df_h1 = get_h1_cached(symbol)
+    df_h4 = get_h4_cached(symbol)
+    df_m1 = get_m1_cached(symbol)
+    if df_h1 is None or df_h4 is None or df_m1 is None or len(df) < 40:
+        return blocked_signal(branch_name, "NO DATA")
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return blocked_signal(branch_name, "NO TICK")
+
+    price_bid = float(tick.bid)
+    price_ask = float(tick.ask)
+    bias_h4 = _compute_htf_structure(df_h4)
+    bias_h1 = _compute_htf_structure(df_h1)
+    if bias_h4 == "UP" and bias_h1 == "UP":
+        signal = "BUY"
+        entry_price = price_ask
+    elif bias_h4 == "DOWN" and bias_h1 == "DOWN":
+        signal = "SELL"
+        entry_price = price_bid
+    else:
+        return blocked_signal(branch_name, "HTF BIAS MIXED")
+
+    htf_high = float(df_h4["high"].iloc[-20:-2].max())
+    htf_low = float(df_h4["low"].iloc[-20:-2].min())
+    mid_block, range_pos = _price_midrange_block((price_bid + price_ask) / 2.0, htf_low, htf_high)
+    if mid_block:
+        return blocked_signal(branch_name, "MID HTF RANGE", f"RNG {range_pos:.2f}")
+
+    atr_h1 = float(df_h1["atr"].iloc[-2] or 0.0)
+    zone = _get_supply_demand_zone(df_h1, signal)
+    in_zone = _price_in_zone((price_bid + price_ask) / 2.0, zone, atr_h1, 0.35)
+    sweep_info = _find_liquidity_sweep(df, signal)
+    if not sweep_info:
+        return blocked_signal(branch_name, "NO REAL SWEEP")
+    retrace_ok, retrace_ratio = _retrace_ok(entry_price, sweep_info, signal)
+    if not retrace_ok:
+        return blocked_signal(branch_name, "NO RETRACE", f"RET {retrace_ratio:.2f}" if retrace_ratio is not None else "---")
+
+    premium_discount_ok = range_pos <= 0.55 if signal == "BUY" else range_pos >= 0.45
+    tp1, tp2 = _continuation_tp_levels(df_h1, entry_price, signal)
+    buffer_pct = entry_price * 0.001
+    buffer_atr = sweep_info["atr"] * 0.15
+    sl_buffer = max(buffer_pct, buffer_atr)
+    sl_price = sweep_info["sweep_extreme"] - sl_buffer if signal == "BUY" else sweep_info["sweep_extreme"] + sl_buffer
+    rr = abs(tp2 - entry_price) / max(abs(entry_price - sl_price), 1e-9)
+    displacement_ok = bool(sweep_info["body"] >= sweep_info["atr"] * 0.80)
+    bos_ok = True
+
+    confluences = 0
+    checks = [
+        bias_h4 == bias_h1 and bias_h4 in {"UP", "DOWN"},
+        in_zone,
+        True,
+        bos_ok,
+        displacement_ok,
+        retrace_ok,
+        premium_discount_ok,
+        rr >= 2.0,
+    ]
+    confluences = sum(1 for x in checks if x)
+    if confluences < 6:
+        return blocked_signal(branch_name, "LOW CONFLUENCE", f"{confluences}/8")
+    if not _allow_liquidity_sniper_priority(symbol, confluences):
+        return blocked_signal(branch_name, "LOWER PRIORITY", f"{confluences}/8")
+
+    confidence = int(clamp(54 + confluences * 5 + max(0.0, min(rr, 3.5) - 2.0) * 8, 0, 100))
+    invalidation = sweep_info["sweep_extreme"]
+    details = {
+        "instrument": profile["display"],
+        "strategy": "Continuation Liquidity Pullback",
+        "direction": "LONG" if signal == "BUY" else "SHORT",
+        "entry_zone": f"{entry_price:.2f} | retrace {retrace_ratio:.2f}",
+        "stop_loss": round(sl_price, 5),
+        "tp1": round(tp1, 5),
+        "tp2": round(tp2, 5),
+        "rr": round(rr, 2),
+        "confluences": confluences,
+        "invalidation_level": round(invalidation, 5),
+        "confidence_score": confidence,
+        "entry_price": entry_price,
+        "take_profit": f"TP1 {tp1:.2f} | TP2 {tp2:.2f}",
+        "summary": (
+            f"{profile['display']} | Continuation Liquidity Pullback | {'LONG' if signal == 'BUY' else 'SHORT'} | "
+            f"zone {entry_price:.2f} | SL {sl_price:.2f} | TP1 {tp1:.2f} | TP2 {tp2:.2f} | "
+            f"RR {rr:.2f} | {confluences}/8 | invalid {invalidation:.2f} | conf {confidence}"
+        ),
+    }
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "name": branch_name,
+        "execution_df": df,
+        "sl_price": round(sl_price, 5),
+        "tp_price": round(tp2, 5),
+        "signal_key": f"{family}|CLP|{df.iloc[-2]['time'].isoformat()}|{signal}",
+        "signal_details": details,
+    }
+
+
+def _build_reversal_external_sweep_signal(df, symbol, branch_name, family):
+    profile = LIQUIDITY_SNIPER_PROFILES[family]
+    if not _time_in_exchange_windows(profile["session_tz"], profile["session_windows"]):
+        return blocked_signal(branch_name, "OUT SESSION")
+    if _news_window_blocked(profile["session_tz"], profile.get("news_windows", [])):
+        return blocked_signal(branch_name, "NEWS BLOCK")
+
+    limits_ok, limit_reason = _liquidity_sniper_limits_ok(symbol, profile)
+    if not limits_ok:
+        return blocked_signal(branch_name, limit_reason)
+
+    df_h1 = get_h1_cached(symbol)
+    df_h4 = get_h4_cached(symbol)
+    if df_h1 is None or df_h4 is None or len(df) < 40:
+        return blocked_signal(branch_name, "NO DATA")
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return blocked_signal(branch_name, "NO TICK")
+
+    atr_h4 = float(df_h4["atr"].iloc[-2] or 0.0)
+    atr_m5 = float(df["atr"].iloc[-2] or 0.0)
+    if atr_h4 <= 0 or atr_m5 <= 0:
+        return blocked_signal(branch_name, "NO ATR")
+
+    price_mid = (float(tick.bid) + float(tick.ask)) / 2.0
+    h4_high = float(df_h4["high"].iloc[-24:-2].max())
+    h4_low = float(df_h4["low"].iloc[-24:-2].min())
+    range_pos = _sniper_range_position(price_mid, h4_low, h4_high)
+    long_context = range_pos <= 0.38
+    short_context = range_pos >= 0.62
+    if not long_context and not short_context:
+        return blocked_signal(branch_name, "NO PREMIUM DISCOUNT", f"RNG {range_pos:.2f}")
+
+    long_sweep = _find_liquidity_sweep(df, "BUY")
+    short_sweep = _find_liquidity_sweep(df, "SELL")
+    signal = None
+    sweep_info = None
+    if long_context and long_sweep and long_sweep["sweep_extreme"] <= h4_low + atr_h4 * 0.35:
+        signal = "BUY"
+        sweep_info = long_sweep
+    elif short_context and short_sweep and short_sweep["sweep_extreme"] >= h4_high - atr_h4 * 0.35:
+        signal = "SELL"
+        sweep_info = short_sweep
+    else:
+        return blocked_signal(branch_name, "NO EXTERNAL SWEEP")
+
+    entry_price = float(tick.ask) if signal == "BUY" else float(tick.bid)
+    retrace_ok, retrace_ratio = _retrace_ok(entry_price, sweep_info, signal)
+    if not retrace_ok:
+        return blocked_signal(branch_name, "NO CLEAN RETRACE", f"RET {retrace_ratio:.2f}" if retrace_ratio is not None else "---")
+
+    zone = _get_supply_demand_zone(df_h1, signal)
+    in_zone = _price_in_zone(price_mid, zone, float(df_h1["atr"].iloc[-2] or 0.0), 0.45)
+    tp1, tp2 = _reversal_tp_levels(df_h4, entry_price, signal)
+    sl_price = sweep_info["sweep_extreme"] - atr_m5 * 0.18 if signal == "BUY" else sweep_info["sweep_extreme"] + atr_m5 * 0.18
+    rr = abs(tp2 - entry_price) / max(abs(entry_price - sl_price), 1e-9)
+    displacement_ok = sweep_info["body"] >= sweep_info["atr"] * 0.85
+    bos_ok = True
+    confluences = sum(
+        1
+        for x in [
+            True,
+            in_zone,
+            True,
+            bos_ok,
+            displacement_ok,
+            retrace_ok,
+            True,
+            rr >= 2.2,
+        ]
+        if x
+    )
+    if confluences < 6:
+        return blocked_signal(branch_name, "LOW CONFLUENCE", f"{confluences}/8")
+    if not _allow_liquidity_sniper_priority(symbol, confluences):
+        return blocked_signal(branch_name, "LOWER PRIORITY", f"{confluences}/8")
+
+    confidence = int(clamp(56 + confluences * 5 + max(0.0, min(rr, 3.8) - 2.2) * 8, 0, 100))
+    invalidation = sweep_info["sweep_extreme"]
+    details = {
+        "instrument": profile["display"],
+        "strategy": "Reversal after External Liquidity Sweep",
+        "direction": "LONG" if signal == "BUY" else "SHORT",
+        "entry_zone": f"{entry_price:.2f} | retrace {retrace_ratio:.2f}",
+        "stop_loss": round(sl_price, 5),
+        "tp1": round(tp1, 5),
+        "tp2": round(tp2, 5),
+        "rr": round(rr, 2),
+        "confluences": confluences,
+        "invalidation_level": round(invalidation, 5),
+        "confidence_score": confidence,
+        "entry_price": entry_price,
+        "take_profit": f"TP1 {tp1:.2f} | TP2 {tp2:.2f}",
+        "summary": (
+            f"{profile['display']} | Reversal after External Sweep | {'LONG' if signal == 'BUY' else 'SHORT'} | "
+            f"zone {entry_price:.2f} | SL {sl_price:.2f} | TP1 {tp1:.2f} | TP2 {tp2:.2f} | "
+            f"RR {rr:.2f} | {confluences}/8 | invalid {invalidation:.2f} | conf {confidence}"
+        ),
+    }
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "name": branch_name,
+        "execution_df": df,
+        "sl_price": round(sl_price, 5),
+        "tp_price": round(tp2, 5),
+        "signal_key": f"{family}|ELS|{df.iloc[-2]['time'].isoformat()}|{signal}",
+        "signal_details": details,
+    }
+
+
+def get_liquidity_sniper_exit_reason(symbol, strategy_cfg, signal):
+    family = strategy_cfg.get("symbol_family")
+    profile = LIQUIDITY_SNIPER_PROFILES.get(family)
+    if not profile:
+        return None
+    if not _time_in_exchange_windows(profile["session_tz"], profile["session_windows"]) and strategy_cfg["name"].endswith("_REVERSAL_SWEEP"):
+        return None
+
+    df_h1 = get_h1_cached(symbol)
+    df_h4 = get_h4_cached(symbol)
+    if df_h1 is None or df_h4 is None or len(df_h1) < 20 or len(df_h4) < 20:
+        return None
+    atr_h1 = float(df_h1["atr"].iloc[-2] or 0.0)
+    close_h1 = float(df_h1["close"].iloc[-2])
+    h4_high = float(df_h4["high"].iloc[-18:-2].max())
+    h4_low = float(df_h4["low"].iloc[-18:-2].min())
+    range_pos = _sniper_range_position(close_h1, h4_low, h4_high)
+    if signal == "BUY" and range_pos >= 0.78:
+        return "HTF external liquidity reached"
+    if signal == "SELL" and range_pos <= 0.22:
+        return "HTF external liquidity reached"
+    recent_range = abs(float(df_h1["high"].iloc[-2] - df_h1["low"].iloc[-2]))
+    if recent_range < atr_h1 * 0.45:
+        return "displacement faded on H1"
+    return None
+
+
+def strategy_continuation_liquidity_pullback(df, symbol, branch_name, family):
+    return _build_continuation_liquidity_signal(df, symbol, branch_name, family)
+
+
+def strategy_reversal_after_external_sweep(df, symbol, branch_name, family):
+    return _build_reversal_external_sweep_signal(df, symbol, branch_name, family)
+
+
+def _make_liquidity_runner(kind, branch_name, family):
+    if kind == "CONTINUATION":
+        return lambda df, symbol, _branch=branch_name, _family=family: strategy_continuation_liquidity_pullback(df, symbol, _branch, _family)
+    return lambda df, symbol, _branch=branch_name, _family=family: strategy_reversal_after_external_sweep(df, symbol, _branch, _family)
+
+
 def strategy_trend_vwap(df, symbol):
     trend_strength = compute_trend_strength(df)
     regime = detect_market_regime(df)
     attack = is_attack_runtime()
     hour = get_broker_hour()
-    min_trend = 0.08 if attack else 0.22
-    vwap_limit = 2.10 if attack else 1.45
-    if symbol_in_family(symbol, "XAUUSD") and (hour >= 21 or hour <= 2):
-        min_trend = min(min_trend, 0.05 if attack else 0.12)
+    is_xau = symbol_in_family(symbol, "XAUUSD")
+    overnight_xau = is_xau and (hour >= 21 or hour <= 2)
+    friction_xau = is_xau and (5 <= hour <= 7 or 12 <= hour <= 13)
+
+    min_trend = 0.10 if attack else 0.26
+    vwap_limit = 1.85 if attack else 1.25
+    confirm_pad = 0.18 if attack else 0.10
+    ema_hold_pad = 0.24 if attack else 0.15
+    body_floor = 0.025 if attack else 0.05
+    wick_mult = 1.50 if attack else 1.22
+    wick_atr = 0.22 if attack else 0.16
+
+    if overnight_xau:
+        min_trend = min(min_trend, 0.07 if attack else 0.14)
         if trend_strength >= (0.85 if attack else 0.65):
-            vwap_limit = max(vwap_limit, 5.60 if attack else 4.80)
-    confirm_pad = 0.24 if attack else 0.12
-    ema_hold_pad = 0.30 if attack else 0.18
-    body_floor = 0.02 if attack else 0.04
-    wick_mult = 1.70 if attack else 1.35
-    wick_atr = 0.26 if attack else 0.18
-    if symbol_in_family(symbol, "XAUUSD") and (hour >= 21 or hour <= 2):
-        confirm_pad = 0.34 if attack else 0.20
-        ema_hold_pad = 0.42 if attack else 0.26
-        body_floor = 0.015 if attack else 0.028
-        wick_mult = 1.95 if attack else 1.55
-        wick_atr = 0.32 if attack else 0.22
+            vwap_limit = max(vwap_limit, 5.20 if attack else 4.40)
+        confirm_pad = 0.30 if attack else 0.18
+        ema_hold_pad = 0.36 if attack else 0.24
+        body_floor = 0.018 if attack else 0.032
+        wick_mult = 1.80 if attack else 1.45
+        wick_atr = 0.28 if attack else 0.20
+    elif friction_xau:
+        min_trend = max(min_trend, 0.16 if attack else 0.32)
+        vwap_limit = min(vwap_limit, 1.60 if attack else 1.10)
+        confirm_pad = max(confirm_pad, 0.22 if attack else 0.14)
+        ema_hold_pad = max(ema_hold_pad, 0.28 if attack else 0.18)
+        body_floor = max(body_floor, 0.035 if attack else 0.06)
+        wick_mult = min(wick_mult, 1.38 if attack else 1.14)
+        wick_atr = min(wick_atr, 0.20 if attack else 0.14)
     if regime == "CHAOS" or trend_strength < min_trend:
         return blocked_signal("XAU_TREND", "REGIME RANGE", f"STR {round(trend_strength, 2)}")
 
@@ -2020,29 +3127,29 @@ def strategy_xau_m1_scalp(df, symbol):
     vwap = df["vwap"].iloc[-1]
     trend_strength = compute_trend_strength(df)
 
-    min_trend = 0.06 if attack else 0.14
+    min_trend = 0.10 if attack else 0.18
     long_bias = ema20_m5 > ema50_m5 and ema20_m15 > ema50_m15 and price > vwap and trend_strength >= min_trend
     short_bias = ema20_m5 < ema50_m5 and ema20_m15 < ema50_m15 and price < vwap and trend_strength >= min_trend
 
     long_stack = ema8.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1]
     short_stack = ema8.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1]
-    long_pullback = min(prev["low"], last["low"]) <= (ema21.iloc[-1] + atr_m1 * (0.30 if attack else 0.22))
-    short_pullback = max(prev["high"], last["high"]) >= (ema21.iloc[-1] - atr_m1 * (0.30 if attack else 0.22))
+    long_pullback = min(prev["low"], last["low"]) <= (ema21.iloc[-1] + atr_m1 * (0.26 if attack else 0.18))
+    short_pullback = max(prev["high"], last["high"]) >= (ema21.iloc[-1] - atr_m1 * (0.26 if attack else 0.18))
     long_reclaim = last["close"] > ema8.iloc[-1] and last["close"] > last["open"]
     short_reject = last["close"] < ema8.iloc[-1] and last["close"] < last["open"]
-    long_break = last["close"] >= (recent_high - atr_m1 * (0.22 if attack else 0.10))
-    short_break = last["close"] <= (recent_low + atr_m1 * (0.22 if attack else 0.10))
-    strong_body = body >= atr_m1 * (0.04 if attack else 0.05)
-    clean_long = wick_up <= max(body * (1.35 if attack else 1.18), atr_m1 * (0.22 if attack else 0.16))
-    clean_short = wick_down <= max(body * (1.35 if attack else 1.18), atr_m1 * (0.22 if attack else 0.16))
+    long_break = last["close"] >= (recent_high - atr_m1 * (0.16 if attack else 0.04))
+    short_break = last["close"] <= (recent_low + atr_m1 * (0.16 if attack else 0.04))
+    strong_body = body >= atr_m1 * (0.05 if attack else 0.06)
+    clean_long = wick_up <= max(body * (1.24 if attack else 1.08), atr_m1 * (0.20 if attack else 0.14))
+    clean_short = wick_down <= max(body * (1.24 if attack else 1.08), atr_m1 * (0.20 if attack else 0.14))
 
-    if long_bias and long_stack and long_pullback and long_reclaim and long_break and strong_body and clean_long and 42 <= rsi.iloc[-1] <= 82:
+    if long_bias and long_stack and long_pullback and long_reclaim and long_break and strong_body and clean_long and 48 <= rsi.iloc[-1] <= 78:
         conf = 78
         if price >= vwap + atr_m5 * 0.08 and trend_strength > 0.70:
             conf = 82
         return {"signal": "BUY", "confidence": conf, "name": "XAU_M1_SCALP", "execution_df": df_m1}
 
-    if short_bias and short_stack and short_pullback and short_reject and short_break and strong_body and clean_short and 18 <= rsi.iloc[-1] <= 58:
+    if short_bias and short_stack and short_pullback and short_reject and short_break and strong_body and clean_short and 22 <= rsi.iloc[-1] <= 52:
         conf = 78
         if price <= vwap - atr_m5 * 0.08 and trend_strength > 0.70:
             conf = 82
@@ -2054,29 +3161,29 @@ def strategy_xau_m1_scalp(df, symbol):
         if not long_stack:
             return blocked_signal("XAU_M1_SCALP", "EMA STACK MISS", pretrigger_text("STACK", max(ema21.iloc[-1] - ema8.iloc[-1], ema50.iloc[-1] - ema21.iloc[-1]), atr_m1))
         if not long_pullback:
-            return blocked_signal("XAU_M1_SCALP", "NO PULLBACK", pretrigger_text("PB", min(prev['low'], last['low']) - (ema21.iloc[-1] + atr_m1 * (0.30 if attack else 0.22)), atr_m1))
+            return blocked_signal("XAU_M1_SCALP", "NO PULLBACK", pretrigger_text("PB", min(prev['low'], last['low']) - (ema21.iloc[-1] + atr_m1 * (0.26 if attack else 0.18)), atr_m1))
         if not long_reclaim:
             return blocked_signal("XAU_M1_SCALP", "EMA8 NOT RECLAIMED", pretrigger_text("EMA8", ema8.iloc[-1] - last["close"], atr_m1))
         if not strong_body:
-            return blocked_signal("XAU_M1_SCALP", "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (0.04 if attack else 0.05) - body, atr_m1))
+            return blocked_signal("XAU_M1_SCALP", "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (0.05 if attack else 0.06) - body, atr_m1))
         if not clean_long:
-            return blocked_signal("XAU_M1_SCALP", "UPPER WICK HEAVY", pretrigger_text("WICK", wick_up - max(body * (1.35 if attack else 1.18), atr_m1 * (0.22 if attack else 0.16)), atr_m1))
+            return blocked_signal("XAU_M1_SCALP", "UPPER WICK HEAVY", pretrigger_text("WICK", wick_up - max(body * (1.24 if attack else 1.08), atr_m1 * (0.20 if attack else 0.14)), atr_m1))
         if not long_break:
-            return blocked_signal("XAU_M1_SCALP", "NO BREAKOUT", pretrigger_text("BRK", (recent_high - atr_m1 * (0.22 if attack else 0.10)) - last["close"], atr_m1))
+            return blocked_signal("XAU_M1_SCALP", "NO BREAKOUT", pretrigger_text("BRK", (recent_high - atr_m1 * (0.16 if attack else 0.04)) - last["close"], atr_m1))
         return blocked_signal("XAU_M1_SCALP", "RSI BLOCKED", f"RSI {round(rsi.iloc[-1], 1)}")
 
     if not short_stack:
         return blocked_signal("XAU_M1_SCALP", "EMA STACK MISS", pretrigger_text("STACK", max(ema8.iloc[-1] - ema21.iloc[-1], ema21.iloc[-1] - ema50.iloc[-1]), atr_m1))
     if not short_pullback:
-        return blocked_signal("XAU_M1_SCALP", "NO PULLBACK", pretrigger_text("PB", (ema21.iloc[-1] - atr_m1 * (0.30 if attack else 0.22)) - max(prev['high'], last['high']), atr_m1))
+        return blocked_signal("XAU_M1_SCALP", "NO PULLBACK", pretrigger_text("PB", (ema21.iloc[-1] - atr_m1 * (0.26 if attack else 0.18)) - max(prev['high'], last['high']), atr_m1))
     if not short_reject:
         return blocked_signal("XAU_M1_SCALP", "EMA8 NOT LOST", pretrigger_text("EMA8", last["close"] - ema8.iloc[-1], atr_m1))
     if not strong_body:
-        return blocked_signal("XAU_M1_SCALP", "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (0.04 if attack else 0.05) - body, atr_m1))
+        return blocked_signal("XAU_M1_SCALP", "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (0.05 if attack else 0.06) - body, atr_m1))
     if not clean_short:
-        return blocked_signal("XAU_M1_SCALP", "LOWER WICK HEAVY", pretrigger_text("WICK", wick_down - max(body * (1.35 if attack else 1.18), atr_m1 * (0.22 if attack else 0.16)), atr_m1))
+        return blocked_signal("XAU_M1_SCALP", "LOWER WICK HEAVY", pretrigger_text("WICK", wick_down - max(body * (1.24 if attack else 1.08), atr_m1 * (0.20 if attack else 0.14)), atr_m1))
     if not short_break:
-        return blocked_signal("XAU_M1_SCALP", "NO BREAKDOWN", pretrigger_text("BRK", last["close"] - (recent_low + atr_m1 * (0.22 if attack else 0.10)), atr_m1))
+        return blocked_signal("XAU_M1_SCALP", "NO BREAKDOWN", pretrigger_text("BRK", last["close"] - (recent_low + atr_m1 * (0.16 if attack else 0.04)), atr_m1))
     return blocked_signal("XAU_M1_SCALP", "RSI BLOCKED", f"RSI {round(rsi.iloc[-1], 1)}")
 
 
@@ -2118,9 +3225,11 @@ def strategy_btc_trend(df, symbol):
     recent_high = df["high"].rolling(14).max().iloc[-2]
     recent_low = df["low"].rolling(14).min().iloc[-2]
 
-    trend_min = 0.24 if attack else 0.42
-    m15_min = 0.14 if attack else 0.26
-    vwap_limit = 3.45 if attack else 2.95
+    trend_min = 0.20 if attack else 0.34
+    m15_min = 0.10 if attack else 0.18
+    if trend_strength >= (1.00 if attack else 0.86):
+        m15_min = max(0.08 if attack else 0.14, m15_min - 0.04)
+    vwap_limit = 3.70 if attack else 3.15
     if trend_strength >= (0.90 if attack else 1.05):
         vwap_limit += 0.65
     if m15_strength >= (0.55 if attack else 0.42):
@@ -2129,11 +3238,11 @@ def strategy_btc_trend(df, symbol):
     short_trigger = recent_low + atr * (0.10 if attack else 0.04)
     long_break_gap = max(0.0, long_trigger - price)
     short_break_gap = max(0.0, price - short_trigger)
-    long_pullback = min(m1_prev["low"], m1_last["low"]) <= (ema20_m1 + atr_m1 * (0.34 if attack else 0.24))
-    short_pullback = max(m1_prev["high"], m1_last["high"]) >= (ema20_m1 - atr_m1 * (0.34 if attack else 0.24))
+    long_pullback = min(m1_prev["low"], m1_last["low"]) <= (ema20_m1 + atr_m1 * (0.40 if attack else 0.30))
+    short_pullback = max(m1_prev["high"], m1_last["high"]) >= (ema20_m1 - atr_m1 * (0.40 if attack else 0.30))
     long_reclaim = m1_last["close"] > ema9_m1 and ema9_m1 > ema20_m1 > ema50_m1
     short_reclaim = m1_last["close"] < ema9_m1 and ema9_m1 < ema20_m1 < ema50_m1
-    strong_body = body >= atr * (0.04 if attack else 0.06)
+    strong_body = body >= atr * (0.035 if attack else 0.05)
     clean_long_candle = wick_up <= max(body * (1.28 if attack else 1.06), atr * 0.16)
     clean_short_candle = wick_down <= max(body * (1.28 if attack else 1.06), atr * 0.16)
     long_break_failed = m1_last["high"] >= long_trigger and m1_last["close"] < long_trigger
@@ -2815,61 +3924,105 @@ def strategy_ustech_pullback_scalp(df, symbol):
         return blocked_signal("USTECH_PULLBACK_SCALP", "NO ATR")
 
     spread = tick.ask - tick.bid
-    if spread > atr_m1 * (0.34 if attack else 0.24):
+    if spread > atr_m1 * (0.30 if attack else 0.20):
         return blocked_signal("USTECH_PULLBACK_SCALP", "SPREAD HIGH")
 
+    price_m5 = df["close"].iloc[-1]
+    ema20_m5 = df["close"].ewm(span=20).mean().iloc[-1]
+    ema50_m5 = df["close"].ewm(span=50).mean().iloc[-1]
+    vwap_m5 = df["vwap"].iloc[-1]
+    trend_strength = compute_trend_strength(df)
     m15_close = df_m15["close"].iloc[-1]
     ema50_m15 = df_m15["close"].ewm(span=50).mean().iloc[-1]
+    ema200_m15 = df_m15["close"].ewm(span=200).mean().iloc[-1]
+    atr_m15 = df_m15["atr"].iloc[-1]
     last = df_m1.iloc[-1]
     prev = df_m1.iloc[-2]
-    recent_high = df_m1["high"].tail(6).max()
-    recent_low = df_m1["low"].tail(6).min()
+    recent_high = df_m1["high"].tail(8).max()
+    recent_low = df_m1["low"].tail(8).min()
     body = abs(last["close"] - last["open"])
     wick_up = last["high"] - max(last["open"], last["close"])
     wick_down = min(last["open"], last["close"]) - last["low"]
-    strong_body = body >= atr_m1 * (0.05 if attack else 0.06)
-    clean_long = wick_up <= max(body * (1.25 if attack else 1.05), atr_m1 * (0.24 if attack else 0.16))
-    clean_short = wick_down <= max(body * (1.25 if attack else 1.05), atr_m1 * (0.24 if attack else 0.16))
+    strong_body = body >= atr_m1 * (0.08 if attack else 0.09)
+    clean_long = wick_up <= max(body * (1.10 if attack else 0.88), atr_m1 * (0.18 if attack else 0.12))
+    clean_short = wick_down <= max(body * (1.10 if attack else 0.88), atr_m1 * (0.18 if attack else 0.12))
 
-    long_trend = ema50.iloc[-1] > ema200.iloc[-1] and m15_close >= ema50_m15
-    short_trend = ema50.iloc[-1] < ema200.iloc[-1] and m15_close <= ema50_m15
-    long_pullback = min(prev["low"], last["low"]) <= ema50.iloc[-1] + atr_m1 * (0.22 if attack else 0.16) and min(prev["low"], last["low"]) >= ema200.iloc[-1] - atr_m1 * 0.10
-    short_pullback = max(prev["high"], last["high"]) >= ema50.iloc[-1] - atr_m1 * (0.22 if attack else 0.16) and max(prev["high"], last["high"]) <= ema200.iloc[-1] + atr_m1 * 0.10
-    long_confirm = last["close"] > last["open"] and last["close"] > ema50.iloc[-1] and last["close"] >= recent_high - atr_m1 * (0.18 if attack else 0.08)
-    short_confirm = last["close"] < last["open"] and last["close"] < ema50.iloc[-1] and last["close"] <= recent_low + atr_m1 * (0.18 if attack else 0.08)
+    m15_strength = abs(ema50_m15 - ema200_m15) / max(atr_m15, 1e-6)
+    long_trend = (
+        ema20_m5 > ema50_m5
+        and
+        ema50.iloc[-1] > ema200.iloc[-1]
+        and ema50_m15 > ema200_m15
+        and price_m5 > vwap_m5
+        and trend_strength >= (0.22 if attack else 0.40)
+        and m15_close >= ema50_m15 + atr_m15 * (0.02 if attack else 0.05)
+        and m15_strength >= (0.22 if attack else 0.36)
+    )
+    short_trend = (
+        ema20_m5 < ema50_m5
+        and
+        ema50.iloc[-1] < ema200.iloc[-1]
+        and ema50_m15 < ema200_m15
+        and price_m5 < vwap_m5
+        and trend_strength >= (0.22 if attack else 0.40)
+        and m15_close <= ema50_m15 - atr_m15 * (0.02 if attack else 0.05)
+        and m15_strength >= (0.22 if attack else 0.36)
+    )
+    long_pullback = (
+        min(prev["low"], last["low"]) <= ema50.iloc[-1] + atr_m1 * (0.10 if attack else 0.06)
+        and min(prev["low"], last["low"]) >= ema50.iloc[-1] - atr_m1 * (0.22 if attack else 0.16)
+        and min(prev["low"], last["low"]) > ema200.iloc[-1]
+    )
+    short_pullback = (
+        max(prev["high"], last["high"]) >= ema50.iloc[-1] - atr_m1 * (0.10 if attack else 0.06)
+        and max(prev["high"], last["high"]) <= ema50.iloc[-1] + atr_m1 * (0.22 if attack else 0.16)
+        and max(prev["high"], last["high"]) < ema200.iloc[-1]
+    )
+    long_confirm = (
+        last["close"] > last["open"]
+        and last["close"] > ema50.iloc[-1] + atr_m1 * (0.04 if attack else 0.06)
+        and last["close"] >= recent_high - atr_m1 * (0.06 if attack else 0.02)
+        and last["close"] > prev["high"] - atr_m1 * (0.02 if attack else 0.00)
+    )
+    short_confirm = (
+        last["close"] < last["open"]
+        and last["close"] < ema50.iloc[-1] - atr_m1 * (0.04 if attack else 0.06)
+        and last["close"] <= recent_low + atr_m1 * (0.06 if attack else 0.02)
+        and last["close"] < prev["low"] + atr_m1 * (0.02 if attack else 0.00)
+    )
 
-    if long_trend and long_pullback and long_confirm and strong_body and clean_long and rsi.iloc[-1] > 50:
+    if long_trend and long_pullback and long_confirm and strong_body and clean_long and rsi.iloc[-1] >= 54:
         conf = 76
-        if rsi.iloc[-1] > 58 and last["close"] >= ema50.iloc[-1] + atr_m1 * 0.08:
+        if rsi.iloc[-1] > 60 and last["close"] >= ema50.iloc[-1] + atr_m1 * 0.10:
             conf = 81
         return {"signal": "BUY", "confidence": conf, "name": "USTECH_PULLBACK_SCALP", "execution_df": df_m1}
 
-    if short_trend and short_pullback and short_confirm and strong_body and clean_short and rsi.iloc[-1] < 50:
+    if short_trend and short_pullback and short_confirm and strong_body and clean_short and rsi.iloc[-1] <= 46:
         conf = 76
-        if rsi.iloc[-1] < 42 and last["close"] <= ema50.iloc[-1] - atr_m1 * 0.08:
+        if rsi.iloc[-1] < 40 and last["close"] <= ema50.iloc[-1] - atr_m1 * 0.10:
             conf = 81
         return {"signal": "SELL", "confidence": conf, "name": "USTECH_PULLBACK_SCALP", "execution_df": df_m1}
 
     if not long_trend and not short_trend:
-        return blocked_signal("USTECH_PULLBACK_SCALP", "EMA TREND MIXED", pretrigger_text("EMA", abs(ema50.iloc[-1] - ema200.iloc[-1]), atr_m1))
+        return blocked_signal("USTECH_PULLBACK_SCALP", "M15 EMA MIXED", pretrigger_text("M15", abs(ema50_m15 - ema200_m15), atr_m15))
     if long_trend:
         if not long_pullback:
-            return blocked_signal("USTECH_PULLBACK_SCALP", "NO PULLBACK", pretrigger_text("PB", min(prev["low"], last["low"]) - (ema50.iloc[-1] + atr_m1 * (0.22 if attack else 0.16)), atr_m1))
+            return blocked_signal("USTECH_PULLBACK_SCALP", "NO PULLBACK", pretrigger_text("PB", min(prev["low"], last["low"]) - (ema50.iloc[-1] + atr_m1 * (0.10 if attack else 0.06)), atr_m1))
         if not long_confirm:
-            return blocked_signal("USTECH_PULLBACK_SCALP", "NO BULL CONFIRM", pretrigger_text("CONF", (recent_high - atr_m1 * (0.18 if attack else 0.08)) - last["close"], atr_m1))
+            return blocked_signal("USTECH_PULLBACK_SCALP", "NO BULL CONFIRM", pretrigger_text("CONF", (recent_high - atr_m1 * (0.06 if attack else 0.02)) - last["close"], atr_m1))
         if not strong_body:
-            return blocked_signal("USTECH_PULLBACK_SCALP", "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (0.05 if attack else 0.06) - body, atr_m1))
+            return blocked_signal("USTECH_PULLBACK_SCALP", "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (0.08 if attack else 0.09) - body, atr_m1))
         if not clean_long:
-            return blocked_signal("USTECH_PULLBACK_SCALP", "UPPER WICK HEAVY", pretrigger_text("WICK", wick_up - max(body * (1.25 if attack else 1.05), atr_m1 * (0.24 if attack else 0.16)), atr_m1))
+            return blocked_signal("USTECH_PULLBACK_SCALP", "UPPER WICK HEAVY", pretrigger_text("WICK", wick_up - max(body * (1.10 if attack else 0.88), atr_m1 * (0.18 if attack else 0.12)), atr_m1))
         return blocked_signal("USTECH_PULLBACK_SCALP", "RSI BLOCKED", f"RSI {round(rsi.iloc[-1], 1)}")
     if not short_pullback:
-        return blocked_signal("USTECH_PULLBACK_SCALP", "NO PULLBACK", pretrigger_text("PB", (ema50.iloc[-1] - atr_m1 * (0.22 if attack else 0.16)) - max(prev["high"], last["high"]), atr_m1))
+        return blocked_signal("USTECH_PULLBACK_SCALP", "NO PULLBACK", pretrigger_text("PB", (ema50.iloc[-1] - atr_m1 * (0.10 if attack else 0.06)) - max(prev["high"], last["high"]), atr_m1))
     if not short_confirm:
-        return blocked_signal("USTECH_PULLBACK_SCALP", "NO BEAR CONFIRM", pretrigger_text("CONF", last["close"] - (recent_low + atr_m1 * (0.18 if attack else 0.08)), atr_m1))
+        return blocked_signal("USTECH_PULLBACK_SCALP", "NO BEAR CONFIRM", pretrigger_text("CONF", last["close"] - (recent_low + atr_m1 * (0.06 if attack else 0.02)), atr_m1))
     if not strong_body:
-        return blocked_signal("USTECH_PULLBACK_SCALP", "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (0.05 if attack else 0.06) - body, atr_m1))
+        return blocked_signal("USTECH_PULLBACK_SCALP", "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (0.08 if attack else 0.09) - body, atr_m1))
     if not clean_short:
-        return blocked_signal("USTECH_PULLBACK_SCALP", "LOWER WICK HEAVY", pretrigger_text("WICK", wick_down - max(body * (1.25 if attack else 1.05), atr_m1 * (0.24 if attack else 0.16)), atr_m1))
+        return blocked_signal("USTECH_PULLBACK_SCALP", "LOWER WICK HEAVY", pretrigger_text("WICK", wick_down - max(body * (1.10 if attack else 0.88), atr_m1 * (0.18 if attack else 0.12)), atr_m1))
     return blocked_signal("USTECH_PULLBACK_SCALP", "RSI BLOCKED", f"RSI {round(rsi.iloc[-1], 1)}")
 
 
@@ -3072,6 +4225,2813 @@ def strategy_ger40_pullback_scalp(df, symbol):
     return blocked_signal("GER40_PULLBACK_SCALP", "RSI BLOCKED", f"RSI {round(rsi.iloc[-1], 1)}")
 
 
+INDEX_TOP_PROFILES = {
+    "XAUUSD": {
+        "session": (13, 3),
+        "spread_mult": (0.34, 0.26),
+        "trend_min": (0.14, 0.21),
+        "m15_min": (0.10, 0.16),
+        "m15_bias_pad": (0.00, 0.01),
+        "pullback_top": (0.20, 0.14),
+        "pullback_bottom": (0.24, 0.17),
+        "ema200_pad": 0.08,
+        "confirm_pad": (0.14, 0.07),
+        "reclaim_pad": (0.01, 0.00),
+        "body_floor": (0.045, 0.055),
+        "wick_ratio": (1.18, 1.00),
+        "wick_atr": (0.18, 0.14),
+        "rsi_long": (50, 78),
+        "rsi_short": (22, 50),
+        "boost_rsi": (57, 43),
+        "boost_pad": 0.08,
+        "recent_bars": 6,
+        "base_conf": 77,
+        "boost_conf": 82,
+    },
+    "GER40": {
+        "session": (8, 18),
+        "spread_mult": (0.36, 0.26),
+        "trend_min": (0.16, 0.24),
+        "m15_min": (0.14, 0.20),
+        "m15_bias_pad": (0.00, 0.02),
+        "pullback_top": (0.18, 0.12),
+        "pullback_bottom": (0.22, 0.15),
+        "ema200_pad": 0.08,
+        "confirm_pad": (0.14, 0.06),
+        "reclaim_pad": (0.02, 0.00),
+        "body_floor": (0.05, 0.06),
+        "wick_ratio": (1.26, 1.08),
+        "wick_atr": (0.22, 0.16),
+        "rsi_long": (50, 78),
+        "rsi_short": (22, 50),
+        "boost_rsi": (57, 43),
+        "boost_pad": 0.06,
+        "recent_bars": 6,
+        "base_conf": 76,
+        "boost_conf": 81,
+    },
+    "UK100": {
+        "session": (8, 18),
+        "spread_mult": (0.38, 0.28),
+        "trend_min": (0.16, 0.24),
+        "m15_min": (0.14, 0.20),
+        "m15_bias_pad": (0.00, 0.02),
+        "pullback_top": (0.18, 0.12),
+        "pullback_bottom": (0.22, 0.15),
+        "ema200_pad": 0.08,
+        "confirm_pad": (0.14, 0.06),
+        "reclaim_pad": (0.02, 0.00),
+        "body_floor": (0.05, 0.06),
+        "wick_ratio": (1.24, 1.06),
+        "wick_atr": (0.22, 0.16),
+        "rsi_long": (50, 78),
+        "rsi_short": (22, 50),
+        "boost_rsi": (57, 43),
+        "boost_pad": 0.06,
+        "recent_bars": 6,
+        "base_conf": 76,
+        "boost_conf": 81,
+    },
+    "USTECH": {
+        "session": (13, 23),
+        "spread_mult": (0.30, 0.20),
+        "trend_min": (0.20, 0.34),
+        "m15_min": (0.18, 0.28),
+        "m15_bias_pad": (0.02, 0.04),
+        "pullback_top": (0.12, 0.08),
+        "pullback_bottom": (0.20, 0.14),
+        "ema200_pad": 0.04,
+        "confirm_pad": (0.08, 0.03),
+        "reclaim_pad": (0.04, 0.05),
+        "body_floor": (0.07, 0.08),
+        "wick_ratio": (1.12, 0.92),
+        "wick_atr": (0.18, 0.12),
+        "rsi_long": (54, 80),
+        "rsi_short": (20, 46),
+        "boost_rsi": (60, 40),
+        "boost_pad": 0.10,
+        "recent_bars": 8,
+        "base_conf": 76,
+        "boost_conf": 81,
+    },
+    "US500": {
+        "session": (13, 23),
+        "spread_mult": (0.32, 0.22),
+        "trend_min": (0.18, 0.30),
+        "m15_min": (0.16, 0.24),
+        "m15_bias_pad": (0.01, 0.03),
+        "pullback_top": (0.16, 0.10),
+        "pullback_bottom": (0.22, 0.15),
+        "ema200_pad": 0.06,
+        "confirm_pad": (0.12, 0.05),
+        "reclaim_pad": (0.03, 0.03),
+        "body_floor": (0.06, 0.07),
+        "wick_ratio": (1.18, 0.98),
+        "wick_atr": (0.20, 0.14),
+        "rsi_long": (52, 79),
+        "rsi_short": (21, 48),
+        "boost_rsi": (58, 42),
+        "boost_pad": 0.08,
+        "recent_bars": 7,
+        "base_conf": 76,
+        "boost_conf": 81,
+    },
+    "US30": {
+        "session": (13, 23),
+        "spread_mult": (0.36, 0.24),
+        "trend_min": (0.18, 0.30),
+        "m15_min": (0.16, 0.24),
+        "m15_bias_pad": (0.01, 0.03),
+        "pullback_top": (0.18, 0.12),
+        "pullback_bottom": (0.24, 0.17),
+        "ema200_pad": 0.07,
+        "confirm_pad": (0.12, 0.05),
+        "reclaim_pad": (0.03, 0.03),
+        "body_floor": (0.06, 0.07),
+        "wick_ratio": (1.18, 0.98),
+        "wick_atr": (0.20, 0.14),
+        "rsi_long": (52, 79),
+        "rsi_short": (21, 48),
+        "boost_rsi": (58, 42),
+        "boost_pad": 0.08,
+        "recent_bars": 7,
+        "base_conf": 76,
+        "boost_conf": 81,
+    },
+    "JPN225": {
+        "session": (2, 10),
+        "spread_mult": (0.38, 0.28),
+        "trend_min": (0.16, 0.26),
+        "m15_min": (0.14, 0.22),
+        "m15_bias_pad": (0.00, 0.02),
+        "pullback_top": (0.18, 0.12),
+        "pullback_bottom": (0.24, 0.18),
+        "ema200_pad": 0.08,
+        "confirm_pad": (0.12, 0.05),
+        "reclaim_pad": (0.02, 0.02),
+        "body_floor": (0.06, 0.07),
+        "wick_ratio": (1.22, 1.02),
+        "wick_atr": (0.22, 0.16),
+        "rsi_long": (50, 78),
+        "rsi_short": (22, 50),
+        "boost_rsi": (56, 44),
+        "boost_pad": 0.07,
+        "recent_bars": 6,
+        "base_conf": 75,
+        "boost_conf": 80,
+    },
+    "BTCUSD": {
+        "session": (0, 23),
+        "spread_mult": (0.40, 0.32),
+        "trend_min": (0.16, 0.24),
+        "m15_min": (0.12, 0.18),
+        "m15_bias_pad": (0.00, 0.02),
+        "pullback_top": (0.20, 0.14),
+        "pullback_bottom": (0.26, 0.20),
+        "ema200_pad": 0.06,
+        "confirm_pad": (0.12, 0.05),
+        "reclaim_pad": (0.02, 0.02),
+        "body_floor": (0.04, 0.05),
+        "wick_ratio": (1.18, 1.00),
+        "wick_atr": (0.18, 0.14),
+        "rsi_long": (50, 78),
+        "rsi_short": (22, 50),
+        "boost_rsi": (58, 42),
+        "boost_pad": 0.08,
+        "recent_bars": 7,
+        "base_conf": 76,
+        "boost_conf": 81,
+    },
+    "ETHUSD": {
+        "session": (0, 23),
+        "spread_mult": (0.86, 0.70),
+        "trend_min": (0.16, 0.24),
+        "m15_min": (0.12, 0.18),
+        "m15_bias_pad": (0.00, 0.02),
+        "pullback_top": (0.20, 0.14),
+        "pullback_bottom": (0.26, 0.20),
+        "ema200_pad": 0.06,
+        "confirm_pad": (0.12, 0.05),
+        "reclaim_pad": (0.02, 0.02),
+        "body_floor": (0.045, 0.055),
+        "wick_ratio": (1.20, 1.02),
+        "wick_atr": (0.18, 0.14),
+        "rsi_long": (50, 78),
+        "rsi_short": (22, 50),
+        "boost_rsi": (58, 42),
+        "boost_pad": 0.08,
+        "recent_bars": 7,
+        "base_conf": 76,
+        "boost_conf": 81,
+    },
+}
+
+
+def _session_open(hour, session_start, session_end):
+    if session_start <= session_end:
+        return session_start <= hour <= session_end
+    return hour >= session_start or hour <= session_end
+
+
+def strategy_index_top(df, symbol, branch_name, family):
+    if is_crypto_family(family):
+        if not crypto_enabled:
+            return blocked_signal(branch_name, "CRYPTO OFF")
+    elif not scalping_enabled:
+        return blocked_signal(branch_name, "SCALP OFF")
+
+    profile = INDEX_TOP_PROFILES[family]
+    hour = get_broker_hour()
+    session_start, session_end = profile["session"]
+    if not _session_open(hour, session_start, session_end):
+        return blocked_signal(branch_name, "OUT SESSION")
+
+    df_m1 = get_data(symbol, mt5.TIMEFRAME_M1, 260)
+    df_m15 = get_m15_cached(symbol)
+    if df_m1 is None or len(df_m1) < 220:
+        return blocked_signal(branch_name, "NO M1 DATA")
+    if df_m15 is None or len(df_m15) < 60:
+        return blocked_signal(branch_name, "NO M15 DATA")
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return blocked_signal(branch_name, "NO TICK")
+
+    attack = is_attack_runtime()
+    close_m1 = df_m1["close"]
+    ema50_m1 = close_m1.ewm(span=50).mean()
+    ema200_m1 = close_m1.ewm(span=200).mean()
+    rsi = compute_rsi(close_m1, 14)
+    atr_m1 = df_m1["atr"].iloc[-1]
+    atr_m15 = df_m15["atr"].iloc[-1]
+    if atr_m1 <= 0 or atr_m15 <= 0:
+        return blocked_signal(branch_name, "NO ATR")
+
+    spread = tick.ask - tick.bid
+    spread_mult = profile["spread_mult"][0] if attack else profile["spread_mult"][1]
+    spread_limit = atr_m1 * spread_mult
+    if is_crypto_family(family):
+        atr_floor = float(df_m1["atr"].tail(90).median() or atr_m1)
+        spread_limit = max(spread_limit, atr_floor * spread_mult * 1.10)
+    if spread > spread_limit:
+        return blocked_signal(branch_name, "SPREAD HIGH")
+
+    price_m5 = df["close"].iloc[-1]
+    vwap_m5 = df["vwap"].iloc[-1]
+    trend_strength = compute_trend_strength(df)
+
+    m15_close = df_m15["close"].iloc[-1]
+    ema50_m15 = df_m15["close"].ewm(span=50).mean().iloc[-1]
+    ema200_m15 = df_m15["close"].ewm(span=200).mean().iloc[-1]
+    m15_strength = abs(ema50_m15 - ema200_m15) / max(atr_m15, 1e-6)
+
+    last = df_m1.iloc[-1]
+    prev = df_m1.iloc[-2]
+    low_ref = min(prev["low"], last["low"])
+    high_ref = max(prev["high"], last["high"])
+    recent_high = df_m1["high"].tail(profile["recent_bars"]).max()
+    recent_low = df_m1["low"].tail(profile["recent_bars"]).min()
+    body = abs(last["close"] - last["open"])
+    wick_up = last["high"] - max(last["open"], last["close"])
+    wick_down = min(last["open"], last["close"]) - last["low"]
+
+    trend_min = profile["trend_min"][0] if attack else profile["trend_min"][1]
+    m15_min = profile["m15_min"][0] if attack else profile["m15_min"][1]
+    m15_bias_pad = profile["m15_bias_pad"][0] if attack else profile["m15_bias_pad"][1]
+    pullback_top = profile["pullback_top"][0] if attack else profile["pullback_top"][1]
+    pullback_bottom = profile["pullback_bottom"][0] if attack else profile["pullback_bottom"][1]
+    confirm_pad = profile["confirm_pad"][0] if attack else profile["confirm_pad"][1]
+    reclaim_pad = profile["reclaim_pad"][0] if attack else profile["reclaim_pad"][1]
+    body_floor = profile["body_floor"][0] if attack else profile["body_floor"][1]
+    wick_ratio = profile["wick_ratio"][0] if attack else profile["wick_ratio"][1]
+    wick_atr = profile["wick_atr"][0] if attack else profile["wick_atr"][1]
+    vwap_pad = 0.0
+    default_vwap_limits = {
+        "GER40": (1.95, 1.45),
+        "UK100": (2.00, 1.50),
+        "USTECH": (2.20, 1.60),
+        "US500": (2.10, 1.55),
+        "US30": (2.25, 1.65),
+        "JPN225": (2.10, 1.55),
+        "XAUUSD": (2.45, 1.85),
+        "BTCUSD": (2.90, 2.20),
+        "ETHUSD": (3.35, 2.55),
+    }
+    vwap_limit = (profile.get("vwap_limit") or default_vwap_limits.get(family, (1.95, 1.45)))[0 if attack else 1]
+
+    evening_flex = family in {"USTECH", "US500", "US30"} and 19 <= hour <= 23
+    if evening_flex:
+        trend_min = max(0.14, trend_min - 0.04)
+        m15_min = max(0.12, m15_min - 0.03)
+        pullback_top += 0.02
+        pullback_bottom += 0.02
+        confirm_pad += 0.01
+        vwap_pad = atr_m1 * (0.05 if family == "USTECH" else 0.04)
+    if is_crypto_family(family):
+        trend_min = max(0.12, trend_min - 0.02)
+        m15_min = max(0.10, m15_min - 0.02)
+        pullback_top += 0.02
+        pullback_bottom += 0.02
+        confirm_pad += 0.01
+        vwap_pad = max(vwap_pad, atr_m1 * 0.06)
+    elif family == "XAUUSD":
+        trend_min = max(0.12, trend_min - 0.01)
+        m15_min = max(0.09, m15_min - 0.01)
+        pullback_top += 0.01
+        pullback_bottom += 0.01
+        confirm_pad += 0.01
+        vwap_pad = max(vwap_pad, atr_m1 * 0.04)
+
+    strong_body = body >= atr_m1 * body_floor
+    clean_long = wick_up <= max(body * wick_ratio, atr_m1 * wick_atr)
+    clean_short = wick_down <= max(body * wick_ratio, atr_m1 * wick_atr)
+    vwap_dist = abs(price_m5 - vwap_m5)
+
+    long_trend = (
+        ema50_m1.iloc[-1] > ema200_m1.iloc[-1]
+        and ema50_m15 > ema200_m15
+        and price_m5 > vwap_m5 - vwap_pad
+        and vwap_dist <= atr_m1 * vwap_limit
+        and trend_strength >= trend_min
+        and m15_close >= ema50_m15 + atr_m15 * m15_bias_pad
+        and m15_strength >= m15_min
+    )
+    short_trend = (
+        ema50_m1.iloc[-1] < ema200_m1.iloc[-1]
+        and ema50_m15 < ema200_m15
+        and price_m5 < vwap_m5 + vwap_pad
+        and vwap_dist <= atr_m1 * vwap_limit
+        and trend_strength >= trend_min
+        and m15_close <= ema50_m15 - atr_m15 * m15_bias_pad
+        and m15_strength >= m15_min
+    )
+    long_pullback = (
+        low_ref <= ema50_m1.iloc[-1] + atr_m1 * pullback_top
+        and low_ref >= max(ema50_m1.iloc[-1] - atr_m1 * pullback_bottom, ema200_m1.iloc[-1] - atr_m1 * profile["ema200_pad"])
+    )
+    short_pullback = (
+        high_ref >= ema50_m1.iloc[-1] - atr_m1 * pullback_top
+        and high_ref <= min(ema50_m1.iloc[-1] + atr_m1 * pullback_bottom, ema200_m1.iloc[-1] + atr_m1 * profile["ema200_pad"])
+    )
+    long_confirm = (
+        last["close"] > last["open"]
+        and last["close"] > ema50_m1.iloc[-1] + atr_m1 * reclaim_pad
+        and last["close"] >= recent_high - atr_m1 * confirm_pad
+        and last["close"] > prev["high"] - atr_m1 * 0.02
+    )
+    short_confirm = (
+        last["close"] < last["open"]
+        and last["close"] < ema50_m1.iloc[-1] - atr_m1 * reclaim_pad
+        and last["close"] <= recent_low + atr_m1 * confirm_pad
+        and last["close"] < prev["low"] + atr_m1 * 0.02
+    )
+
+    rsi_long_min, rsi_long_max = profile["rsi_long"]
+    rsi_short_min, rsi_short_max = profile["rsi_short"]
+    boost_rsi_long, boost_rsi_short = profile["boost_rsi"]
+
+    if long_trend and long_pullback and long_confirm and strong_body and clean_long and rsi_long_min <= rsi.iloc[-1] <= rsi_long_max:
+        conf = profile["base_conf"]
+        if rsi.iloc[-1] >= boost_rsi_long and last["close"] >= ema50_m1.iloc[-1] + atr_m1 * profile["boost_pad"]:
+            conf = profile["boost_conf"]
+        return {"signal": "BUY", "confidence": conf, "name": branch_name, "execution_df": df_m1}
+
+    if short_trend and short_pullback and short_confirm and strong_body and clean_short and rsi_short_min <= rsi.iloc[-1] <= rsi_short_max:
+        conf = profile["base_conf"]
+        if rsi.iloc[-1] <= boost_rsi_short and last["close"] <= ema50_m1.iloc[-1] - atr_m1 * profile["boost_pad"]:
+            conf = profile["boost_conf"]
+        return {"signal": "SELL", "confidence": conf, "name": branch_name, "execution_df": df_m1}
+
+    if not long_trend and not short_trend:
+        if m15_strength < m15_min:
+            return blocked_signal(branch_name, "M15 WEAK", f"STR {round(m15_strength, 2)}")
+        if trend_strength < trend_min:
+            return blocked_signal(branch_name, "TREND WEAK", f"STR {round(trend_strength, 2)}")
+        if price_m5 > vwap_m5 and vwap_dist > atr_m1 * vwap_limit:
+            return blocked_signal(branch_name, "VWAP TOO FAR", pretrigger_text("VWAP", vwap_dist - atr_m1 * vwap_limit, atr_m1))
+        if price_m5 < vwap_m5 and vwap_dist > atr_m1 * vwap_limit:
+            return blocked_signal(branch_name, "VWAP TOO FAR", pretrigger_text("VWAP", vwap_dist - atr_m1 * vwap_limit, atr_m1))
+        if price_m5 >= ema50_m1.iloc[-1] and price_m5 <= vwap_m5:
+            return blocked_signal(branch_name, "VWAP LOST", pretrigger_text("VWAP", vwap_m5 - price_m5, atr_m1))
+        if price_m5 <= ema50_m1.iloc[-1] and price_m5 >= vwap_m5:
+            return blocked_signal(branch_name, "VWAP LOST", pretrigger_text("VWAP", price_m5 - vwap_m5, atr_m1))
+        return blocked_signal(branch_name, "M15 EMA MIXED", pretrigger_text("M15", abs(ema50_m15 - ema200_m15), atr_m15))
+    if long_trend:
+        if not long_pullback:
+            return blocked_signal(branch_name, "NO PULLBACK", pretrigger_text("PB", low_ref - (ema50_m1.iloc[-1] + atr_m1 * pullback_top), atr_m1))
+        if not long_confirm:
+            return blocked_signal(branch_name, "NO BULL CONFIRM", pretrigger_text("CONF", (recent_high - atr_m1 * confirm_pad) - last["close"], atr_m1))
+        if not strong_body:
+            return blocked_signal(branch_name, "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * body_floor - body, atr_m1))
+        if not clean_long:
+            return blocked_signal(branch_name, "UPPER WICK HEAVY", pretrigger_text("WICK", wick_up - max(body * wick_ratio, atr_m1 * wick_atr), atr_m1))
+        return blocked_signal(branch_name, "RSI BLOCKED", f"RSI {round(rsi.iloc[-1], 1)}")
+    if not short_pullback:
+        return blocked_signal(branch_name, "NO PULLBACK", pretrigger_text("PB", (ema50_m1.iloc[-1] - atr_m1 * pullback_top) - high_ref, atr_m1))
+    if not short_confirm:
+        return blocked_signal(branch_name, "NO BEAR CONFIRM", pretrigger_text("CONF", last["close"] - (recent_low + atr_m1 * confirm_pad), atr_m1))
+    if not strong_body:
+        return blocked_signal(branch_name, "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * body_floor - body, atr_m1))
+    if not clean_short:
+        return blocked_signal(branch_name, "LOWER WICK HEAVY", pretrigger_text("WICK", wick_down - max(body * wick_ratio, atr_m1 * wick_atr), atr_m1))
+    return blocked_signal(branch_name, "RSI BLOCKED", f"RSI {round(rsi.iloc[-1], 1)}")
+
+
+def strategy_ger40_top(df, symbol):
+    return strategy_index_top(df, symbol, "GER40_TOP", "GER40")
+
+
+def strategy_uk100_top(df, symbol):
+    return strategy_index_top(df, symbol, "UK100_TOP", "UK100")
+
+
+def strategy_ustech_top(df, symbol):
+    return strategy_index_top(df, symbol, "USTECH_TOP", "USTECH")
+
+
+def strategy_us500_top(df, symbol):
+    return strategy_index_top(df, symbol, "US500_TOP", "US500")
+
+
+def strategy_us30_top(df, symbol):
+    return strategy_index_top(df, symbol, "US30_TOP", "US30")
+
+
+def strategy_jpn225_top(df, symbol):
+    return strategy_index_top(df, symbol, "JPN225_TOP", "JPN225")
+
+
+def strategy_xau_top(df, symbol):
+    return strategy_index_top(df, symbol, "XAU_TOP", "XAUUSD")
+
+
+def strategy_btc_top(df, symbol):
+    return strategy_index_top(df, symbol, "BTC_TOP", "BTCUSD")
+
+
+def strategy_eth_top(df, symbol):
+    return strategy_index_top(df, symbol, "ETH_TOP", "ETHUSD")
+
+
+BREAK_RETEST_TEST_PROFILES = {
+    "XAUUSD": {
+        "session": (13, 3),
+        "spread_mult": (0.42, 0.30),
+        "trend_min": (0.10, 0.20),
+        "vwap_limit": (2.45, 1.85),
+        "lookback": 24,
+        "break_pad": (0.02, 0.04),
+        "retest_top": (0.22, 0.16),
+        "retest_hold": (0.06, 0.04),
+        "confirm_pad": (0.12, 0.06),
+        "break_body": (0.08, 0.11),
+        "body_floor": (0.05, 0.07),
+        "wick_ratio": (1.22, 1.02),
+        "wick_atr": (0.20, 0.14),
+        "base_conf": 76,
+        "boost_conf": 82,
+        "boost_trend": 0.90,
+        "boost_pad": 0.14,
+    },
+    "BTCUSD": {
+        "session": (0, 23),
+        "spread_mult": (0.44, 0.34),
+        "trend_min": (0.12, 0.20),
+        "vwap_limit": (3.00, 2.25),
+        "lookback": 26,
+        "break_pad": (0.01, 0.03),
+        "retest_top": (0.24, 0.18),
+        "retest_hold": (0.06, 0.04),
+        "confirm_pad": (0.12, 0.06),
+        "break_body": (0.07, 0.10),
+        "body_floor": (0.05, 0.07),
+        "wick_ratio": (1.18, 1.00),
+        "wick_atr": (0.18, 0.12),
+        "base_conf": 75,
+        "boost_conf": 81,
+        "boost_trend": 0.78,
+        "boost_pad": 0.16,
+    },
+    "ETHUSD": {
+        "session": (0, 23),
+        "spread_mult": (0.95, 0.76),
+        "trend_min": (0.12, 0.20),
+        "vwap_limit": (3.40, 2.60),
+        "lookback": 26,
+        "break_pad": (0.01, 0.03),
+        "retest_top": (0.24, 0.18),
+        "retest_hold": (0.06, 0.04),
+        "confirm_pad": (0.12, 0.06),
+        "break_body": (0.07, 0.10),
+        "body_floor": (0.05, 0.07),
+        "wick_ratio": (1.20, 1.02),
+        "wick_atr": (0.18, 0.12),
+        "base_conf": 75,
+        "boost_conf": 81,
+        "boost_trend": 0.78,
+        "boost_pad": 0.16,
+    },
+    "JPN225": {
+        "session": (2, 10),
+        "spread_mult": (0.40, 0.30),
+        "trend_min": (0.14, 0.24),
+        "vwap_limit": (2.10, 1.60),
+        "lookback": 22,
+        "break_pad": (0.02, 0.04),
+        "retest_top": (0.18, 0.12),
+        "retest_hold": (0.04, 0.03),
+        "confirm_pad": (0.10, 0.05),
+        "break_body": (0.08, 0.11),
+        "body_floor": (0.05, 0.07),
+        "wick_ratio": (1.18, 0.98),
+        "wick_atr": (0.18, 0.12),
+        "base_conf": 76,
+        "boost_conf": 81,
+        "boost_trend": 0.86,
+        "boost_pad": 0.12,
+    },
+    "US30": {
+        "session": (13, 23),
+        "spread_mult": (0.38, 0.28),
+        "trend_min": (0.16, 0.26),
+        "vwap_limit": (2.25, 1.70),
+        "lookback": 24,
+        "break_pad": (0.02, 0.04),
+        "retest_top": (0.18, 0.12),
+        "retest_hold": (0.05, 0.03),
+        "confirm_pad": (0.10, 0.05),
+        "break_body": (0.08, 0.11),
+        "body_floor": (0.05, 0.07),
+        "wick_ratio": (1.18, 0.98),
+        "wick_atr": (0.18, 0.12),
+        "base_conf": 76,
+        "boost_conf": 81,
+        "boost_trend": 0.92,
+        "boost_pad": 0.12,
+    },
+}
+
+RECLAIM_TEST_PROFILES = {
+    "XAUUSD": {
+        "session": (13, 3),
+        "spread_mult": (0.36, 0.26),
+        "trend_min": (0.10, 0.18),
+        "m15_min": (0.08, 0.14),
+        "vwap_limit": (2.40, 1.80),
+        "pullback_top": (0.12, 0.09),
+        "pullback_bottom": (0.20, 0.14),
+        "reclaim_pad": (0.02, 0.01),
+        "confirm_pad": (0.14, 0.08),
+        "body_floor": (0.045, 0.06),
+        "wick_ratio": (1.24, 1.04),
+        "wick_atr": (0.20, 0.14),
+        "recent_bars": 8,
+        "rsi_long": (50, 76),
+        "rsi_short": (24, 50),
+        "boost_rsi": (58, 42),
+        "base_conf": 75,
+        "boost_conf": 81,
+        "boost_pad": 0.10,
+    },
+    "BTCUSD": {
+        "session": (0, 23),
+        "spread_mult": (0.42, 0.32),
+        "trend_min": (0.12, 0.18),
+        "m15_min": (0.10, 0.16),
+        "vwap_limit": (2.90, 2.20),
+        "pullback_top": (0.14, 0.10),
+        "pullback_bottom": (0.22, 0.16),
+        "reclaim_pad": (0.02, 0.01),
+        "confirm_pad": (0.12, 0.06),
+        "body_floor": (0.04, 0.055),
+        "wick_ratio": (1.18, 1.00),
+        "wick_atr": (0.18, 0.12),
+        "recent_bars": 8,
+        "rsi_long": (50, 78),
+        "rsi_short": (22, 50),
+        "boost_rsi": (58, 42),
+        "base_conf": 75,
+        "boost_conf": 81,
+        "boost_pad": 0.08,
+    },
+    "ETHUSD": {
+        "session": (0, 23),
+        "spread_mult": (0.92, 0.74),
+        "trend_min": (0.12, 0.18),
+        "m15_min": (0.10, 0.16),
+        "vwap_limit": (3.30, 2.55),
+        "pullback_top": (0.14, 0.10),
+        "pullback_bottom": (0.22, 0.16),
+        "reclaim_pad": (0.02, 0.01),
+        "confirm_pad": (0.12, 0.06),
+        "body_floor": (0.04, 0.055),
+        "wick_ratio": (1.20, 1.02),
+        "wick_atr": (0.18, 0.12),
+        "recent_bars": 8,
+        "rsi_long": (50, 78),
+        "rsi_short": (22, 50),
+        "boost_rsi": (58, 42),
+        "base_conf": 75,
+        "boost_conf": 81,
+        "boost_pad": 0.08,
+    },
+    "JPN225": {
+        "session": (2, 10),
+        "spread_mult": (0.38, 0.28),
+        "trend_min": (0.14, 0.22),
+        "m15_min": (0.12, 0.18),
+        "vwap_limit": (2.10, 1.55),
+        "pullback_top": (0.14, 0.10),
+        "pullback_bottom": (0.22, 0.16),
+        "reclaim_pad": (0.02, 0.01),
+        "confirm_pad": (0.12, 0.06),
+        "body_floor": (0.05, 0.06),
+        "wick_ratio": (1.18, 0.98),
+        "wick_atr": (0.18, 0.12),
+        "recent_bars": 7,
+        "rsi_long": (50, 77),
+        "rsi_short": (23, 50),
+        "boost_rsi": (57, 43),
+        "base_conf": 76,
+        "boost_conf": 81,
+        "boost_pad": 0.08,
+    },
+    "US30": {
+        "session": (13, 23),
+        "spread_mult": (0.36, 0.26),
+        "trend_min": (0.16, 0.24),
+        "m15_min": (0.14, 0.20),
+        "vwap_limit": (2.20, 1.60),
+        "pullback_top": (0.14, 0.10),
+        "pullback_bottom": (0.22, 0.16),
+        "reclaim_pad": (0.02, 0.01),
+        "confirm_pad": (0.12, 0.06),
+        "body_floor": (0.05, 0.06),
+        "wick_ratio": (1.18, 0.98),
+        "wick_atr": (0.18, 0.12),
+        "recent_bars": 7,
+        "rsi_long": (50, 78),
+        "rsi_short": (22, 50),
+        "boost_rsi": (58, 42),
+        "base_conf": 76,
+        "boost_conf": 81,
+        "boost_pad": 0.08,
+    },
+}
+
+
+def strategy_break_retest_profiled(df, symbol, branch_name, family):
+    profile = BREAK_RETEST_TEST_PROFILES[family]
+    if is_crypto_family(family):
+        if not crypto_enabled:
+            return blocked_signal(branch_name, "CRYPTO OFF")
+    elif not scalping_enabled:
+        return blocked_signal(branch_name, "SCALP OFF")
+
+    hour = get_broker_hour()
+    session_start, session_end = profile["session"]
+    if not _session_open(hour, session_start, session_end):
+        return blocked_signal(branch_name, "OUT SESSION")
+
+    attack = is_attack_runtime()
+    df_m15 = get_m15_cached(symbol)
+    if df_m15 is None or len(df_m15) < 60 or len(df) < 80:
+        return blocked_signal(branch_name, "NO DATA")
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return blocked_signal(branch_name, "NO TICK")
+
+    atr = df["atr"].iloc[-1]
+    if atr <= 0:
+        return blocked_signal(branch_name, "NO ATR")
+
+    spread = tick.ask - tick.bid
+    spread_limit = atr * (profile["spread_mult"][0] if attack else profile["spread_mult"][1])
+    if spread > spread_limit:
+        return blocked_signal(branch_name, "SPREAD HIGH")
+
+    trend_strength = compute_trend_strength(df)
+    trend_min = profile["trend_min"][0] if attack else profile["trend_min"][1]
+    if detect_market_regime(df) == "CHAOS" or trend_strength < trend_min:
+        return blocked_signal(branch_name, "REGIME RANGE", f"STR {round(trend_strength, 2)}")
+
+    ema50 = df["close"].ewm(span=50).mean()
+    ema50_m15 = df_m15["close"].ewm(span=50).mean().iloc[-1]
+    price = df["close"].iloc[-1]
+    vwap = df["vwap"].iloc[-1]
+    vwap_limit = profile["vwap_limit"][0] if attack else profile["vwap_limit"][1]
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    breakout_ref = df.iloc[-profile["lookback"]:-3] if len(df) >= (profile["lookback"] + 4) else df.iloc[:-3]
+    if len(breakout_ref) < 8:
+        return blocked_signal(branch_name, "NO STRUCTURE")
+
+    resistance = breakout_ref["high"].max()
+    support = breakout_ref["low"].min()
+    body = abs(last["close"] - last["open"])
+    breakout_body = abs(prev["close"] - prev["open"])
+    wick_up = last["high"] - max(last["open"], last["close"])
+    wick_down = min(last["open"], last["close"]) - last["low"]
+    clean_long = wick_up <= max(body * (profile["wick_ratio"][0] if attack else profile["wick_ratio"][1]), atr * (profile["wick_atr"][0] if attack else profile["wick_atr"][1]))
+    clean_short = wick_down <= max(body * (profile["wick_ratio"][0] if attack else profile["wick_ratio"][1]), atr * (profile["wick_atr"][0] if attack else profile["wick_atr"][1]))
+    strong_break = breakout_body >= atr * (profile["break_body"][0] if attack else profile["break_body"][1])
+    strong_confirm = body >= atr * (profile["body_floor"][0] if attack else profile["body_floor"][1])
+
+    break_pad = profile["break_pad"][0] if attack else profile["break_pad"][1]
+    retest_top = profile["retest_top"][0] if attack else profile["retest_top"][1]
+    retest_hold = profile["retest_hold"][0] if attack else profile["retest_hold"][1]
+    confirm_pad = profile["confirm_pad"][0] if attack else profile["confirm_pad"][1]
+
+    long_break = prev["close"] >= resistance + atr * break_pad and prev["close"] > prev["open"] and strong_break
+    short_break = prev["close"] <= support - atr * break_pad and prev["close"] < prev["open"] and strong_break
+    long_retest = last["low"] <= resistance + atr * retest_top and last["close"] >= resistance - atr * retest_hold
+    short_retest = last["high"] >= support - atr * retest_top and last["close"] <= support + atr * retest_hold
+    long_confirm = last["close"] > last["open"] and last["close"] >= max(resistance, prev["high"] - atr * confirm_pad)
+    short_confirm = last["close"] < last["open"] and last["close"] <= min(support, prev["low"] + atr * confirm_pad)
+    m15_bias_up = df_m15["close"].iloc[-1] > ema50_m15
+    m15_bias_down = df_m15["close"].iloc[-1] < ema50_m15
+
+    if (
+        price > ema50.iloc[-1]
+        and price > vwap
+        and m15_bias_up
+        and abs(price - vwap) <= atr * vwap_limit
+        and long_break
+        and long_retest
+        and long_confirm
+        and strong_confirm
+        and clean_long
+    ):
+        conf = profile["base_conf"]
+        if trend_strength > profile["boost_trend"] and price >= resistance + atr * profile["boost_pad"]:
+            conf = profile["boost_conf"]
+        return {"signal": "BUY", "confidence": conf, "name": branch_name}
+
+    if (
+        price < ema50.iloc[-1]
+        and price < vwap
+        and m15_bias_down
+        and abs(price - vwap) <= atr * vwap_limit
+        and short_break
+        and short_retest
+        and short_confirm
+        and strong_confirm
+        and clean_short
+    ):
+        conf = profile["base_conf"]
+        if trend_strength > profile["boost_trend"] and price <= support - atr * profile["boost_pad"]:
+            conf = profile["boost_conf"]
+        return {"signal": "SELL", "confidence": conf, "name": branch_name}
+
+    if price > ema50.iloc[-1] and not m15_bias_up:
+        return blocked_signal(branch_name, "M15 NOT ALIGNED", pretrigger_text("EMA50", ema50_m15 - df_m15["close"].iloc[-1], atr))
+    if price < ema50.iloc[-1] and not m15_bias_down:
+        return blocked_signal(branch_name, "M15 NOT ALIGNED", pretrigger_text("EMA50", df_m15["close"].iloc[-1] - ema50_m15, atr))
+    if abs(price - vwap) > atr * vwap_limit:
+        return blocked_signal(branch_name, "VWAP TOO FAR", pretrigger_text("VWAP", abs(price - vwap) - atr * vwap_limit, atr))
+    if price > ema50.iloc[-1]:
+        if not long_break:
+            return blocked_signal(branch_name, "NO BREAKOUT", pretrigger_text("BRK", resistance - prev["close"], atr))
+        if not long_retest:
+            return blocked_signal(branch_name, "NO RETEST", pretrigger_text("RET", last["low"] - (resistance + atr * retest_top), atr))
+        if not long_confirm:
+            return blocked_signal(branch_name, "NO BULL CONFIRM", pretrigger_text("CONF", max(resistance - last["close"], prev["high"] - last["close"]), atr))
+        if not strong_confirm:
+            return blocked_signal(branch_name, "WEAK BODY", pretrigger_text("BODY", atr * (profile["body_floor"][0] if attack else profile["body_floor"][1]) - body, atr))
+        if not clean_long:
+            return blocked_signal(branch_name, "UPPER WICK HEAVY", pretrigger_text("WICK", wick_up - max(body * (profile["wick_ratio"][0] if attack else profile["wick_ratio"][1]), atr * (profile["wick_atr"][0] if attack else profile["wick_atr"][1])), atr))
+    if price < ema50.iloc[-1]:
+        if not short_break:
+            return blocked_signal(branch_name, "NO BREAKDOWN", pretrigger_text("BRK", prev["close"] - support, atr))
+        if not short_retest:
+            return blocked_signal(branch_name, "NO RETEST", pretrigger_text("RET", (support - atr * retest_top) - last["high"], atr))
+        if not short_confirm:
+            return blocked_signal(branch_name, "NO BEAR CONFIRM", pretrigger_text("CONF", max(last["close"] - support, last["close"] - prev["low"]), atr))
+        if not strong_confirm:
+            return blocked_signal(branch_name, "WEAK BODY", pretrigger_text("BODY", atr * (profile["body_floor"][0] if attack else profile["body_floor"][1]) - body, atr))
+        if not clean_short:
+            return blocked_signal(branch_name, "LOWER WICK HEAVY", pretrigger_text("WICK", wick_down - max(body * (profile["wick_ratio"][0] if attack else profile["wick_ratio"][1]), atr * (profile["wick_atr"][0] if attack else profile["wick_atr"][1])), atr))
+    return blocked_signal(branch_name, "TREND MIXED", pretrigger_text("EMA", abs(price - ema50.iloc[-1]), atr))
+
+
+def strategy_reclaim_profiled(df, symbol, branch_name, family):
+    profile = RECLAIM_TEST_PROFILES[family]
+    if is_crypto_family(family):
+        if not crypto_enabled:
+            return blocked_signal(branch_name, "CRYPTO OFF")
+    elif not scalping_enabled:
+        return blocked_signal(branch_name, "SCALP OFF")
+
+    hour = get_broker_hour()
+    session_start, session_end = profile["session"]
+    if not _session_open(hour, session_start, session_end):
+        return blocked_signal(branch_name, "OUT SESSION")
+
+    df_m1 = get_data(symbol, mt5.TIMEFRAME_M1, 220)
+    df_m15 = get_m15_cached(symbol)
+    if df_m1 is None or len(df_m1) < 180:
+        return blocked_signal(branch_name, "NO M1 DATA")
+    if df_m15 is None or len(df_m15) < 60:
+        return blocked_signal(branch_name, "NO M15 DATA")
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return blocked_signal(branch_name, "NO TICK")
+
+    attack = is_attack_runtime()
+    close_m1 = df_m1["close"]
+    ema9 = close_m1.ewm(span=9).mean()
+    ema21 = close_m1.ewm(span=21).mean()
+    ema55 = close_m1.ewm(span=55).mean()
+    rsi = compute_rsi(close_m1, 14)
+    atr_m1 = df_m1["atr"].iloc[-1]
+    atr_m15 = df_m15["atr"].iloc[-1]
+    if atr_m1 <= 0 or atr_m15 <= 0:
+        return blocked_signal(branch_name, "NO ATR")
+
+    spread = tick.ask - tick.bid
+    spread_limit = atr_m1 * (profile["spread_mult"][0] if attack else profile["spread_mult"][1])
+    if spread > spread_limit:
+        return blocked_signal(branch_name, "SPREAD HIGH")
+
+    price_m5 = df["close"].iloc[-1]
+    ema20_m5 = df["close"].ewm(span=20).mean().iloc[-1]
+    ema50_m5 = df["close"].ewm(span=50).mean().iloc[-1]
+    vwap_m5 = df["vwap"].iloc[-1]
+    vwap_dist = abs(price_m5 - vwap_m5)
+    trend_strength = compute_trend_strength(df)
+
+    m15_close = df_m15["close"].iloc[-1]
+    ema20_m15 = df_m15["close"].ewm(span=20).mean().iloc[-1]
+    ema50_m15 = df_m15["close"].ewm(span=50).mean().iloc[-1]
+    m15_strength = abs(ema20_m15 - ema50_m15) / max(atr_m15, 1e-6)
+
+    last = df_m1.iloc[-1]
+    prev = df_m1.iloc[-2]
+    recent_high = df_m1["high"].tail(profile["recent_bars"]).max()
+    recent_low = df_m1["low"].tail(profile["recent_bars"]).min()
+    body = abs(last["close"] - last["open"])
+    wick_up = last["high"] - max(last["open"], last["close"])
+    wick_down = min(last["open"], last["close"]) - last["low"]
+    strong_body = body >= atr_m1 * (profile["body_floor"][0] if attack else profile["body_floor"][1])
+    clean_long = wick_up <= max(body * (profile["wick_ratio"][0] if attack else profile["wick_ratio"][1]), atr_m1 * (profile["wick_atr"][0] if attack else profile["wick_atr"][1]))
+    clean_short = wick_down <= max(body * (profile["wick_ratio"][0] if attack else profile["wick_ratio"][1]), atr_m1 * (profile["wick_atr"][0] if attack else profile["wick_atr"][1]))
+
+    trend_min = profile["trend_min"][0] if attack else profile["trend_min"][1]
+    m15_min = profile["m15_min"][0] if attack else profile["m15_min"][1]
+    vwap_limit = profile["vwap_limit"][0] if attack else profile["vwap_limit"][1]
+    pullback_top = profile["pullback_top"][0] if attack else profile["pullback_top"][1]
+    pullback_bottom = profile["pullback_bottom"][0] if attack else profile["pullback_bottom"][1]
+    reclaim_pad = profile["reclaim_pad"][0] if attack else profile["reclaim_pad"][1]
+    confirm_pad = profile["confirm_pad"][0] if attack else profile["confirm_pad"][1]
+
+    long_trend = (
+        ema20_m5 > ema50_m5
+        and ema9.iloc[-1] > ema21.iloc[-1] > ema55.iloc[-1]
+        and ema20_m15 > ema50_m15
+        and price_m5 > vwap_m5
+        and trend_strength >= trend_min
+        and m15_strength >= m15_min
+        and vwap_dist <= atr_m1 * vwap_limit
+    )
+    short_trend = (
+        ema20_m5 < ema50_m5
+        and ema9.iloc[-1] < ema21.iloc[-1] < ema55.iloc[-1]
+        and ema20_m15 < ema50_m15
+        and price_m5 < vwap_m5
+        and trend_strength >= trend_min
+        and m15_strength >= m15_min
+        and vwap_dist <= atr_m1 * vwap_limit
+    )
+
+    low_ref = min(prev["low"], last["low"])
+    high_ref = max(prev["high"], last["high"])
+    long_pullback = low_ref <= ema21.iloc[-1] + atr_m1 * pullback_top and low_ref >= ema21.iloc[-1] - atr_m1 * pullback_bottom
+    short_pullback = high_ref >= ema21.iloc[-1] - atr_m1 * pullback_top and high_ref <= ema21.iloc[-1] + atr_m1 * pullback_bottom
+    long_confirm = (
+        last["close"] > last["open"]
+        and last["close"] > ema9.iloc[-1] + atr_m1 * reclaim_pad
+        and last["close"] >= recent_high - atr_m1 * confirm_pad
+    )
+    short_confirm = (
+        last["close"] < last["open"]
+        and last["close"] < ema9.iloc[-1] - atr_m1 * reclaim_pad
+        and last["close"] <= recent_low + atr_m1 * confirm_pad
+    )
+
+    rsi_long_min, rsi_long_max = profile["rsi_long"]
+    rsi_short_min, rsi_short_max = profile["rsi_short"]
+    boost_rsi_long, boost_rsi_short = profile["boost_rsi"]
+
+    if long_trend and long_pullback and long_confirm and strong_body and clean_long and rsi_long_min <= rsi.iloc[-1] <= rsi_long_max:
+        conf = profile["base_conf"]
+        if rsi.iloc[-1] >= boost_rsi_long and last["close"] >= ema9.iloc[-1] + atr_m1 * profile["boost_pad"]:
+            conf = profile["boost_conf"]
+        return {"signal": "BUY", "confidence": conf, "name": branch_name, "execution_df": df_m1}
+
+    if short_trend and short_pullback and short_confirm and strong_body and clean_short and rsi_short_min <= rsi.iloc[-1] <= rsi_short_max:
+        conf = profile["base_conf"]
+        if rsi.iloc[-1] <= boost_rsi_short and last["close"] <= ema9.iloc[-1] - atr_m1 * profile["boost_pad"]:
+            conf = profile["boost_conf"]
+        return {"signal": "SELL", "confidence": conf, "name": branch_name, "execution_df": df_m1}
+
+    if not long_trend and not short_trend:
+        if m15_strength < m15_min:
+            return blocked_signal(branch_name, "M15 WEAK", f"STR {round(m15_strength, 2)}")
+        if trend_strength < trend_min:
+            return blocked_signal(branch_name, "TREND WEAK", f"STR {round(trend_strength, 2)}")
+        if vwap_dist > atr_m1 * vwap_limit:
+            return blocked_signal(branch_name, "VWAP TOO FAR", pretrigger_text("VWAP", vwap_dist - atr_m1 * vwap_limit, atr_m1))
+        return blocked_signal(branch_name, "EMA STACK MISS", pretrigger_text("STACK", abs(ema21.iloc[-1] - ema55.iloc[-1]), atr_m1))
+    if long_trend:
+        if not long_pullback:
+            return blocked_signal(branch_name, "NO PULLBACK", pretrigger_text("PB", low_ref - (ema21.iloc[-1] + atr_m1 * pullback_top), atr_m1))
+        if not long_confirm:
+            return blocked_signal(branch_name, "NO BULL CONFIRM", pretrigger_text("CONF", (recent_high - atr_m1 * confirm_pad) - last["close"], atr_m1))
+        if not strong_body:
+            return blocked_signal(branch_name, "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (profile["body_floor"][0] if attack else profile["body_floor"][1]) - body, atr_m1))
+        if not clean_long:
+            return blocked_signal(branch_name, "UPPER WICK HEAVY", pretrigger_text("WICK", wick_up - max(body * (profile["wick_ratio"][0] if attack else profile["wick_ratio"][1]), atr_m1 * (profile["wick_atr"][0] if attack else profile["wick_atr"][1])), atr_m1))
+        return blocked_signal(branch_name, "RSI BLOCKED", f"RSI {round(rsi.iloc[-1], 1)}")
+    if not short_pullback:
+        return blocked_signal(branch_name, "NO PULLBACK", pretrigger_text("PB", (ema21.iloc[-1] - atr_m1 * pullback_top) - high_ref, atr_m1))
+    if not short_confirm:
+        return blocked_signal(branch_name, "NO BEAR CONFIRM", pretrigger_text("CONF", last["close"] - (recent_low + atr_m1 * confirm_pad), atr_m1))
+    if not strong_body:
+        return blocked_signal(branch_name, "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (profile["body_floor"][0] if attack else profile["body_floor"][1]) - body, atr_m1))
+    if not clean_short:
+        return blocked_signal(branch_name, "LOWER WICK HEAVY", pretrigger_text("WICK", wick_down - max(body * (profile["wick_ratio"][0] if attack else profile["wick_ratio"][1]), atr_m1 * (profile["wick_atr"][0] if attack else profile["wick_atr"][1])), atr_m1))
+    return blocked_signal(branch_name, "RSI BLOCKED", f"RSI {round(rsi.iloc[-1], 1)}")
+
+
+def strategy_xau_break_retest(df, symbol):
+    return strategy_break_retest_profiled(df, symbol, "XAU_BREAK_RETEST", "XAUUSD")
+
+
+def strategy_xau_vwap_reclaim(df, symbol):
+    return strategy_reclaim_profiled(df, symbol, "XAU_VWAP_RECLAIM", "XAUUSD")
+
+
+def strategy_btc_break_retest(df, symbol):
+    return strategy_break_retest_profiled(df, symbol, "BTC_BREAK_RETEST", "BTCUSD")
+
+
+def strategy_btc_vwap_reclaim(df, symbol):
+    return strategy_reclaim_profiled(df, symbol, "BTC_VWAP_RECLAIM", "BTCUSD")
+
+
+def strategy_eth_break_retest(df, symbol):
+    return strategy_break_retest_profiled(df, symbol, "ETH_BREAK_RETEST", "ETHUSD")
+
+
+def strategy_eth_vwap_reclaim(df, symbol):
+    return strategy_reclaim_profiled(df, symbol, "ETH_VWAP_RECLAIM", "ETHUSD")
+
+
+def strategy_jpn225_vwap_trend(df, symbol):
+    return strategy_reclaim_profiled(df, symbol, "JPN225_VWAP_TREND", "JPN225")
+
+
+def strategy_jpn225_break_retest(df, symbol):
+    return strategy_break_retest_profiled(df, symbol, "JPN225_BREAK_RETEST", "JPN225")
+
+
+def strategy_us30_vwap_trend(df, symbol):
+    return strategy_reclaim_profiled(df, symbol, "US30_VWAP_TREND", "US30")
+
+
+def strategy_us30_break_retest(df, symbol):
+    return strategy_break_retest_profiled(df, symbol, "US30_BREAK_RETEST", "US30")
+
+
+SANTO_GRAAL_PROFILES = {
+    "USTECH": {
+        "display": "US100",
+        "session": (13, 23),
+        "adx_min": 29.0,
+        "d1_adx_min": 24.0,
+        "adx_high_exit": 42.0,
+        "ema_pad": 0.05,
+        "pullback_depth": 0.34,
+        "confirm_pad": 0.08,
+        "sl_buffer": 0.10,
+        "base_conf": 77,
+        "boost_conf": 84,
+        "boost_adx": 38.0,
+        "permissive": True,
+    },
+    "US500": {
+        "display": "US500",
+        "session": (13, 23),
+        "adx_min": 31.0,
+        "d1_adx_min": 26.0,
+        "adx_high_exit": 44.0,
+        "ema_pad": 0.04,
+        "pullback_depth": 0.28,
+        "confirm_pad": 0.06,
+        "sl_buffer": 0.09,
+        "base_conf": 75,
+        "boost_conf": 82,
+        "boost_adx": 39.0,
+        "permissive": False,
+    },
+    "GER40": {
+        "display": "DAX",
+        "session": (8, 18),
+        "adx_min": 31.0,
+        "d1_adx_min": 26.0,
+        "adx_high_exit": 44.0,
+        "ema_pad": 0.04,
+        "pullback_depth": 0.28,
+        "confirm_pad": 0.06,
+        "sl_buffer": 0.09,
+        "base_conf": 75,
+        "boost_conf": 82,
+        "boost_adx": 39.0,
+        "permissive": False,
+    },
+    "BTCUSD": {
+        "display": "BTC",
+        "session": (0, 23),
+        "adx_min": 28.0,
+        "d1_adx_min": 22.0,
+        "adx_high_exit": 40.0,
+        "ema_pad": 0.06,
+        "pullback_depth": 0.38,
+        "confirm_pad": 0.10,
+        "sl_buffer": 0.12,
+        "base_conf": 78,
+        "boost_conf": 85,
+        "boost_adx": 36.0,
+        "permissive": True,
+    },
+}
+
+
+def format_santo_graal_signal_details(details):
+    if details.get("summary"):
+        return details["summary"]
+    return (
+        f"{details['instrument']} {details['direction']} | {details['reason']} | "
+        f"EMA20 {details['ema20_h4']:.2f} | ADX14 {details['adx14_h4']:.1f} | "
+        f"entry {details['entry_price']:.2f} | SL {details['stop_loss']:.2f} | "
+        f"{details['take_profit']} | D1 {details['trend_d1']} | H4 {details['trend_h4']}"
+    )
+
+
+def get_santo_graal_exit_reason(symbol, strategy_cfg, signal):
+    family = strategy_cfg.get("symbol_family")
+    profile = SANTO_GRAAL_PROFILES.get(family)
+    if not profile:
+        return None
+
+    df_h4 = get_h4_cached(symbol)
+    df_d1 = get_d1_cached(symbol)
+    if df_h4 is None or df_d1 is None or len(df_h4) < 40 or len(df_d1) < 40:
+        return None
+
+    ema20_h4 = df_h4["close"].ewm(span=20).mean()
+    ema20_d1 = df_d1["close"].ewm(span=20).mean()
+    adx_h4, _, _ = compute_adx(df_h4, 14)
+    adx_d1, _, _ = compute_adx(df_d1, 14)
+
+    last_h4 = df_h4.iloc[-2]
+    prev_h4 = df_h4.iloc[-3]
+    last_d1 = df_d1.iloc[-2]
+
+    adx_h4_now = float(adx_h4.iloc[-2])
+    adx_h4_prev = float(adx_h4.iloc[-3])
+    adx_d1_now = float(adx_d1.iloc[-2])
+    adx_d1_prev = float(adx_d1.iloc[-3])
+
+    if signal == "BUY":
+        if adx_h4_prev >= profile["adx_high_exit"] and adx_h4_now < adx_h4_prev and last_h4["close"] < ema20_h4.iloc[-2]:
+            return "ADX rollover + H4 under EMA20"
+        if last_h4["close"] < ema20_h4.iloc[-2] and prev_h4["close"] < ema20_h4.iloc[-3]:
+            return "H4 close below EMA20"
+        if adx_d1_prev >= profile["adx_high_exit"] and adx_d1_now < adx_d1_prev and last_d1["close"] < ema20_d1.iloc[-2]:
+            return "D1 ADX rollover"
+    else:
+        if adx_h4_prev >= profile["adx_high_exit"] and adx_h4_now < adx_h4_prev and last_h4["close"] > ema20_h4.iloc[-2]:
+            return "ADX rollover + H4 over EMA20"
+        if last_h4["close"] > ema20_h4.iloc[-2] and prev_h4["close"] > ema20_h4.iloc[-3]:
+            return "H4 close above EMA20"
+        if adx_d1_prev >= profile["adx_high_exit"] and adx_d1_now < adx_d1_prev and last_d1["close"] > ema20_d1.iloc[-2]:
+            return "D1 ADX rollover"
+    return None
+
+
+def strategy_santo_graal(df, symbol, branch_name, family):
+    profile = SANTO_GRAAL_PROFILES[family]
+    if is_crypto_family(family) and not crypto_enabled:
+        return blocked_signal(branch_name, "CRYPTO OFF")
+
+    hour = get_broker_hour()
+    session_start, session_end = profile["session"]
+    if not _session_open(hour, session_start, session_end):
+        return blocked_signal(branch_name, "OUT SESSION")
+
+    df_h4 = get_h4_cached(symbol)
+    df_d1 = get_d1_cached(symbol)
+    if df_h4 is None or len(df_h4) < 60:
+        return blocked_signal(branch_name, "NO H4 DATA")
+    if df_d1 is None or len(df_d1) < 60:
+        return blocked_signal(branch_name, "NO D1 DATA")
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return blocked_signal(branch_name, "NO TICK")
+
+    ema20_h4 = df_h4["close"].ewm(span=20).mean()
+    ema20_d1 = df_d1["close"].ewm(span=20).mean()
+    adx_h4, plus_di_h4, minus_di_h4 = compute_adx(df_h4, 14)
+    adx_d1, plus_di_d1, minus_di_d1 = compute_adx(df_d1, 14)
+    atr_h4 = float(df_h4["atr"].iloc[-2])
+    if atr_h4 <= 0:
+        return blocked_signal(branch_name, "NO ATR")
+
+    current_h4 = df_h4.iloc[-1]
+    confirm = df_h4.iloc[-2]
+    pullback = df_h4.iloc[-3]
+    anchor = df_h4.iloc[-4]
+
+    adx_h4_now = float(adx_h4.iloc[-2])
+    adx_h4_prev = float(adx_h4.iloc[-3])
+    adx_d1_now = float(adx_d1.iloc[-2])
+    adx_d1_prev = float(adx_d1.iloc[-3])
+
+    if adx_h4_now < 15 or adx_d1_now < 15:
+        return blocked_signal(branch_name, "ADX TOO LOW", f"H4 {adx_h4_now:.1f} | D1 {adx_d1_now:.1f}")
+    if adx_h4_now <= adx_h4_prev:
+        return blocked_signal(branch_name, "ADX FLAT", f"H4 {adx_h4_prev:.1f}->{adx_h4_now:.1f}")
+    if adx_h4_now < profile["adx_min"]:
+        return blocked_signal(branch_name, "ADX BELOW 30", f"H4 {adx_h4_now:.1f}")
+
+    d1_up = (
+        df_d1["close"].iloc[-2] > ema20_d1.iloc[-2]
+        and plus_di_d1.iloc[-2] >= minus_di_d1.iloc[-2]
+        and adx_d1_now >= profile["d1_adx_min"]
+        and adx_d1_now >= adx_d1_prev
+    )
+    d1_down = (
+        df_d1["close"].iloc[-2] < ema20_d1.iloc[-2]
+        and minus_di_d1.iloc[-2] >= plus_di_d1.iloc[-2]
+        and adx_d1_now >= profile["d1_adx_min"]
+        and adx_d1_now >= adx_d1_prev
+    )
+
+    h4_up_context = anchor["close"] > ema20_h4.iloc[-4] and plus_di_h4.iloc[-2] >= minus_di_h4.iloc[-2]
+    h4_down_context = anchor["close"] < ema20_h4.iloc[-4] and minus_di_h4.iloc[-2] >= plus_di_h4.iloc[-2]
+
+    long_pullback = (
+        d1_up
+        and h4_up_context
+        and min(pullback["low"], confirm["low"]) < ema20_h4.iloc[-3]
+        and pullback["high"] > ema20_h4.iloc[-3]
+        and pullback["low"] >= ema20_h4.iloc[-3] - atr_h4 * profile["pullback_depth"]
+    )
+    short_pullback = (
+        d1_down
+        and h4_down_context
+        and max(pullback["high"], confirm["high"]) > ema20_h4.iloc[-3]
+        and pullback["low"] < ema20_h4.iloc[-3]
+        and pullback["high"] <= ema20_h4.iloc[-3] + atr_h4 * profile["pullback_depth"]
+    )
+
+    long_confirm = (
+        confirm["close"] > confirm["open"]
+        and confirm["close"] > ema20_h4.iloc[-2] + atr_h4 * profile["ema_pad"]
+        and confirm["close"] >= pullback["high"] - atr_h4 * profile["confirm_pad"]
+        and current_h4["time"] > confirm["time"]
+    )
+    short_confirm = (
+        confirm["close"] < confirm["open"]
+        and confirm["close"] < ema20_h4.iloc[-2] - atr_h4 * profile["ema_pad"]
+        and confirm["close"] <= pullback["low"] + atr_h4 * profile["confirm_pad"]
+        and current_h4["time"] > confirm["time"]
+    )
+
+    if not d1_up and not d1_down:
+        return blocked_signal(branch_name, "D1 TREND MIXED", f"ADX {adx_d1_now:.1f}")
+
+    entry_price = tick.ask if d1_up else tick.bid
+    signal_key = f"{family}|{confirm['time'].isoformat()}|{'BUY' if d1_up else 'SELL'}"
+    last_signal_key = strategy_runtime.get(branch_name, {}).get("last_signal_key_by_symbol", {}).get(symbol)
+    if last_signal_key == signal_key:
+        return blocked_signal(branch_name, "DUPLICATE LEG", confirm["time"].strftime("%Y-%m-%d %H:%M"))
+
+    if long_pullback and long_confirm:
+        sl_price = min(pullback["low"], confirm["low"]) - atr_h4 * profile["sl_buffer"]
+        conf = profile["boost_conf"] if adx_h4_now >= profile["boost_adx"] else profile["base_conf"]
+        details = {
+            "instrument": profile["display"],
+            "direction": "LONG",
+            "reason": "H4 pullback through EMA20 with bullish reclaim in D1 uptrend",
+            "ema20_h4": float(ema20_h4.iloc[-2]),
+            "adx14_h4": adx_h4_now,
+            "entry_price": float(entry_price),
+            "stop_loss": float(sl_price),
+            "take_profit": "1R partial + trailing while ADX strong",
+            "trend_d1": f"UP | EMA20 {ema20_d1.iloc[-2]:.2f} | ADX {adx_d1_now:.1f}",
+            "trend_h4": f"UP | EMA20 {ema20_h4.iloc[-2]:.2f} | ADX {adx_h4_now:.1f}",
+        }
+        return {
+            "signal": "BUY",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_h4,
+            "sl_price": round(sl_price, 5),
+            "signal_key": signal_key,
+            "signal_details": details,
+        }
+
+    if short_pullback and short_confirm:
+        sl_price = max(pullback["high"], confirm["high"]) + atr_h4 * profile["sl_buffer"]
+        conf = profile["boost_conf"] if adx_h4_now >= profile["boost_adx"] else profile["base_conf"]
+        details = {
+            "instrument": profile["display"],
+            "direction": "SHORT",
+            "reason": "H4 pullback through EMA20 with bearish reclaim in D1 downtrend",
+            "ema20_h4": float(ema20_h4.iloc[-2]),
+            "adx14_h4": adx_h4_now,
+            "entry_price": float(entry_price),
+            "stop_loss": float(sl_price),
+            "take_profit": "1R partial + trailing while ADX strong",
+            "trend_d1": f"DOWN | EMA20 {ema20_d1.iloc[-2]:.2f} | ADX {adx_d1_now:.1f}",
+            "trend_h4": f"DOWN | EMA20 {ema20_h4.iloc[-2]:.2f} | ADX {adx_h4_now:.1f}",
+        }
+        return {
+            "signal": "SELL",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_h4,
+            "sl_price": round(sl_price, 5),
+            "signal_key": signal_key,
+            "signal_details": details,
+        }
+
+    if d1_up and h4_up_context:
+        if not long_pullback:
+            return blocked_signal(branch_name, "NO PULLBACK", pretrigger_text("EMA20", min(pullback["low"], confirm["low"]) - ema20_h4.iloc[-3], atr_h4))
+        return blocked_signal(branch_name, "NO BULL CONFIRM", pretrigger_text("CONF", max(pullback["high"] - confirm["close"], 0.0), atr_h4))
+    if d1_down and h4_down_context:
+        if not short_pullback:
+            return blocked_signal(branch_name, "NO PULLBACK", pretrigger_text("EMA20", ema20_h4.iloc[-3] - max(pullback["high"], confirm["high"]), atr_h4))
+        return blocked_signal(branch_name, "NO BEAR CONFIRM", pretrigger_text("CONF", max(confirm["close"] - pullback["low"], 0.0), atr_h4))
+    return blocked_signal(branch_name, "H4 TREND MIXED", f"H4 ADX {adx_h4_now:.1f}")
+
+
+def strategy_ustech_santo_graal(df, symbol):
+    return strategy_santo_graal(df, symbol, "USTECH_SANTO_GRAAL", "USTECH")
+
+
+def strategy_us500_santo_graal(df, symbol):
+    return strategy_santo_graal(df, symbol, "US500_SANTO_GRAAL", "US500")
+
+
+def strategy_ger40_santo_graal(df, symbol):
+    return strategy_santo_graal(df, symbol, "GER40_SANTO_GRAAL", "GER40")
+
+
+def strategy_btc_santo_graal(df, symbol):
+    return strategy_santo_graal(df, symbol, "BTC_SANTO_GRAAL", "BTCUSD")
+
+
+KUMO_BREAKOUT_PROFILES = {
+    "USTECH": {
+        "display": "US100",
+        "session": (13, 23),
+        "breakout_pad": 0.06,
+        "stop_buffer": 0.10,
+        "max_extension": 1.10,
+        "ao_delta": 0.00,
+        "hold_bars": 1,
+        "require_h4_bias": False,
+        "base_conf": 76,
+        "boost_conf": 82,
+    },
+    "BTCUSD": {
+        "display": "BTC",
+        "session": (0, 23),
+        "breakout_pad": 0.08,
+        "stop_buffer": 0.16,
+        "max_extension": 1.80,
+        "ao_delta": 0.00,
+        "hold_bars": 1,
+        "require_h4_bias": False,
+        "base_conf": 77,
+        "boost_conf": 84,
+    },
+    "ETHUSD": {
+        "display": "ETH",
+        "session": (0, 23),
+        "breakout_pad": 0.08,
+        "stop_buffer": 0.14,
+        "max_extension": 1.55,
+        "ao_delta": 0.00,
+        "hold_bars": 2,
+        "require_h4_bias": False,
+        "base_conf": 76,
+        "boost_conf": 83,
+    },
+}
+
+
+def get_kumo_breakout_exit_reason(symbol, strategy_cfg, signal):
+    family = strategy_cfg.get("symbol_family")
+    profile = KUMO_BREAKOUT_PROFILES.get(family)
+    if not profile:
+        return None
+
+    df_h1 = get_h1_cached(symbol)
+    if df_h1 is None or len(df_h1) < 80:
+        return None
+
+    ao_h1 = compute_awesome_oscillator(df_h1)
+    _, _, kumo_top_h1, kumo_bottom_h1 = compute_kumo_cloud(df_h1, 8, 29, 34, 29)
+    last = df_h1.iloc[-2]
+    prev = df_h1.iloc[-3]
+    atr_h1 = float(df_h1["atr"].iloc[-2] or 0.0)
+    if atr_h1 <= 0:
+        return None
+
+    ao_now = float(ao_h1.iloc[-2])
+    ao_prev = float(ao_h1.iloc[-3])
+    kumo_top = float(kumo_top_h1.iloc[-2])
+    kumo_bottom = float(kumo_bottom_h1.iloc[-2])
+
+    if signal == "BUY":
+        if ao_prev >= 0 and ao_now < 0:
+            return "AO crossed below zero on H1"
+        if last["close"] < kumo_top - atr_h1 * 0.04 and prev["close"] < kumo_top_h1.iloc[-3] - atr_h1 * 0.04:
+            return "price re-entered Kumo on H1"
+    else:
+        if ao_prev <= 0 and ao_now > 0:
+            return "AO crossed above zero on H1"
+        if last["close"] > kumo_bottom + atr_h1 * 0.04 and prev["close"] > kumo_bottom_h1.iloc[-3] + atr_h1 * 0.04:
+            return "price re-entered Kumo on H1"
+    return None
+
+
+def strategy_kumo_breakout(df, symbol, branch_name, family):
+    profile = KUMO_BREAKOUT_PROFILES[family]
+    if is_crypto_family(family):
+        if not crypto_enabled:
+            return blocked_signal(branch_name, "CRYPTO OFF")
+
+    hour = get_broker_hour()
+    session_start, session_end = profile["session"]
+    if not _session_open(hour, session_start, session_end):
+        return blocked_signal(branch_name, "OUT SESSION")
+
+    df_m15 = get_data(symbol, mt5.TIMEFRAME_M15, 260)
+    df_h1 = get_h1_cached(symbol)
+    df_h4 = get_h4_cached(symbol)
+    if df_m15 is None or len(df_m15) < 120:
+        return blocked_signal(branch_name, "NO M15 DATA")
+    if df_h1 is None or len(df_h1) < 80:
+        return blocked_signal(branch_name, "NO H1 DATA")
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return blocked_signal(branch_name, "NO TICK")
+
+    atr_m15 = float(df_m15["atr"].iloc[-2] or 0.0)
+    if atr_m15 <= 0:
+        return blocked_signal(branch_name, "NO ATR")
+
+    ao = compute_awesome_oscillator(df_m15)
+    _, _, kumo_top, kumo_bottom = compute_kumo_cloud(df_m15, 8, 29, 34, 29)
+
+    breakout = df_m15.iloc[-2]
+    prev = df_m15.iloc[-3]
+    current = df_m15.iloc[-1]
+    current_time = current["time"]
+
+    top_now = float(kumo_top.iloc[-2])
+    bottom_now = float(kumo_bottom.iloc[-2])
+    top_prev = float(kumo_top.iloc[-3])
+    bottom_prev = float(kumo_bottom.iloc[-3])
+
+    close_now = float(breakout["close"])
+    close_prev = float(prev["close"])
+    body = abs(float(breakout["close"] - breakout["open"]))
+    extension = abs(close_now - top_now) if close_now > top_now else abs(bottom_now - close_now)
+    ao_now = float(ao.iloc[-2])
+    ao_prev = float(ao.iloc[-3])
+    ao_prev2 = float(ao.iloc[-4])
+
+    inside_now = bottom_now <= close_now <= top_now
+    if inside_now:
+        return blocked_signal(branch_name, "INSIDE KUMO")
+
+    h4_bias = None
+    if df_h4 is not None and len(df_h4) >= 50:
+        ema20_h4 = df_h4["close"].ewm(span=20).mean().iloc[-2]
+        h4_close = df_h4["close"].iloc[-2]
+        if h4_close > ema20_h4:
+            h4_bias = "UP"
+        elif h4_close < ema20_h4:
+            h4_bias = "DOWN"
+        else:
+            h4_bias = "FLAT"
+    else:
+        h4_bias = "N/A"
+
+    breakout_up = close_prev <= top_prev + atr_m15 * 0.02 and close_now > top_now + atr_m15 * profile["breakout_pad"]
+    breakout_down = close_prev >= bottom_prev - atr_m15 * 0.02 and close_now < bottom_now - atr_m15 * profile["breakout_pad"]
+    ao_up = ao_now > 0 and ao_now > ao_prev + atr_m15 * profile["ao_delta"] and ao_prev <= ao_prev2
+    ao_down = ao_now < 0 and ao_now < ao_prev - atr_m15 * profile["ao_delta"] and ao_prev >= ao_prev2
+
+    if family == "ETHUSD":
+        hold_ok_up = float(df_m15["close"].iloc[-3]) > float(kumo_top.iloc[-3])
+        hold_ok_down = float(df_m15["close"].iloc[-3]) < float(kumo_bottom.iloc[-3])
+    else:
+        hold_ok_up = True
+        hold_ok_down = True
+
+    if extension > atr_m15 * profile["max_extension"]:
+        return blocked_signal(branch_name, "OVEREXTENDED BREAKOUT", pretrigger_text("EXT", extension - atr_m15 * profile["max_extension"], atr_m15))
+
+    signal_key_up = f"{family}|KUMO|{breakout['time'].isoformat()}|BUY"
+    signal_key_down = f"{family}|KUMO|{breakout['time'].isoformat()}|SELL"
+    last_signal_key = strategy_runtime.get(branch_name, {}).get("last_signal_key_by_symbol", {}).get(symbol)
+    if last_signal_key in {signal_key_up, signal_key_down}:
+        return blocked_signal(branch_name, "DUPLICATE BREAKOUT", breakout["time"].strftime("%Y-%m-%d %H:%M"))
+
+    if breakout_up and ao_up and hold_ok_up:
+        if h4_bias == "DOWN":
+            return blocked_signal(branch_name, "H4 OPPOSITE", "H4 below EMA20")
+        sl_price = min(float(breakout["low"]), top_now) - atr_m15 * profile["stop_buffer"]
+        conf = profile["boost_conf"] if ao_now > abs(ao_prev) and h4_bias == "UP" else profile["base_conf"]
+        details = {
+            "instrument": profile["display"],
+            "direction": "LONG",
+            "reason": "bullish Kumo breakout confirmed by AO upturn",
+            "kumo_side": "upper Kumo",
+            "ao_state": f"AO up | {ao_prev:.2f}->{ao_now:.2f}",
+            "entry_price": float(tick.ask),
+            "stop_loss": float(sl_price),
+            "take_profit": "1R partial + trailing while breakout holds",
+            "position_state": "breakout valid",
+            "summary": (
+                f"{profile['display']} LONG | bullish Kumo breakout | upper Kumo | "
+                f"AO {ao_prev:.2f}->{ao_now:.2f} | entry {tick.ask:.2f} | SL {sl_price:.2f} | "
+                f"1R partial + trailing | state breakout valid"
+            ),
+        }
+        return {
+            "signal": "BUY",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_m15,
+            "sl_price": round(sl_price, 5),
+            "signal_key": signal_key_up,
+            "signal_details": details,
+        }
+
+    if breakout_down and ao_down and hold_ok_down:
+        if h4_bias == "UP":
+            return blocked_signal(branch_name, "H4 OPPOSITE", "H4 above EMA20")
+        sl_price = max(float(breakout["high"]), bottom_now) + atr_m15 * profile["stop_buffer"]
+        conf = profile["boost_conf"] if abs(ao_now) > ao_prev and h4_bias == "DOWN" else profile["base_conf"]
+        details = {
+            "instrument": profile["display"],
+            "direction": "SHORT",
+            "reason": "bearish Kumo breakout confirmed by AO downturn",
+            "kumo_side": "lower Kumo",
+            "ao_state": f"AO down | {ao_prev:.2f}->{ao_now:.2f}",
+            "entry_price": float(tick.bid),
+            "stop_loss": float(sl_price),
+            "take_profit": "1R partial + trailing while breakout holds",
+            "position_state": "breakout valid",
+            "summary": (
+                f"{profile['display']} SHORT | bearish Kumo breakout | lower Kumo | "
+                f"AO {ao_prev:.2f}->{ao_now:.2f} | entry {tick.bid:.2f} | SL {sl_price:.2f} | "
+                f"1R partial + trailing | state breakout valid"
+            ),
+        }
+        return {
+            "signal": "SELL",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_m15,
+            "sl_price": round(sl_price, 5),
+            "signal_key": signal_key_down,
+            "signal_details": details,
+        }
+
+    if close_now > top_now:
+        if not breakout_up:
+            return blocked_signal(branch_name, "WEAK BREAKOUT", pretrigger_text("KUMO", max(0.0, (top_now + atr_m15 * profile["breakout_pad"]) - close_now), atr_m15))
+        if not ao_up:
+            return blocked_signal(branch_name, "AO NOT CONFIRMED", f"AO {ao_prev:.2f}->{ao_now:.2f}")
+        if not hold_ok_up:
+            return blocked_signal(branch_name, "BREAKOUT ANNULLED", "ETH hold outside Kumo failed")
+    elif close_now < bottom_now:
+        if not breakout_down:
+            return blocked_signal(branch_name, "WEAK BREAKOUT", pretrigger_text("KUMO", max(0.0, close_now - (bottom_now - atr_m15 * profile["breakout_pad"])), atr_m15))
+        if not ao_down:
+            return blocked_signal(branch_name, "AO NOT CONFIRMED", f"AO {ao_prev:.2f}->{ao_now:.2f}")
+        if not hold_ok_down:
+            return blocked_signal(branch_name, "BREAKOUT ANNULLED", "ETH hold outside Kumo failed")
+    return blocked_signal(branch_name, "BREAKOUT ANNULLED", current_time.strftime("%H:%M"))
+
+
+def strategy_ustech_kumo_breakout(df, symbol):
+    return strategy_kumo_breakout(df, symbol, "USTECH_KUMO_BREAKOUT", "USTECH")
+
+
+def strategy_btc_kumo_breakout(df, symbol):
+    return strategy_kumo_breakout(df, symbol, "BTC_KUMO_BREAKOUT", "BTCUSD")
+
+
+def strategy_eth_kumo_breakout(df, symbol):
+    return strategy_kumo_breakout(df, symbol, "ETH_KUMO_BREAKOUT", "ETHUSD")
+
+
+SIDUS_PROFILES = {
+    "GER40": {
+        "display": "DAX",
+        "session": (8, 18),
+        "cross_pad": 0.05,
+        "close_pad": 0.04,
+        "compression": 0.30,
+        "flat_slope": 0.12,
+        "max_extension": 1.00,
+        "body_floor": 0.10,
+        "wick_ratio": 1.10,
+        "sl_buffer": 0.10,
+        "h1_bias_pad": 0.02,
+        "base_conf": 74,
+        "boost_conf": 82,
+        "whipsaw_limit": 2,
+    },
+    "USTECH": {
+        "display": "US100",
+        "session": (13, 23),
+        "cross_pad": 0.04,
+        "close_pad": 0.03,
+        "compression": 0.26,
+        "flat_slope": 0.10,
+        "max_extension": 1.20,
+        "body_floor": 0.08,
+        "wick_ratio": 1.25,
+        "sl_buffer": 0.10,
+        "h1_bias_pad": 0.02,
+        "base_conf": 76,
+        "boost_conf": 84,
+        "whipsaw_limit": 2,
+    },
+    "BTCUSD": {
+        "display": "BTC",
+        "session": (0, 23),
+        "cross_pad": 0.08,
+        "close_pad": 0.06,
+        "compression": 0.32,
+        "flat_slope": 0.12,
+        "max_extension": 1.45,
+        "body_floor": 0.08,
+        "wick_ratio": 1.35,
+        "sl_buffer": 0.14,
+        "h1_bias_pad": 0.03,
+        "base_conf": 77,
+        "boost_conf": 85,
+        "whipsaw_limit": 2,
+    },
+}
+
+
+def _sidus_channel_snapshot(ema18, ema28, wma5, wma8, idx):
+    red_low = min(float(ema18.iloc[idx]), float(ema28.iloc[idx]))
+    red_high = max(float(ema18.iloc[idx]), float(ema28.iloc[idx]))
+    blue_low = min(float(wma5.iloc[idx]), float(wma8.iloc[idx]))
+    blue_high = max(float(wma5.iloc[idx]), float(wma8.iloc[idx]))
+    return red_low, red_high, blue_low, blue_high
+
+
+def _recent_ma_cross_direction(fast, slow, lookback=4, end_offset=2):
+    end = len(fast) - end_offset
+    start = max(1, end - lookback + 1)
+    up = False
+    down = False
+    for pos in range(start, end + 1):
+        prev_fast = float(fast.iloc[pos - 1])
+        prev_slow = float(slow.iloc[pos - 1])
+        now_fast = float(fast.iloc[pos])
+        now_slow = float(slow.iloc[pos])
+        if prev_fast <= prev_slow and now_fast > now_slow:
+            up = True
+        if prev_fast >= prev_slow and now_fast < now_slow:
+            down = True
+    return up, down
+
+
+def _count_sign_flips(series, lookback=6, end_offset=2):
+    end = len(series) - end_offset
+    start = max(0, end - lookback + 1)
+    values = np.sign(series.iloc[start : end + 1].fillna(0).to_numpy(dtype=float))
+    flips = 0
+    for left, right in zip(values[:-1], values[1:]):
+        if left == 0 or right == 0:
+            continue
+        if left != right:
+            flips += 1
+    return flips
+
+
+def _sidus_higher_bias(df_tf, atr_pad=0.02):
+    if df_tf is None or len(df_tf) < 60:
+        return "N/A"
+    close = df_tf["close"]
+    atr = float(df_tf["atr"].iloc[-2] or 0.0)
+    ema18 = close.ewm(span=18).mean()
+    ema28 = close.ewm(span=28).mean()
+    wma5 = compute_wma(close, 5)
+    wma8 = compute_wma(close, 8)
+    red_low, red_high, blue_low, blue_high = _sidus_channel_snapshot(ema18, ema28, wma5, wma8, -2)
+    pad = atr * atr_pad
+    last_close = float(close.iloc[-2])
+    if blue_low > red_high + pad and last_close > red_high + pad:
+        return "UP"
+    if blue_high < red_low - pad and last_close < red_low - pad:
+        return "DOWN"
+    return "MIXED"
+
+
+def get_sidus_exit_reason(symbol, strategy_cfg, signal):
+    family = strategy_cfg.get("symbol_family")
+    profile = SIDUS_PROFILES.get(family)
+    if not profile:
+        return None
+
+    df_h1 = get_h1_cached(symbol)
+    if df_h1 is None or len(df_h1) < 80:
+        return None
+
+    close = df_h1["close"]
+    atr_h1 = float(df_h1["atr"].iloc[-2] or 0.0)
+    if atr_h1 <= 0:
+        return None
+
+    ema18 = close.ewm(span=18).mean()
+    ema28 = close.ewm(span=28).mean()
+    wma5 = compute_wma(close, 5)
+    wma8 = compute_wma(close, 8)
+    red_low, red_high, blue_low, blue_high = _sidus_channel_snapshot(ema18, ema28, wma5, wma8, -2)
+    pad = atr_h1 * profile["h1_bias_pad"]
+
+    cross_up, cross_down = _recent_ma_cross_direction(wma5, wma8, lookback=2, end_offset=2)
+
+    if signal == "BUY":
+        if cross_down:
+            return "WMA 5/8 bearish cross on H1"
+        if blue_high < red_low - pad:
+            return "blue channel fell below red channel on H1"
+    else:
+        if cross_up:
+            return "WMA 5/8 bullish cross on H1"
+        if blue_low > red_high + pad:
+            return "blue channel rose above red channel on H1"
+    return None
+
+
+def strategy_sidus(df, symbol, branch_name, family):
+    profile = SIDUS_PROFILES[family]
+    if is_crypto_family(family) and not crypto_enabled:
+        return blocked_signal(branch_name, "CRYPTO OFF")
+
+    hour = get_broker_hour()
+    session_start, session_end = profile["session"]
+    if not _session_open(hour, session_start, session_end):
+        return blocked_signal(branch_name, "OUT SESSION")
+
+    df_m30 = get_m30_cached(symbol)
+    df_h1 = get_h1_cached(symbol)
+    df_h4 = get_h4_cached(symbol)
+    if df_m30 is None or len(df_m30) < 90:
+        return blocked_signal(branch_name, "NO M30 DATA")
+    if df_h1 is None or len(df_h1) < 80:
+        return blocked_signal(branch_name, "NO H1 DATA")
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return blocked_signal(branch_name, "NO TICK")
+
+    close = df_m30["close"]
+    atr_m30 = float(df_m30["atr"].iloc[-2] or 0.0)
+    if atr_m30 <= 0:
+        return blocked_signal(branch_name, "NO ATR")
+
+    ema18 = close.ewm(span=18).mean()
+    ema28 = close.ewm(span=28).mean()
+    wma5 = compute_wma(close, 5)
+    wma8 = compute_wma(close, 8)
+    confirm = df_m30.iloc[-2]
+    current = df_m30.iloc[-1]
+
+    red_low_now, red_high_now, blue_low_now, blue_high_now = _sidus_channel_snapshot(ema18, ema28, wma5, wma8, -2)
+    red_low_prev, red_high_prev, blue_low_prev, blue_high_prev = _sidus_channel_snapshot(ema18, ema28, wma5, wma8, -3)
+    red_low_prev2, red_high_prev2, blue_low_prev2, blue_high_prev2 = _sidus_channel_snapshot(ema18, ema28, wma5, wma8, -4)
+
+    body = abs(float(confirm["close"] - confirm["open"]))
+    wick_up = float(confirm["high"] - max(confirm["open"], confirm["close"]))
+    wick_down = float(min(confirm["open"], confirm["close"]) - confirm["low"])
+    extension_up = max(0.0, float(confirm["close"]) - red_high_now)
+    extension_down = max(0.0, red_low_now - float(confirm["close"]))
+    channel_span = max(red_high_now, blue_high_now) - min(red_low_now, blue_low_now)
+    ema_slope = max(abs(float(ema18.iloc[-2] - ema18.iloc[-6])), abs(float(ema28.iloc[-2] - ema28.iloc[-6]))) / max(atr_m30, 1e-6)
+    whipsaw_flips = _count_sign_flips(wma5 - wma8, lookback=7, end_offset=2)
+
+    if channel_span < atr_m30 * profile["compression"]:
+        return blocked_signal(branch_name, "MA COMPRESSED", pretrigger_text("MA", atr_m30 * profile["compression"] - channel_span, atr_m30))
+    if ema_slope < profile["flat_slope"]:
+        return blocked_signal(branch_name, "EMA FLAT", f"SLOPE {round(ema_slope, 2)}")
+    if whipsaw_flips > profile["whipsaw_limit"]:
+        return blocked_signal(branch_name, "WMA WHIPSAW", f"FLIPS {whipsaw_flips}")
+
+    cross_hint_up, cross_hint_down = _recent_ma_cross_direction(wma5, wma8, lookback=4, end_offset=2)
+    full_below_recent = (
+        blue_high_prev < red_low_prev - atr_m30 * profile["cross_pad"]
+        or blue_high_prev2 < red_low_prev2 - atr_m30 * profile["cross_pad"]
+    )
+    full_above_recent = (
+        blue_low_prev > red_high_prev + atr_m30 * profile["cross_pad"]
+        or blue_low_prev2 > red_high_prev2 + atr_m30 * profile["cross_pad"]
+    )
+
+    long_cross = full_below_recent and blue_low_now > red_high_now + atr_m30 * profile["cross_pad"]
+    short_cross = full_above_recent and blue_high_now < red_low_now - atr_m30 * profile["cross_pad"]
+
+    long_confirm = (
+        float(confirm["close"]) > red_high_now + atr_m30 * profile["close_pad"]
+        and body >= atr_m30 * profile["body_floor"]
+        and wick_up <= max(body * profile["wick_ratio"], atr_m30 * 0.28)
+        and extension_up <= atr_m30 * profile["max_extension"]
+        and current["time"] > confirm["time"]
+    )
+    short_confirm = (
+        float(confirm["close"]) < red_low_now - atr_m30 * profile["close_pad"]
+        and body >= atr_m30 * profile["body_floor"]
+        and wick_down <= max(body * profile["wick_ratio"], atr_m30 * 0.28)
+        and extension_down <= atr_m30 * profile["max_extension"]
+        and current["time"] > confirm["time"]
+    )
+
+    h1_bias = _sidus_higher_bias(df_h1, profile["h1_bias_pad"])
+    h4_bias = _sidus_higher_bias(df_h4, profile["h1_bias_pad"])
+    if long_cross and h1_bias == "DOWN":
+        return blocked_signal(branch_name, "H1 OPPOSITE", "H1 blue below red")
+    if short_cross and h1_bias == "UP":
+        return blocked_signal(branch_name, "H1 OPPOSITE", "H1 blue above red")
+    if long_cross and h4_bias == "DOWN":
+        return blocked_signal(branch_name, "H4 OPPOSITE", "H4 bias down")
+    if short_cross and h4_bias == "UP":
+        return blocked_signal(branch_name, "H4 OPPOSITE", "H4 bias up")
+
+    prelim_text = "YES" if (cross_hint_up or cross_hint_down) else "NO"
+    long_signal_key = f"{family}|SIDUS|{confirm['time'].isoformat()}|BUY"
+    short_signal_key = f"{family}|SIDUS|{confirm['time'].isoformat()}|SELL"
+    last_signal_key = strategy_runtime.get(branch_name, {}).get("last_signal_key_by_symbol", {}).get(symbol)
+    if last_signal_key in {long_signal_key, short_signal_key}:
+        return blocked_signal(branch_name, "DUPLICATE LEG", confirm["time"].strftime("%Y-%m-%d %H:%M"))
+
+    if long_cross and long_confirm:
+        swing_low = float(df_m30["low"].iloc[-7:-1].min())
+        sl_price = min(swing_low, red_low_now) - atr_m30 * profile["sl_buffer"]
+        conf = profile["boost_conf"] if cross_hint_up and h1_bias == "UP" else profile["base_conf"]
+        details = {
+            "instrument": profile["display"],
+            "direction": "LONG",
+            "reason": "Sidus bullish full blue-channel cross above red channel",
+            "channel_state": f"WMA5/WMA8 above EMA18/EMA28 | blue {blue_low_now:.2f}-{blue_high_now:.2f} vs red {red_low_now:.2f}-{red_high_now:.2f}",
+            "preliminary_cross": "WMA5 crossed WMA8 up before channel cross" if cross_hint_up else "no early WMA 5/8 cross",
+            "entry_price": float(tick.ask),
+            "stop_loss": float(sl_price),
+            "take_profit": "1R partial + trailing until opposite Sidus cross",
+            "trend_m30": f"UP | cross clean | slope {ema_slope:.2f}",
+            "trend_h1": f"{h1_bias} | H4 {h4_bias}",
+            "summary": (
+                f"{profile['display']} LONG | Sidus bullish cross | WMA5/WMA8 above EMA18/EMA28 | "
+                f"pre-cross {prelim_text} | entry {tick.ask:.2f} | SL {sl_price:.2f} | "
+                f"1R partial + trailing | M30 UP | H1 {h1_bias}"
+            ),
+        }
+        return {
+            "signal": "BUY",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_m30,
+            "sl_price": round(sl_price, 5),
+            "signal_key": long_signal_key,
+            "signal_details": details,
+        }
+
+    if short_cross and short_confirm:
+        swing_high = float(df_m30["high"].iloc[-7:-1].max())
+        sl_price = max(swing_high, red_high_now) + atr_m30 * profile["sl_buffer"]
+        conf = profile["boost_conf"] if cross_hint_down and h1_bias == "DOWN" else profile["base_conf"]
+        details = {
+            "instrument": profile["display"],
+            "direction": "SHORT",
+            "reason": "Sidus bearish full blue-channel cross below red channel",
+            "channel_state": f"WMA5/WMA8 below EMA18/EMA28 | blue {blue_low_now:.2f}-{blue_high_now:.2f} vs red {red_low_now:.2f}-{red_high_now:.2f}",
+            "preliminary_cross": "WMA5 crossed WMA8 down before channel cross" if cross_hint_down else "no early WMA 5/8 cross",
+            "entry_price": float(tick.bid),
+            "stop_loss": float(sl_price),
+            "take_profit": "1R partial + trailing until opposite Sidus cross",
+            "trend_m30": f"DOWN | cross clean | slope {ema_slope:.2f}",
+            "trend_h1": f"{h1_bias} | H4 {h4_bias}",
+            "summary": (
+                f"{profile['display']} SHORT | Sidus bearish cross | WMA5/WMA8 below EMA18/EMA28 | "
+                f"pre-cross {prelim_text} | entry {tick.bid:.2f} | SL {sl_price:.2f} | "
+                f"1R partial + trailing | M30 DOWN | H1 {h1_bias}"
+            ),
+        }
+        return {
+            "signal": "SELL",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_m30,
+            "sl_price": round(sl_price, 5),
+            "signal_key": short_signal_key,
+            "signal_details": details,
+        }
+
+    if blue_low_now <= red_high_now and blue_high_now >= red_low_now:
+        return blocked_signal(branch_name, "PARTIAL CROSS", pretrigger_text("SIDUS", abs(blue_low_now - red_high_now), atr_m30))
+    if full_below_recent and not long_cross:
+        return blocked_signal(branch_name, "WAIT BULL CROSS", pretrigger_text("SIDUS", (red_high_now + atr_m30 * profile["cross_pad"]) - blue_low_now, atr_m30))
+    if full_above_recent and not short_cross:
+        return blocked_signal(branch_name, "WAIT BEAR CROSS", pretrigger_text("SIDUS", blue_high_now - (red_low_now - atr_m30 * profile["cross_pad"]), atr_m30))
+    return blocked_signal(branch_name, "SIDUS NOT READY", confirm["time"].strftime("%H:%M"))
+
+
+def strategy_ustech_sidus(df, symbol):
+    return strategy_sidus(df, symbol, "USTECH_SIDUS", "USTECH")
+
+
+def strategy_btc_sidus(df, symbol):
+    return strategy_sidus(df, symbol, "BTC_SIDUS", "BTCUSD")
+
+
+def strategy_ger40_sidus(df, symbol):
+    return strategy_sidus(df, symbol, "GER40_SIDUS", "GER40")
+
+
+PURIA_PROFILES = {
+    "GER40": {
+        "display": "DAX",
+        "session": (8, 18),
+        "cross_pad": 0.05,
+        "close_pad": 0.04,
+        "compression": 0.22,
+        "flat_slope": 0.09,
+        "body_floor": 0.10,
+        "wick_ratio": 1.08,
+        "macd_floor": 0.05,
+        "macd_expand": 0.02,
+        "sl_buffer": 0.10,
+        "whipsaw_limit": 2,
+        "base_conf": 74,
+        "boost_conf": 82,
+    },
+    "USTECH": {
+        "display": "US100",
+        "session": (13, 23),
+        "cross_pad": 0.04,
+        "close_pad": 0.03,
+        "compression": 0.20,
+        "flat_slope": 0.08,
+        "body_floor": 0.08,
+        "wick_ratio": 1.18,
+        "macd_floor": 0.045,
+        "macd_expand": 0.018,
+        "sl_buffer": 0.10,
+        "whipsaw_limit": 2,
+        "base_conf": 76,
+        "boost_conf": 84,
+    },
+    "BTCUSD": {
+        "display": "BTC",
+        "session": (0, 23),
+        "cross_pad": 0.07,
+        "close_pad": 0.06,
+        "compression": 0.26,
+        "flat_slope": 0.10,
+        "body_floor": 0.08,
+        "wick_ratio": 1.30,
+        "macd_floor": 0.07,
+        "macd_expand": 0.025,
+        "sl_buffer": 0.15,
+        "whipsaw_limit": 2,
+        "base_conf": 77,
+        "boost_conf": 85,
+    },
+    "ETHUSD": {
+        "display": "ETH",
+        "session": (0, 23),
+        "cross_pad": 0.07,
+        "close_pad": 0.06,
+        "compression": 0.24,
+        "flat_slope": 0.10,
+        "body_floor": 0.09,
+        "wick_ratio": 1.22,
+        "macd_floor": 0.07,
+        "macd_expand": 0.026,
+        "sl_buffer": 0.14,
+        "whipsaw_limit": 2,
+        "base_conf": 76,
+        "boost_conf": 84,
+    },
+}
+
+
+def _puria_bias(df_tf, macd_floor_mult=0.05):
+    if df_tf is None or len(df_tf) < 100:
+        return "N/A"
+    close = df_tf["close"]
+    low = df_tf["low"]
+    atr = float(df_tf["atr"].iloc[-2] or 0.0)
+    if atr <= 0:
+        return "N/A"
+    ema5 = close.ewm(span=5, adjust=False).mean()
+    ma75 = compute_wma(low, 75)
+    ma85 = compute_wma(low, 85)
+    macd_hist = compute_macd_hist(close, 15, 26)
+    slow_low = min(float(ma75.iloc[-2]), float(ma85.iloc[-2]))
+    slow_high = max(float(ma75.iloc[-2]), float(ma85.iloc[-2]))
+    ema_now = float(ema5.iloc[-2])
+    macd_now = float(macd_hist.iloc[-2])
+    if ema_now > slow_high + atr * 0.02 and macd_now > atr * macd_floor_mult:
+        return "UP"
+    if ema_now < slow_low - atr * 0.02 and macd_now < -atr * macd_floor_mult:
+        return "DOWN"
+    return "MIXED"
+
+
+def get_puria_exit_reason(symbol, strategy_cfg, signal):
+    family = strategy_cfg.get("symbol_family")
+    profile = PURIA_PROFILES.get(family)
+    if not profile:
+        return None
+
+    df_h1 = get_h1_cached(symbol)
+    if df_h1 is None or len(df_h1) < 100:
+        return None
+
+    close = df_h1["close"]
+    low = df_h1["low"]
+    atr_h1 = float(df_h1["atr"].iloc[-2] or 0.0)
+    if atr_h1 <= 0:
+        return None
+
+    ema5 = close.ewm(span=5, adjust=False).mean()
+    ma75 = compute_wma(low, 75)
+    ma85 = compute_wma(low, 85)
+    macd_hist = compute_macd_hist(close, 15, 26)
+
+    ema_now = float(ema5.iloc[-2])
+    ema_prev = float(ema5.iloc[-3])
+    ma75_now = float(ma75.iloc[-2])
+    ma75_prev = float(ma75.iloc[-3])
+    ma85_now = float(ma85.iloc[-2])
+    ma85_prev = float(ma85.iloc[-3])
+    macd_now = float(macd_hist.iloc[-2])
+    macd_prev = float(macd_hist.iloc[-3])
+    macd_floor = atr_h1 * profile["macd_floor"]
+
+    if signal == "BUY":
+        if macd_now < macd_prev and macd_prev > macd_floor:
+            return "MACD momentum rolled over on H1"
+        if ema_prev >= max(ma75_prev, ma85_prev) and ema_now < min(ma75_now, ma85_now):
+            return "EMA5 crossed back below MA75/MA85 on H1"
+    else:
+        if macd_now > macd_prev and macd_prev < -macd_floor:
+            return "MACD momentum rolled over on H1"
+        if ema_prev <= min(ma75_prev, ma85_prev) and ema_now > max(ma75_now, ma85_now):
+            return "EMA5 crossed back above MA75/MA85 on H1"
+    return None
+
+
+def strategy_puria(df, symbol, branch_name, family):
+    profile = PURIA_PROFILES[family]
+    if is_crypto_family(family) and not crypto_enabled:
+        return blocked_signal(branch_name, "CRYPTO OFF")
+
+    hour = get_broker_hour()
+    session_start, session_end = profile["session"]
+    if not _session_open(hour, session_start, session_end):
+        return blocked_signal(branch_name, "OUT SESSION")
+
+    df_m30 = get_m30_cached(symbol)
+    df_h1 = get_h1_cached(symbol)
+    df_h4 = get_h4_cached(symbol)
+    if df_m30 is None or len(df_m30) < 110:
+        return blocked_signal(branch_name, "NO M30 DATA")
+    if df_h1 is None or len(df_h1) < 100:
+        return blocked_signal(branch_name, "NO H1 DATA")
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return blocked_signal(branch_name, "NO TICK")
+
+    close = df_m30["close"]
+    low = df_m30["low"]
+    atr_m30 = float(df_m30["atr"].iloc[-2] or 0.0)
+    if atr_m30 <= 0:
+        return blocked_signal(branch_name, "NO ATR")
+
+    ema5 = close.ewm(span=5, adjust=False).mean()
+    ma75 = compute_wma(low, 75)
+    ma85 = compute_wma(low, 85)
+    macd_hist = compute_macd_hist(close, 15, 26)
+    confirm = df_m30.iloc[-2]
+    current = df_m30.iloc[-1]
+
+    ema_now = float(ema5.iloc[-2])
+    ema_prev = float(ema5.iloc[-3])
+    ma75_now = float(ma75.iloc[-2])
+    ma75_prev = float(ma75.iloc[-3])
+    ma85_now = float(ma85.iloc[-2])
+    ma85_prev = float(ma85.iloc[-3])
+    macd_now = float(macd_hist.iloc[-2])
+    macd_prev = float(macd_hist.iloc[-3])
+    macd_prev2 = float(macd_hist.iloc[-4])
+
+    slow_low_now = min(ma75_now, ma85_now)
+    slow_high_now = max(ma75_now, ma85_now)
+    slow_low_prev = min(ma75_prev, ma85_prev)
+    slow_high_prev = max(ma75_prev, ma85_prev)
+    slow_span = abs(ma75_now - ma85_now)
+    slow_slope = max(abs(ma75_now - float(ma75.iloc[-6])), abs(ma85_now - float(ma85.iloc[-6]))) / max(atr_m30, 1e-6)
+    body = abs(float(confirm["close"] - confirm["open"]))
+    wick_up = float(confirm["high"] - max(confirm["open"], confirm["close"]))
+    wick_down = float(min(confirm["open"], confirm["close"]) - confirm["low"])
+    macd_floor = atr_m30 * profile["macd_floor"]
+    macd_expand = atr_m30 * profile["macd_expand"]
+
+    if slow_span < atr_m30 * profile["compression"] and slow_slope < profile["flat_slope"]:
+        return blocked_signal(branch_name, "MA FLAT", pretrigger_text("MA", atr_m30 * profile["compression"] - slow_span, atr_m30))
+    if abs(macd_now) < macd_floor and abs(macd_now - macd_prev) < macd_expand:
+        return blocked_signal(branch_name, "MACD FLAT", f"MACD {macd_now:.3f}")
+
+    flips_75 = _count_sign_flips(ema5 - ma75, lookback=7, end_offset=2)
+    flips_85 = _count_sign_flips(ema5 - ma85, lookback=7, end_offset=2)
+    if max(flips_75, flips_85) > profile["whipsaw_limit"]:
+        return blocked_signal(branch_name, "EMA5 WHIPSAW", f"75:{flips_75} 85:{flips_85}")
+
+    long_cross = ema_prev <= slow_low_prev - atr_m30 * profile["cross_pad"] and ema_now > slow_high_now + atr_m30 * profile["cross_pad"]
+    short_cross = ema_prev >= slow_high_prev + atr_m30 * profile["cross_pad"] and ema_now < slow_low_now - atr_m30 * profile["cross_pad"]
+
+    above_75 = ema_now > ma75_now + atr_m30 * profile["cross_pad"]
+    above_85 = ema_now > ma85_now + atr_m30 * profile["cross_pad"]
+    below_75 = ema_now < ma75_now - atr_m30 * profile["cross_pad"]
+    below_85 = ema_now < ma85_now - atr_m30 * profile["cross_pad"]
+    partial_cross = (above_75 ^ above_85) or (below_75 ^ below_85)
+    if partial_cross:
+        return blocked_signal(branch_name, "SINGLE MA CROSS", "EMA5 crossed only one slow MA")
+
+    long_macd_ok = (macd_now > macd_floor or macd_prev > macd_floor) and macd_now >= macd_prev - macd_expand
+    short_macd_ok = (macd_now < -macd_floor or macd_prev < -macd_floor) and macd_now <= macd_prev + macd_expand
+
+    long_confirm = (
+        float(confirm["close"]) > slow_high_now + atr_m30 * profile["close_pad"]
+        and body >= atr_m30 * profile["body_floor"]
+        and wick_up <= max(body * profile["wick_ratio"], atr_m30 * 0.28)
+        and current["time"] > confirm["time"]
+    )
+    short_confirm = (
+        float(confirm["close"]) < slow_low_now - atr_m30 * profile["close_pad"]
+        and body >= atr_m30 * profile["body_floor"]
+        and wick_down <= max(body * profile["wick_ratio"], atr_m30 * 0.28)
+        and current["time"] > confirm["time"]
+    )
+
+    h1_bias = _puria_bias(df_h1, profile["macd_floor"])
+    h4_bias = _puria_bias(df_h4, profile["macd_floor"])
+    if long_cross and h1_bias == "DOWN":
+        return blocked_signal(branch_name, "H1 OPPOSITE", "H1 Puria bias down")
+    if short_cross and h1_bias == "UP":
+        return blocked_signal(branch_name, "H1 OPPOSITE", "H1 Puria bias up")
+    if long_cross and h4_bias == "DOWN":
+        return blocked_signal(branch_name, "H4 OPPOSITE", "H4 Puria bias down")
+    if short_cross and h4_bias == "UP":
+        return blocked_signal(branch_name, "H4 OPPOSITE", "H4 Puria bias up")
+
+    signal_key_buy = f"{family}|PURIA|{confirm['time'].isoformat()}|BUY"
+    signal_key_sell = f"{family}|PURIA|{confirm['time'].isoformat()}|SELL"
+    last_signal_key = strategy_runtime.get(branch_name, {}).get("last_signal_key_by_symbol", {}).get(symbol)
+    if last_signal_key in {signal_key_buy, signal_key_sell}:
+        return blocked_signal(branch_name, "DUPLICATE LEG", confirm["time"].strftime("%Y-%m-%d %H:%M"))
+
+    if family == "ETHUSD":
+        long_confirm = long_confirm and macd_now > macd_floor and float(confirm["close"]) > slow_high_now + atr_m30 * (profile["close_pad"] + 0.01)
+        short_confirm = short_confirm and macd_now < -macd_floor and float(confirm["close"]) < slow_low_now - atr_m30 * (profile["close_pad"] + 0.01)
+    if family == "BTCUSD":
+        long_macd_ok = long_macd_ok and macd_now > macd_floor and (macd_now - macd_prev) >= -macd_expand * 0.2
+        short_macd_ok = short_macd_ok and macd_now < -macd_floor and (macd_now - macd_prev) <= macd_expand * 0.2
+
+    if long_cross and long_macd_ok and long_confirm:
+        swing_low = float(df_m30["low"].iloc[-7:-1].min())
+        sl_price = min(swing_low, slow_low_now) - atr_m30 * profile["sl_buffer"]
+        conf = profile["boost_conf"] if h1_bias == "UP" and h4_bias != "DOWN" and macd_now > max(macd_prev, macd_floor) else profile["base_conf"]
+        details = {
+            "instrument": profile["display"],
+            "direction": "LONG",
+            "reason": "Puria bullish EMA5 cross above both LWMA75/85 with MACD above zero",
+            "ema_state": f"EMA5 {ema_now:.2f} > MA75 {ma75_now:.2f} / MA85 {ma85_now:.2f}",
+            "macd_state": f"MACD {macd_prev:.3f}->{macd_now:.3f} above zero",
+            "entry_price": float(tick.ask),
+            "stop_loss": float(sl_price),
+            "take_profit": "1R partial + trailing until Puria reversal",
+            "trend_m30": f"UP | slope {slow_slope:.2f}",
+            "trend_h1": f"{h1_bias} | H4 {h4_bias}",
+            "summary": (
+                f"{profile['display']} LONG | Puria bullish cross | EMA5 above MA75/MA85 | "
+                f"MACD {macd_prev:.3f}->{macd_now:.3f} > 0 | entry {tick.ask:.2f} | SL {sl_price:.2f} | "
+                f"1R partial + trailing | M30 UP | H1 {h1_bias}"
+            ),
+        }
+        return {
+            "signal": "BUY",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_m30,
+            "sl_price": round(sl_price, 5),
+            "signal_key": signal_key_buy,
+            "signal_details": details,
+        }
+
+    if short_cross and short_macd_ok and short_confirm:
+        swing_high = float(df_m30["high"].iloc[-7:-1].max())
+        sl_price = max(swing_high, slow_high_now) + atr_m30 * profile["sl_buffer"]
+        conf = profile["boost_conf"] if h1_bias == "DOWN" and h4_bias != "UP" and macd_now < min(macd_prev, -macd_floor) else profile["base_conf"]
+        details = {
+            "instrument": profile["display"],
+            "direction": "SHORT",
+            "reason": "Puria bearish EMA5 cross below both LWMA75/85 with MACD below zero",
+            "ema_state": f"EMA5 {ema_now:.2f} < MA75 {ma75_now:.2f} / MA85 {ma85_now:.2f}",
+            "macd_state": f"MACD {macd_prev:.3f}->{macd_now:.3f} below zero",
+            "entry_price": float(tick.bid),
+            "stop_loss": float(sl_price),
+            "take_profit": "1R partial + trailing until Puria reversal",
+            "trend_m30": f"DOWN | slope {slow_slope:.2f}",
+            "trend_h1": f"{h1_bias} | H4 {h4_bias}",
+            "summary": (
+                f"{profile['display']} SHORT | Puria bearish cross | EMA5 below MA75/MA85 | "
+                f"MACD {macd_prev:.3f}->{macd_now:.3f} < 0 | entry {tick.bid:.2f} | SL {sl_price:.2f} | "
+                f"1R partial + trailing | M30 DOWN | H1 {h1_bias}"
+            ),
+        }
+        return {
+            "signal": "SELL",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_m30,
+            "sl_price": round(sl_price, 5),
+            "signal_key": signal_key_sell,
+            "signal_details": details,
+        }
+
+    if long_cross and not long_macd_ok:
+        return blocked_signal(branch_name, "MACD NOT CONFIRMED", f"MACD {macd_prev:.3f}->{macd_now:.3f}")
+    if short_cross and not short_macd_ok:
+        return blocked_signal(branch_name, "MACD NOT CONFIRMED", f"MACD {macd_prev:.3f}->{macd_now:.3f}")
+    if long_cross and not long_confirm:
+        return blocked_signal(branch_name, "NO BULL CONFIRM", pretrigger_text("CONF", (slow_high_now + atr_m30 * profile["close_pad"]) - float(confirm['close']), atr_m30))
+    if short_cross and not short_confirm:
+        return blocked_signal(branch_name, "NO BEAR CONFIRM", pretrigger_text("CONF", float(confirm['close']) - (slow_low_now - atr_m30 * profile["close_pad"]), atr_m30))
+    return blocked_signal(branch_name, "PURIA NOT READY", confirm["time"].strftime("%H:%M"))
+
+
+def strategy_ger40_puria(df, symbol):
+    return strategy_puria(df, symbol, "GER40_PURIA", "GER40")
+
+
+def strategy_ustech_puria(df, symbol):
+    return strategy_puria(df, symbol, "USTECH_PURIA", "USTECH")
+
+
+def strategy_btc_puria(df, symbol):
+    return strategy_puria(df, symbol, "BTC_PURIA", "BTCUSD")
+
+
+def strategy_eth_puria(df, symbol):
+    return strategy_puria(df, symbol, "ETH_PURIA", "ETHUSD")
+
+
+DOUBLE_MACD_PROFILES = {
+    "US500": {
+        "display": "US500",
+        "session": (0, 23),
+        "sma_sep": 0.32,
+        "senior_floor": 0.08,
+        "senior_hist_floor": 0.020,
+        "junior_floor": 0.05,
+        "junior_near_zero": 0.18,
+        "junior_expand": 0.020,
+        "whipsaw_limit": 2,
+        "swing_lookback": 8,
+        "sl_buffer": 0.10,
+        "base_conf": 75,
+        "boost_conf": 83,
+    },
+    "BTCUSD": {
+        "display": "BTC",
+        "session": (0, 23),
+        "sma_sep": 0.42,
+        "senior_floor": 0.11,
+        "senior_hist_floor": 0.028,
+        "junior_floor": 0.08,
+        "junior_near_zero": 0.20,
+        "junior_expand": 0.025,
+        "whipsaw_limit": 2,
+        "swing_lookback": 10,
+        "sl_buffer": 0.16,
+        "base_conf": 77,
+        "boost_conf": 85,
+    },
+    "ETHUSD": {
+        "display": "ETH",
+        "session": (0, 23),
+        "sma_sep": 0.44,
+        "senior_floor": 0.12,
+        "senior_hist_floor": 0.030,
+        "junior_floor": 0.09,
+        "junior_near_zero": 0.18,
+        "junior_expand": 0.026,
+        "whipsaw_limit": 2,
+        "swing_lookback": 10,
+        "sl_buffer": 0.15,
+        "base_conf": 76,
+        "boost_conf": 84,
+    },
+}
+
+
+def _double_macd_h4_state(df_h4):
+    if df_h4 is None or len(df_h4) < 100:
+        return "N/A"
+    close = df_h4["close"]
+    sma60 = close.rolling(60).mean()
+    senior_line, senior_signal, _ = compute_macd(close, 30, 60, 30)
+    last_close = float(close.iloc[-2])
+    last_sma = float(sma60.iloc[-2] or 0.0)
+    senior_now = float(senior_line.iloc[-2])
+    senior_sig = float(senior_signal.iloc[-2])
+    if last_close > last_sma and senior_now > 0 and senior_now >= senior_sig:
+        return "UP"
+    if last_close < last_sma and senior_now < 0 and senior_now <= senior_sig:
+        return "DOWN"
+    return "MIXED"
+
+
+def get_double_macd_exit_reason(symbol, strategy_cfg, signal):
+    family = strategy_cfg.get("symbol_family")
+    profile = DOUBLE_MACD_PROFILES.get(family)
+    if not profile:
+        return None
+
+    df_d1 = get_d1_cached(symbol)
+    if df_d1 is None or len(df_d1) < 110:
+        return None
+
+    close = df_d1["close"]
+    high = df_d1["high"]
+    low = df_d1["low"]
+    atr_d1 = float(df_d1["atr"].iloc[-2] or 0.0)
+    if atr_d1 <= 0:
+        return None
+
+    sma60 = close.rolling(60).mean()
+    senior_line, senior_signal, senior_hist = compute_macd(close, 30, 60, 30)
+    junior_line, junior_signal, junior_hist = compute_macd(close, 6, 12, 5)
+
+    price_now = float(close.iloc[-2])
+    sma_now = float(sma60.iloc[-2])
+    senior_now = float(senior_line.iloc[-2])
+    senior_prev = float(senior_line.iloc[-3])
+    senior_sig = float(senior_signal.iloc[-2])
+    senior_hist_now = float(senior_hist.iloc[-2])
+    senior_hist_prev = float(senior_hist.iloc[-3])
+    junior_now = float(junior_line.iloc[-2])
+    junior_prev = float(junior_line.iloc[-3])
+    junior_sig = float(junior_signal.iloc[-2])
+    junior_hist_now = float(junior_hist.iloc[-2])
+    junior_hist_prev = float(junior_hist.iloc[-3])
+
+    if signal == "BUY":
+        if price_now < sma_now - atr_d1 * 0.02:
+            return "D1 close below SMA60"
+        if senior_now < senior_sig and senior_now < senior_prev and senior_hist_now < senior_hist_prev and junior_now < junior_sig and junior_hist_now < junior_hist_prev:
+            return "senior MACD rolled over and junior confirmed bearish"
+    else:
+        if price_now > sma_now + atr_d1 * 0.02:
+            return "D1 close above SMA60"
+        if senior_now > senior_sig and senior_now > senior_prev and senior_hist_now > senior_hist_prev and junior_now > junior_sig and junior_hist_now > junior_hist_prev:
+            return "senior MACD rolled over and junior confirmed bullish"
+    return None
+
+
+def strategy_double_macd(df, symbol, branch_name, family):
+    profile = DOUBLE_MACD_PROFILES[family]
+    if is_crypto_family(family) and not crypto_enabled:
+        return blocked_signal(branch_name, "CRYPTO OFF")
+
+    hour = get_broker_hour()
+    session_start, session_end = profile["session"]
+    if not _session_open(hour, session_start, session_end):
+        return blocked_signal(branch_name, "OUT SESSION")
+
+    df_d1 = get_d1_cached(symbol)
+    df_h4 = get_h4_cached(symbol)
+    if df_d1 is None or len(df_d1) < 120:
+        return blocked_signal(branch_name, "NO D1 DATA")
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return blocked_signal(branch_name, "NO TICK")
+
+    close = df_d1["close"]
+    high = df_d1["high"]
+    low = df_d1["low"]
+    atr_d1 = float(df_d1["atr"].iloc[-2] or 0.0)
+    if atr_d1 <= 0:
+        return blocked_signal(branch_name, "NO ATR")
+
+    sma60 = close.rolling(60).mean()
+    senior_line, senior_signal, senior_hist = compute_macd(close, 30, 60, 30)
+    junior_line, junior_signal, junior_hist = compute_macd(close, 6, 12, 5)
+
+    confirm = df_d1.iloc[-2]
+    current = df_d1.iloc[-1]
+    price_now = float(confirm["close"])
+    sma_now = float(sma60.iloc[-2])
+    senior_now = float(senior_line.iloc[-2])
+    senior_prev = float(senior_line.iloc[-3])
+    senior_sig = float(senior_signal.iloc[-2])
+    senior_hist_now = float(senior_hist.iloc[-2])
+    senior_hist_prev = float(senior_hist.iloc[-3])
+    junior_now = float(junior_line.iloc[-2])
+    junior_prev = float(junior_line.iloc[-3])
+    junior_sig = float(junior_signal.iloc[-2])
+    junior_hist_now = float(junior_hist.iloc[-2])
+    junior_hist_prev = float(junior_hist.iloc[-3])
+
+    distance_from_sma = abs(price_now - sma_now)
+    if distance_from_sma < atr_d1 * profile["sma_sep"]:
+        return blocked_signal(branch_name, "TOO CLOSE SMA60", pretrigger_text("SMA60", atr_d1 * profile["sma_sep"] - distance_from_sma, atr_d1))
+
+    if abs(senior_now) < atr_d1 * profile["senior_floor"] and abs(senior_hist_now) < atr_d1 * profile["senior_hist_floor"]:
+        return blocked_signal(branch_name, "SENIOR FLAT", f"S {senior_now:.3f}")
+
+    junior_flips = _count_sign_flips(junior_line, lookback=7, end_offset=2)
+    if junior_flips > profile["whipsaw_limit"]:
+        return blocked_signal(branch_name, "JUNIOR WHIPSAW", f"FLIPS {junior_flips}")
+
+    long_context = (
+        price_now > sma_now + atr_d1 * profile["sma_sep"]
+        and senior_now > atr_d1 * profile["senior_floor"]
+        and senior_now >= senior_sig - atr_d1 * profile["senior_hist_floor"]
+        and senior_hist_now >= senior_hist_prev - atr_d1 * profile["senior_hist_floor"]
+    )
+    short_context = (
+        price_now < sma_now - atr_d1 * profile["sma_sep"]
+        and senior_now < -atr_d1 * profile["senior_floor"]
+        and senior_now <= senior_sig + atr_d1 * profile["senior_hist_floor"]
+        and senior_hist_now <= senior_hist_prev + atr_d1 * profile["senior_hist_floor"]
+    )
+
+    junior_long = (
+        (junior_now > atr_d1 * profile["junior_floor"] and junior_hist_now >= junior_hist_prev - atr_d1 * profile["junior_expand"])
+        or (
+            junior_prev <= 0
+            and junior_now > junior_prev
+            and junior_now > junior_sig
+            and abs(junior_now) <= atr_d1 * profile["junior_near_zero"]
+        )
+    )
+    junior_short = (
+        (junior_now < -atr_d1 * profile["junior_floor"] and junior_hist_now <= junior_hist_prev + atr_d1 * profile["junior_expand"])
+        or (
+            junior_prev >= 0
+            and junior_now < junior_prev
+            and junior_now < junior_sig
+            and abs(junior_now) <= atr_d1 * profile["junior_near_zero"]
+        )
+    )
+
+    signal_key_buy = f"{family}|DMACD|{confirm['time'].isoformat()}|BUY"
+    signal_key_sell = f"{family}|DMACD|{confirm['time'].isoformat()}|SELL"
+    last_signal_key = strategy_runtime.get(branch_name, {}).get("last_signal_key_by_symbol", {}).get(symbol)
+    if last_signal_key in {signal_key_buy, signal_key_sell}:
+        return blocked_signal(branch_name, "DUPLICATE LEG", confirm["time"].strftime("%Y-%m-%d"))
+
+    h4_state = _double_macd_h4_state(df_h4)
+
+    if long_context and junior_long:
+        swing_low = float(low.iloc[-profile["swing_lookback"]:-1].min())
+        sl_price = min(swing_low, sma_now) - atr_d1 * profile["sl_buffer"]
+        conf = profile["boost_conf"] if junior_now > max(junior_prev, atr_d1 * profile["junior_floor"]) and senior_now > senior_prev else profile["base_conf"]
+        details = {
+            "instrument": profile["display"],
+            "direction": "LONG",
+            "reason": "price above SMA60 with senior MACD above zero and junior timing aligned",
+            "price_vs_sma60": f"close {price_now:.2f} > SMA60 {sma_now:.2f}",
+            "senior_state": f"MACD {senior_now:.3f} | signal {senior_sig:.3f} | hist {senior_hist_now:.3f}",
+            "junior_state": f"MACD {junior_prev:.3f}->{junior_now:.3f} | hist {junior_hist_now:.3f}",
+            "entry_price": float(tick.ask),
+            "stop_loss": float(sl_price),
+            "take_profit": "1R partial + trailing while senior MACD stays aligned",
+            "trade_state": f"setup valid | H4 {h4_state}",
+            "summary": (
+                f"{profile['display']} LONG | Doppio MACD bullish | close above SMA60 | "
+                f"senior {senior_now:.3f} | junior {junior_prev:.3f}->{junior_now:.3f} | "
+                f"entry {tick.ask:.2f} | SL {sl_price:.2f} | 1R partial + trailing | setup valid"
+            ),
+        }
+        return {
+            "signal": "BUY",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_d1,
+            "sl_price": round(sl_price, 5),
+            "signal_key": signal_key_buy,
+            "signal_details": details,
+        }
+
+    if short_context and junior_short:
+        swing_high = float(high.iloc[-profile["swing_lookback"]:-1].max())
+        sl_price = max(swing_high, sma_now) + atr_d1 * profile["sl_buffer"]
+        conf = profile["boost_conf"] if junior_now < min(junior_prev, -atr_d1 * profile["junior_floor"]) and senior_now < senior_prev else profile["base_conf"]
+        details = {
+            "instrument": profile["display"],
+            "direction": "SHORT",
+            "reason": "price below SMA60 with senior MACD below zero and junior timing aligned",
+            "price_vs_sma60": f"close {price_now:.2f} < SMA60 {sma_now:.2f}",
+            "senior_state": f"MACD {senior_now:.3f} | signal {senior_sig:.3f} | hist {senior_hist_now:.3f}",
+            "junior_state": f"MACD {junior_prev:.3f}->{junior_now:.3f} | hist {junior_hist_now:.3f}",
+            "entry_price": float(tick.bid),
+            "stop_loss": float(sl_price),
+            "take_profit": "1R partial + trailing while senior MACD stays aligned",
+            "trade_state": f"setup valid | H4 {h4_state}",
+            "summary": (
+                f"{profile['display']} SHORT | Doppio MACD bearish | close below SMA60 | "
+                f"senior {senior_now:.3f} | junior {junior_prev:.3f}->{junior_now:.3f} | "
+                f"entry {tick.bid:.2f} | SL {sl_price:.2f} | 1R partial + trailing | setup valid"
+            ),
+        }
+        return {
+            "signal": "SELL",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_d1,
+            "sl_price": round(sl_price, 5),
+            "signal_key": signal_key_sell,
+            "signal_details": details,
+        }
+
+    if not long_context and not short_context:
+        if price_now > sma_now and senior_now <= 0:
+            return blocked_signal(branch_name, "SENIOR OPPOSITE", f"S {senior_now:.3f}")
+        if price_now < sma_now and senior_now >= 0:
+            return blocked_signal(branch_name, "SENIOR OPPOSITE", f"S {senior_now:.3f}")
+        return blocked_signal(branch_name, "NO TREND ALIGN", f"SMA60 {sma_now:.2f}")
+    if long_context and not junior_long:
+        return blocked_signal(branch_name, "JUNIOR NOT READY", f"J {junior_prev:.3f}->{junior_now:.3f}")
+    if short_context and not junior_short:
+        return blocked_signal(branch_name, "JUNIOR NOT READY", f"J {junior_prev:.3f}->{junior_now:.3f}")
+    return blocked_signal(branch_name, "DOUBLE MACD WAIT", confirm["time"].strftime("%Y-%m-%d"))
+
+
+def strategy_us500_double_macd(df, symbol):
+    return strategy_double_macd(df, symbol, "US500_DOUBLE_MACD", "US500")
+
+
+def strategy_btc_double_macd(df, symbol):
+    return strategy_double_macd(df, symbol, "BTC_DOUBLE_MACD", "BTCUSD")
+
+
+def strategy_eth_double_macd(df, symbol):
+    return strategy_double_macd(df, symbol, "ETH_DOUBLE_MACD", "ETHUSD")
+
+
+HEIKEN_TDI_PROFILES = {
+    "USTECH": {
+        "display": "US100",
+        "session": (13, 23),
+        "tdi_clear": 0.55,
+        "yellow_slope": 0.16,
+        "yellow_pad": 0.25,
+        "tdi_relax": 0.20,
+        "compression": 0.35,
+        "body_floor": 0.10,
+        "key_level_pad": 0.45,
+        "key_level_exit": 0.22,
+        "daily_sl_mult": 0.22,
+        "swing_lookback": 8,
+        "whipsaw_limit": 2,
+        "base_conf": 76,
+        "boost_conf": 84,
+    },
+    "BTCUSD": {
+        "display": "BTC",
+        "session": (0, 23),
+        "tdi_clear": 0.85,
+        "yellow_slope": 0.22,
+        "yellow_pad": 0.38,
+        "tdi_relax": 0.26,
+        "compression": 0.50,
+        "body_floor": 0.08,
+        "key_level_pad": 0.60,
+        "key_level_exit": 0.28,
+        "daily_sl_mult": 0.34,
+        "swing_lookback": 10,
+        "whipsaw_limit": 2,
+        "base_conf": 78,
+        "boost_conf": 86,
+    },
+    "ETHUSD": {
+        "display": "ETH",
+        "session": (0, 23),
+        "tdi_clear": 0.95,
+        "yellow_slope": 0.24,
+        "yellow_pad": 0.42,
+        "tdi_relax": 0.28,
+        "compression": 0.56,
+        "body_floor": 0.09,
+        "key_level_pad": 0.58,
+        "key_level_exit": 0.26,
+        "daily_sl_mult": 0.32,
+        "swing_lookback": 10,
+        "whipsaw_limit": 2,
+        "base_conf": 77,
+        "boost_conf": 85,
+    },
+}
+
+
+def _heiken_tdi_higher_state(df_tf):
+    if df_tf is None or len(df_tf) < 90:
+        return "N/A"
+    ha_open, _, _, ha_close = compute_heiken_ashi_smoothed(df_tf, 2, 6, 3, 2)
+    green, red, yellow, _ = compute_tdi(df_tf["close"], 13, 34, 2, 7)
+    blue_now = bool(ha_close.iloc[-2] > ha_open.iloc[-2])
+    yellow_slope = float(yellow.iloc[-2] - yellow.iloc[-3])
+    green_now = float(green.iloc[-2])
+    red_now = float(red.iloc[-2])
+    yellow_now = float(yellow.iloc[-2])
+    if blue_now and green_now > red_now and green_now > yellow_now and yellow_slope > 0:
+        return "UP"
+    if (not blue_now) and green_now < red_now and green_now < yellow_now and yellow_slope < 0:
+        return "DOWN"
+    return "MIXED"
+
+
+def get_heiken_tdi_exit_reason(symbol, strategy_cfg, signal):
+    family = strategy_cfg.get("symbol_family")
+    profile = HEIKEN_TDI_PROFILES.get(family)
+    if not profile:
+        return None
+
+    df_h1 = get_h1_cached(symbol)
+    df_h4 = get_h4_cached(symbol)
+    if df_h1 is None or len(df_h1) < 100 or df_h4 is None or len(df_h4) < 70:
+        return None
+
+    atr_h1 = float(df_h1["atr"].iloc[-2] or 0.0)
+    atr_h4 = float(df_h4["atr"].iloc[-2] or 0.0)
+    if atr_h1 <= 0 or atr_h4 <= 0:
+        return None
+
+    ha_open_h1, _, _, ha_close_h1 = compute_heiken_ashi_smoothed(df_h1, 2, 6, 3, 2)
+    h1_blue = ha_close_h1 > ha_open_h1
+    same_color_count, same_color_state = count_consecutive_state(h1_blue, end_offset=2)
+    green_h4, red_h4, yellow_h4, _ = compute_tdi(df_h4["close"], 13, 34, 2, 7)
+    green_now = float(green_h4.iloc[-2])
+    green_prev = float(green_h4.iloc[-3])
+    yellow_now = float(yellow_h4.iloc[-2])
+    yellow_prev = float(yellow_h4.iloc[-3])
+    h4_resistance = float(df_h4["high"].iloc[-22:-2].max())
+    h4_support = float(df_h4["low"].iloc[-22:-2].min())
+    close_now = float(df_h4["close"].iloc[-2])
+
+    if signal == "BUY":
+        if green_prev >= yellow_prev and green_now < yellow_now - profile["yellow_pad"] * 0.4:
+            return "TDI green rolled below yellow on H4"
+        if bool(same_color_state) and same_color_count > 10:
+            return "HAS trend extended beyond 10 bars on H1"
+        if 0 < (h4_resistance - close_now) < atr_h4 * profile["key_level_exit"]:
+            return "price approaching strong H4 resistance"
+    else:
+        if green_prev <= yellow_prev and green_now > yellow_now + profile["yellow_pad"] * 0.4:
+            return "TDI green rolled above yellow on H4"
+        if (not bool(same_color_state)) and same_color_count > 10:
+            return "HAS trend extended beyond 10 bars on H1"
+        if 0 < (close_now - h4_support) < atr_h4 * profile["key_level_exit"]:
+            return "price approaching strong H4 support"
+    return None
+
+
+def strategy_heiken_tdi(df, symbol, branch_name, family):
+    profile = HEIKEN_TDI_PROFILES[family]
+    if is_crypto_family(family) and not crypto_enabled:
+        return blocked_signal(branch_name, "CRYPTO OFF")
+
+    hour = get_broker_hour()
+    session_start, session_end = profile["session"]
+    if not _session_open(hour, session_start, session_end):
+        return blocked_signal(branch_name, "OUT SESSION")
+
+    df_h1 = get_h1_cached(symbol)
+    df_h4 = get_h4_cached(symbol)
+    df_d1 = get_d1_cached(symbol)
+    if df_h1 is None or len(df_h1) < 130:
+        return blocked_signal(branch_name, "NO H1 DATA")
+    if df_h4 is None or len(df_h4) < 90:
+        return blocked_signal(branch_name, "NO H4 DATA")
+    if df_d1 is None or len(df_d1) < 40:
+        return blocked_signal(branch_name, "NO D1 DATA")
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return blocked_signal(branch_name, "NO TICK")
+
+    atr_h1 = float(df_h1["atr"].iloc[-2] or 0.0)
+    atr_d1 = float(df_d1["atr"].iloc[-2] or 0.0)
+    if atr_h1 <= 0 or atr_d1 <= 0:
+        return blocked_signal(branch_name, "NO ATR")
+
+    ha_open, _, ha_low, ha_close = compute_heiken_ashi_smoothed(df_h1, 2, 6, 3, 2)
+    green, red, yellow, _ = compute_tdi(df_h1["close"], 13, 34, 2, 7)
+
+    confirm = df_h1.iloc[-2]
+    current = df_h1.iloc[-1]
+    body = abs(float(confirm["close"] - confirm["open"]))
+    blue_series = ha_close > ha_open
+    same_color_count, same_color_state = count_consecutive_state(blue_series, end_offset=2)
+    blue_now = bool(blue_series.iloc[-2])
+    blue_prev = bool(blue_series.iloc[-3])
+    blue_prev2 = bool(blue_series.iloc[-4])
+
+    green_now = float(green.iloc[-2])
+    green_prev = float(green.iloc[-3])
+    green_prev2 = float(green.iloc[-4])
+    red_now = float(red.iloc[-2])
+    red_prev = float(red.iloc[-3])
+    red_prev2 = float(red.iloc[-4])
+    yellow_now = float(yellow.iloc[-2])
+    yellow_prev = float(yellow.iloc[-3])
+    tdi_spread = abs(green_now - red_now)
+    whipsaw_flips = _count_sign_flips(green - red, lookback=7, end_offset=2)
+
+    if same_color_count <= 0:
+        return blocked_signal(branch_name, "NO HAS STATE")
+    if body < atr_h1 * profile["body_floor"]:
+        return blocked_signal(branch_name, "WEAK H1 BODY", pretrigger_text("BODY", atr_h1 * profile["body_floor"] - body, atr_h1))
+    if same_color_count > 2:
+        return blocked_signal(branch_name, "HAS EXTENDED", f"{same_color_count} bars")
+    if whipsaw_flips > profile["whipsaw_limit"]:
+        return blocked_signal(branch_name, "TDI WHIPSAW", f"FLIPS {whipsaw_flips}")
+    if tdi_spread < profile["compression"] and abs(yellow_now - yellow_prev) < profile["yellow_slope"]:
+        return blocked_signal(branch_name, "TDI COMPRESSED", f"G/R {tdi_spread:.2f}")
+
+    long_has_ready = blue_now and ((not blue_prev) or (same_color_count == 2 and not blue_prev2))
+    short_has_ready = (not blue_now) and (blue_prev or (same_color_count == 2 and blue_prev2))
+    yellow_rising = yellow_now > yellow_prev + profile["yellow_slope"]
+    yellow_falling = yellow_now < yellow_prev - profile["yellow_slope"]
+
+    long_cross_now = green_prev <= red_prev and green_now > red_now + profile["tdi_clear"]
+    short_cross_now = green_prev >= red_prev and green_now < red_now - profile["tdi_clear"]
+    long_cross_prev = (
+        green_prev2 <= red_prev2
+        and green_prev > red_prev + profile["tdi_clear"] * 0.45
+        and green_now > red_now
+        and green_now >= green_prev - profile["tdi_relax"]
+    )
+    short_cross_prev = (
+        green_prev2 >= red_prev2
+        and green_prev < red_prev - profile["tdi_clear"] * 0.45
+        and green_now < red_now
+        and green_now <= green_prev + profile["tdi_relax"]
+    )
+    long_tdi_ready = (long_cross_now or long_cross_prev) and yellow_rising and green_now > yellow_now + profile["yellow_pad"]
+    short_tdi_ready = (short_cross_now or short_cross_prev) and yellow_falling and green_now < yellow_now - profile["yellow_pad"]
+
+    h4_state = _heiken_tdi_higher_state(df_h4)
+    if long_has_ready and h4_state == "DOWN":
+        return blocked_signal(branch_name, "H4 OPPOSITE", "H4 bearish structure")
+    if short_has_ready and h4_state == "UP":
+        return blocked_signal(branch_name, "H4 OPPOSITE", "H4 bullish structure")
+
+    h4_resistance = float(df_h4["high"].iloc[-22:-2].max())
+    h4_support = float(df_h4["low"].iloc[-22:-2].min())
+    if 0 < (h4_resistance - float(confirm["close"])) < atr_h1 * profile["key_level_pad"] and long_has_ready:
+        return blocked_signal(branch_name, "NEAR RESISTANCE", pretrigger_text("H4", atr_h1 * profile["key_level_pad"] - (h4_resistance - float(confirm["close"])), atr_h1))
+    if 0 < (float(confirm["close"]) - h4_support) < atr_h1 * profile["key_level_pad"] and short_has_ready:
+        return blocked_signal(branch_name, "NEAR SUPPORT", pretrigger_text("H4", atr_h1 * profile["key_level_pad"] - (float(confirm["close"]) - h4_support), atr_h1))
+
+    signal_key_buy = f"{family}|HTDI|{confirm['time'].isoformat()}|BUY"
+    signal_key_sell = f"{family}|HTDI|{confirm['time'].isoformat()}|SELL"
+    last_signal_key = strategy_runtime.get(branch_name, {}).get("last_signal_key_by_symbol", {}).get(symbol)
+    if last_signal_key in {signal_key_buy, signal_key_sell}:
+        return blocked_signal(branch_name, "DUPLICATE LEG", confirm["time"].strftime("%Y-%m-%d %H:%M"))
+
+    if family == "ETHUSD":
+        long_tdi_ready = long_tdi_ready and blue_series.iloc[-3] == blue_series.iloc[-2]
+        short_tdi_ready = short_tdi_ready and blue_series.iloc[-3] == blue_series.iloc[-2]
+
+    if long_has_ready and long_tdi_ready:
+        swing_low = float(min(df_h1["low"].iloc[-profile["swing_lookback"]:-1].min(), ha_low.iloc[-2]))
+        sl_price = swing_low - atr_d1 * profile["daily_sl_mult"]
+        conf = profile["boost_conf"] if h4_state == "UP" and green_now > green_prev else profile["base_conf"]
+        details = {
+            "instrument": profile["display"],
+            "direction": "LONG",
+            "reason": "new bullish HeikenAshi Smoothed bar with TDI green crossing above red and yellow rising",
+            "has_color": "BLUE",
+            "tdi_state": f"green {green_prev:.2f}->{green_now:.2f} vs red {red_prev:.2f}->{red_now:.2f}",
+            "yellow_direction": f"UP {yellow_prev:.2f}->{yellow_now:.2f}",
+            "has_bars": same_color_count,
+            "entry_price": float(tick.ask),
+            "stop_loss": float(sl_price),
+            "take_profit": "1R partial + trailing while TDI stays above yellow",
+            "trend_h1": f"BLUE | {same_color_count} bars",
+            "trend_h4": h4_state,
+            "summary": (
+                f"{profile['display']} LONG | HAS blue fresh | TDI green above red | yellow up | "
+                f"{same_color_count} bars | entry {tick.ask:.2f} | SL {sl_price:.2f} | "
+                f"1R partial + trailing | H1 BLUE | H4 {h4_state}"
+            ),
+        }
+        return {
+            "signal": "BUY",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_h1,
+            "sl_price": round(sl_price, 5),
+            "signal_key": signal_key_buy,
+            "signal_details": details,
+        }
+
+    if short_has_ready and short_tdi_ready:
+        swing_high = float(max(df_h1["high"].iloc[-profile["swing_lookback"]:-1].max(), df_h1["high"].iloc[-2]))
+        sl_price = swing_high + atr_d1 * profile["daily_sl_mult"]
+        conf = profile["boost_conf"] if h4_state == "DOWN" and green_now < green_prev else profile["base_conf"]
+        details = {
+            "instrument": profile["display"],
+            "direction": "SHORT",
+            "reason": "new bearish HeikenAshi Smoothed bar with TDI green crossing below red and yellow falling",
+            "has_color": "RED",
+            "tdi_state": f"green {green_prev:.2f}->{green_now:.2f} vs red {red_prev:.2f}->{red_now:.2f}",
+            "yellow_direction": f"DOWN {yellow_prev:.2f}->{yellow_now:.2f}",
+            "has_bars": same_color_count,
+            "entry_price": float(tick.bid),
+            "stop_loss": float(sl_price),
+            "take_profit": "1R partial + trailing while TDI stays below yellow",
+            "trend_h1": f"RED | {same_color_count} bars",
+            "trend_h4": h4_state,
+            "summary": (
+                f"{profile['display']} SHORT | HAS red fresh | TDI green below red | yellow down | "
+                f"{same_color_count} bars | entry {tick.bid:.2f} | SL {sl_price:.2f} | "
+                f"1R partial + trailing | H1 RED | H4 {h4_state}"
+            ),
+        }
+        return {
+            "signal": "SELL",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_h1,
+            "sl_price": round(sl_price, 5),
+            "signal_key": signal_key_sell,
+            "signal_details": details,
+        }
+
+    if blue_now and not long_has_ready:
+        return blocked_signal(branch_name, "HAS TOO OLD", f"{same_color_count} blue bars")
+    if (not blue_now) and not short_has_ready:
+        return blocked_signal(branch_name, "HAS TOO OLD", f"{same_color_count} red bars")
+    if long_has_ready and not long_tdi_ready:
+        return blocked_signal(branch_name, "TDI NOT READY", f"G/R {green_now:.2f}/{red_now:.2f}")
+    if short_has_ready and not short_tdi_ready:
+        return blocked_signal(branch_name, "TDI NOT READY", f"G/R {green_now:.2f}/{red_now:.2f}")
+    return blocked_signal(branch_name, "HEIKEN TDI WAIT", confirm["time"].strftime("%H:%M"))
+
+
+def strategy_ustech_heiken_tdi(df, symbol):
+    return strategy_heiken_tdi(df, symbol, "USTECH_HEIKEN_TDI", "USTECH")
+
+
+def strategy_btc_heiken_tdi(df, symbol):
+    return strategy_heiken_tdi(df, symbol, "BTC_HEIKEN_TDI", "BTCUSD")
+
+
+def strategy_eth_heiken_tdi(df, symbol):
+    return strategy_heiken_tdi(df, symbol, "ETH_HEIKEN_TDI", "ETHUSD")
+
+
 def strategy_jpn225_orb(df, symbol):
     attack = is_attack_runtime()
     df_m15 = get_m15_cached(symbol)
@@ -3247,14 +7207,14 @@ def strategy_us500_orb(df, symbol):
     recent_high = post_orb["high"].tail(8).max()
     recent_low = post_orb["low"].tail(8).min()
 
-    trend_min = 0.12 if attack else 0.85
-    long_trigger = orb_high + atr_m5 * (0.01 if attack else 0.04)
-    short_trigger = orb_low - atr_m5 * (0.01 if attack else 0.04)
-    long_hold = min(prev["low"], last["low"]) >= orb_high - atr_m5 * (0.16 if attack else 0.10)
-    short_hold = max(prev["high"], last["high"]) <= orb_low + atr_m5 * (0.16 if attack else 0.10)
-    strong_body = body >= atr_m5 * (0.05 if attack else 0.08)
-    clean_long_candle = wick_up <= body * (1.05 if attack else 0.90)
-    clean_short_candle = wick_down <= body * (1.05 if attack else 0.90)
+    trend_min = 0.18 if attack else 0.95
+    long_trigger = orb_high + atr_m5 * (0.02 if attack else 0.06)
+    short_trigger = orb_low - atr_m5 * (0.02 if attack else 0.06)
+    long_hold = min(prev["low"], last["low"]) >= orb_high - atr_m5 * (0.14 if attack else 0.08)
+    short_hold = max(prev["high"], last["high"]) <= orb_low + atr_m5 * (0.14 if attack else 0.08)
+    strong_body = body >= atr_m5 * (0.06 if attack else 0.09)
+    clean_long_candle = wick_up <= max(body * (1.00 if attack else 0.82), atr_m5 * (0.18 if attack else 0.12))
+    clean_short_candle = wick_down <= max(body * (1.00 if attack else 0.82), atr_m5 * (0.18 if attack else 0.12))
 
     if (
         ema20 > ema50
@@ -3305,15 +7265,15 @@ def strategy_us500_orb(df, symbol):
     if ema20 < ema50 and price > short_trigger:
         return blocked_signal("US500_ORB", "NO BREAKDOWN", pretrigger_text("BRK", price - short_trigger, atr_m5))
     if ema20 > ema50 and not long_hold:
-        return blocked_signal("US500_ORB", "NO HOLD ABOVE ORB", pretrigger_text("HOLD", (orb_high - atr_m5 * 0.10) - min(prev["low"], last["low"]), atr_m5))
+        return blocked_signal("US500_ORB", "NO HOLD ABOVE ORB", pretrigger_text("HOLD", (orb_high - atr_m5 * (0.14 if attack else 0.08)) - min(prev["low"], last["low"]), atr_m5))
     if ema20 < ema50 and not short_hold:
-        return blocked_signal("US500_ORB", "NO HOLD BELOW ORB", pretrigger_text("HOLD", max(prev["high"], last["high"]) - (orb_low + atr_m5 * 0.10), atr_m5))
+        return blocked_signal("US500_ORB", "NO HOLD BELOW ORB", pretrigger_text("HOLD", max(prev["high"], last["high"]) - (orb_low + atr_m5 * (0.14 if attack else 0.08)), atr_m5))
     if not strong_body:
-        return blocked_signal("US500_ORB", "WEAK OPEN DRIVE", pretrigger_text("BODY", atr_m5 * 0.08 - body, atr_m5))
+        return blocked_signal("US500_ORB", "WEAK OPEN DRIVE", pretrigger_text("BODY", atr_m5 * (0.06 if attack else 0.09) - body, atr_m5))
     if ema20 > ema50 and not clean_long_candle:
-        return blocked_signal("US500_ORB", "UPPER WICK HEAVY", pretrigger_text("WICK", wick_up - body * 0.90, atr_m5))
+        return blocked_signal("US500_ORB", "UPPER WICK HEAVY", pretrigger_text("WICK", wick_up - max(body * (1.00 if attack else 0.82), atr_m5 * (0.18 if attack else 0.12)), atr_m5))
     if ema20 < ema50 and not clean_short_candle:
-        return blocked_signal("US500_ORB", "LOWER WICK HEAVY", pretrigger_text("WICK", wick_down - body * 0.90, atr_m5))
+        return blocked_signal("US500_ORB", "LOWER WICK HEAVY", pretrigger_text("WICK", wick_down - max(body * (1.00 if attack else 0.82), atr_m5 * (0.18 if attack else 0.12)), atr_m5))
     return blocked_signal("US500_ORB", "TREND MIXED", pretrigger_text("EMA", abs(ema20 - ema50), atr_m5))
 
 
@@ -3910,17 +7870,673 @@ def strategy_ger40_scalping(df, symbol):
     return blocked_signal("GER40_SCALP", "TREND NOT READY", pretrigger_text("EMA", abs(df['close'].ewm(span=20).mean().iloc[-1] - df['close'].ewm(span=50).mean().iloc[-1]), df['atr'].iloc[-1]))
 
 
+TITANYX_PROFILES = {
+    "US500": {
+        "display": "S&P 500",
+        "session_tz": "US/Eastern",
+        "cash_open": "09:30",
+        "entry_windows": [("09:40", "15:15")],
+        "flat_time": "15:45",
+        "news_windows": [],
+        "priority_rank": 1,
+        "grid_step": 0.30,
+        "grid_mult": 1.35,
+        "max_orders": 4,
+        "tp_atr": 0.22,
+        "basket_stop_atr": 1.8,
+        "z_entry": 2.0,
+        "z_readd": 1.55,
+        "rsi_long": 30,
+        "rsi_short": 70,
+        "rsi_readd_long": 38,
+        "rsi_readd_short": 62,
+        "atr_spike_mult": 1.8,
+        "bar_range_mult": 1.5,
+        "gap_atr_mult": 1.1,
+        "ema_divergence": 0.95,
+        "first_hour_pad": 0.18,
+        "risk_scales": [1.00, 0.82, 0.68, 0.58],
+        "daily_equity_dd": 0.012,
+        "weekly_equity_dd": 0.022,
+        "score_base": 70,
+    },
+    "EUSTX50": {
+        "display": "Euro Stoxx 50",
+        "session_tz": "Europe/Paris",
+        "cash_open": "09:00",
+        "entry_windows": [("09:05", "16:40")],
+        "flat_time": "17:10",
+        "news_windows": [],
+        "priority_rank": 2,
+        "grid_step": 0.35,
+        "grid_mult": 1.35,
+        "max_orders": 4,
+        "tp_atr": 0.25,
+        "basket_stop_atr": 1.8,
+        "z_entry": 2.0,
+        "z_readd": 1.60,
+        "rsi_long": 30,
+        "rsi_short": 70,
+        "rsi_readd_long": 39,
+        "rsi_readd_short": 61,
+        "atr_spike_mult": 1.8,
+        "bar_range_mult": 1.5,
+        "gap_atr_mult": 1.0,
+        "ema_divergence": 0.90,
+        "first_hour_pad": 0.16,
+        "risk_scales": [1.00, 0.84, 0.70, 0.60],
+        "daily_equity_dd": 0.011,
+        "weekly_equity_dd": 0.020,
+        "score_base": 69,
+    },
+    "UK100": {
+        "display": "FTSE 100",
+        "session_tz": "Europe/London",
+        "cash_open": "08:00",
+        "entry_windows": [("08:05", "15:50")],
+        "flat_time": "16:20",
+        "news_windows": [],
+        "priority_rank": 3,
+        "grid_step": 0.35,
+        "grid_mult": 1.35,
+        "max_orders": 4,
+        "tp_atr": 0.25,
+        "basket_stop_atr": 1.8,
+        "z_entry": 2.0,
+        "z_readd": 1.60,
+        "rsi_long": 30,
+        "rsi_short": 70,
+        "rsi_readd_long": 39,
+        "rsi_readd_short": 61,
+        "atr_spike_mult": 1.8,
+        "bar_range_mult": 1.5,
+        "gap_atr_mult": 1.0,
+        "ema_divergence": 0.88,
+        "first_hour_pad": 0.16,
+        "risk_scales": [1.00, 0.84, 0.70, 0.60],
+        "daily_equity_dd": 0.011,
+        "weekly_equity_dd": 0.020,
+        "score_base": 68,
+    },
+    "FRA40": {
+        "display": "CAC 40",
+        "session_tz": "Europe/Paris",
+        "cash_open": "09:00",
+        "entry_windows": [("09:05", "16:40")],
+        "flat_time": "17:10",
+        "news_windows": [],
+        "priority_rank": 4,
+        "grid_step": 0.40,
+        "grid_mult": 1.35,
+        "max_orders": 4,
+        "tp_atr": 0.28,
+        "basket_stop_atr": 1.8,
+        "z_entry": 2.05,
+        "z_readd": 1.65,
+        "rsi_long": 30,
+        "rsi_short": 70,
+        "rsi_readd_long": 40,
+        "rsi_readd_short": 60,
+        "atr_spike_mult": 1.8,
+        "bar_range_mult": 1.5,
+        "gap_atr_mult": 1.0,
+        "ema_divergence": 0.92,
+        "first_hour_pad": 0.18,
+        "risk_scales": [1.00, 0.82, 0.68, 0.58],
+        "daily_equity_dd": 0.010,
+        "weekly_equity_dd": 0.019,
+        "score_base": 67,
+    },
+    "US30": {
+        "display": "Dow Jones 30",
+        "session_tz": "US/Eastern",
+        "cash_open": "09:30",
+        "entry_windows": [("09:40", "15:10")],
+        "flat_time": "15:40",
+        "news_windows": [],
+        "priority_rank": 5,
+        "grid_step": 0.40,
+        "grid_mult": 1.35,
+        "max_orders": 3,
+        "tp_atr": 0.30,
+        "basket_stop_atr": 1.8,
+        "z_entry": 2.05,
+        "z_readd": 1.70,
+        "rsi_long": 30,
+        "rsi_short": 70,
+        "rsi_readd_long": 40,
+        "rsi_readd_short": 60,
+        "atr_spike_mult": 1.8,
+        "bar_range_mult": 1.5,
+        "gap_atr_mult": 1.15,
+        "ema_divergence": 1.00,
+        "first_hour_pad": 0.18,
+        "risk_scales": [1.00, 0.80, 0.66],
+        "daily_equity_dd": 0.012,
+        "weekly_equity_dd": 0.022,
+        "score_base": 66,
+    },
+}
+
+
+def _titanyx_exchange_state(profile):
+    now_exchange = get_exchange_now(profile["session_tz"])
+    now_minutes = now_exchange.hour * 60 + now_exchange.minute
+    flat_minutes = _time_hhmm_to_minutes(profile["flat_time"])
+    weekday = now_exchange.weekday()
+    entry_ok = _time_in_exchange_windows(profile["session_tz"], profile["entry_windows"]) and weekday < 5 and now_minutes < flat_minutes
+    force_flat = weekday >= 5 or now_minutes >= flat_minutes
+    return {
+        "now": now_exchange,
+        "weekday": weekday,
+        "entry_ok": entry_ok,
+        "force_flat": force_flat,
+        "label": now_exchange.strftime("%a %H:%M"),
+    }
+
+
+def _titanyx_news_blocked(profile):
+    news_windows = list(profile.get("news_windows") or [])
+    if not news_windows:
+        return False
+    now = get_exchange_now(profile["session_tz"])
+    now_minutes = now.hour * 60 + now.minute
+    for center_text in news_windows:
+        center_minutes = _time_hhmm_to_minutes(center_text)
+        if abs(now_minutes - center_minutes) <= 30:
+            return True
+    return False
+
+
+def _titanyx_equity_state(profile):
+    global titanyx_week_state
+    acc = mt5.account_info()
+    ensure_session_balance_anchor()
+    if not acc:
+        return {"blocked": False, "alert": False, "daily_dd": 0.0, "weekly_dd": 0.0, "label": "NO ACCOUNT"}
+
+    now_local = datetime.now()
+    iso_week = f"{now_local.isocalendar().year}-{now_local.isocalendar().week}"
+    if titanyx_week_state.get("week") != iso_week or not titanyx_week_state.get("balance"):
+        titanyx_week_state = {"week": iso_week, "balance": float(acc.balance)}
+
+    day_anchor = max(float(session_balance_start or acc.balance), 1e-6)
+    week_anchor = max(float(titanyx_week_state.get("balance") or acc.balance), 1e-6)
+    daily_dd = max(0.0, (day_anchor - float(acc.equity)) / day_anchor)
+    weekly_dd = max(0.0, (week_anchor - float(acc.equity)) / week_anchor)
+    blocked = daily_dd >= profile["daily_equity_dd"] or weekly_dd >= profile["weekly_equity_dd"]
+    alert = daily_dd >= profile["daily_equity_dd"] * 0.75 or weekly_dd >= profile["weekly_equity_dd"] * 0.75
+    return {
+        "blocked": blocked,
+        "alert": alert,
+        "daily_dd": daily_dd,
+        "weekly_dd": weekly_dd,
+        "label": f"D {daily_dd*100:.2f}% | W {weekly_dd*100:.2f}%",
+    }
+
+
+def _titanyx_cluster_snapshot(symbol, strategy_tag):
+    positions = get_strategy_cluster_positions(symbol, strategy_tag)
+    if not positions:
+        return None
+    total_volume = sum(float(p.volume) for p in positions)
+    if total_volume <= 0:
+        return None
+    avg_entry = sum(float(p.price_open) * float(p.volume) for p in positions) / total_volume
+    open_profit = sum(float(p.profit) for p in positions)
+    direction = "BUY" if positions[0].type == 0 else "SELL"
+    return {
+        "positions": positions,
+        "orders": len(positions),
+        "avg_entry": float(avg_entry),
+        "direction": direction,
+        "open_profit": float(open_profit),
+        "total_volume": float(total_volume),
+    }
+
+
+def _titanyx_first_hour_breakout_active(df_m5, profile):
+    if df_m5 is None or len(df_m5) < 40:
+        return False
+    tz_name = profile["session_tz"]
+    open_minutes = _time_hhmm_to_minutes(profile["cash_open"])
+    first_hour_end = open_minutes + 60
+    rows = []
+    for _, row in df_m5.tail(120).iterrows():
+        exchange_time = broker_time_to_exchange(row["time"], tz_name)
+        if exchange_time is None:
+            continue
+        rows.append((exchange_time, row))
+    if len(rows) < 20:
+        return False
+    current_day = rows[-2][0].date()
+    day_rows = [(ts, row) for ts, row in rows if ts.date() == current_day]
+    first_hour = []
+    for ts, row in day_rows:
+        minutes = ts.hour * 60 + ts.minute
+        if open_minutes <= minutes < first_hour_end:
+            first_hour.append(row)
+    if len(first_hour) < 3:
+        return False
+    first_hour_df = pd.DataFrame(first_hour)
+    recent_df = pd.DataFrame([row for _, row in day_rows])
+    atr_now = float(recent_df["atr"].iloc[-2] or 0.0)
+    if atr_now <= 0:
+        return False
+    upper = float(first_hour_df["high"].max())
+    lower = float(first_hour_df["low"].min())
+    close_now = float(recent_df["close"].iloc[-2])
+    if close_now > upper + atr_now * profile["first_hour_pad"]:
+        return True
+    if close_now < lower - atr_now * profile["first_hour_pad"]:
+        return True
+    return False
+
+
+def _titanyx_volatility_state(symbol, df_m5, df_m15, profile):
+    if df_m5 is None or len(df_m5) < 80 or df_m15 is None or len(df_m15) < 60:
+        return {"blocked": True, "add_blocked": True, "label": "NO VOL DATA"}
+
+    atr_now = float(df_m5["atr"].iloc[-2] or 0.0)
+    atr_mean = float(df_m5["atr"].iloc[-22:-2].mean() or 0.0)
+    current_bar = df_m5.iloc[-2]
+    current_range = float(current_bar["high"] - current_bar["low"])
+    if atr_now <= 0 or atr_mean <= 0:
+        return {"blocked": True, "add_blocked": True, "label": "NO ATR"}
+
+    ema20_m15 = df_m15["close"].ewm(span=20).mean()
+    ema50_m15 = df_m15["close"].ewm(span=50).mean()
+    divergence = abs(float(ema20_m15.iloc[-2] - ema50_m15.iloc[-2])) / max(atr_now, 1e-6)
+
+    day_slice = df_m5.iloc[-60:].copy()
+    latest_day = day_slice["time"].dt.date.iloc[-1]
+    day_slice = day_slice[day_slice["time"].dt.date == latest_day]
+    session_gap = 0.0
+    if len(day_slice) >= 2 and len(df_m5) > len(day_slice):
+        session_gap = abs(float(day_slice["open"].iloc[0] - df_m5["close"].iloc[-len(day_slice)-1]))
+
+    breakout_active = _titanyx_first_hour_breakout_active(df_m5, profile)
+    atr_spike = atr_now > atr_mean * profile["atr_spike_mult"]
+    range_spike = current_range > atr_now * profile["bar_range_mult"]
+    gap_spike = session_gap > atr_now * profile["gap_atr_mult"]
+    trend_impulsive = divergence > profile["ema_divergence"]
+    blocked = atr_spike or range_spike or gap_spike or breakout_active or trend_impulsive
+    add_blocked = blocked or atr_now > atr_mean * 1.35 or current_range > atr_now * 1.15
+    reasons = []
+    if atr_spike:
+        reasons.append("ATR SPIKE")
+    if range_spike:
+        reasons.append("BAR RANGE SPIKE")
+    if gap_spike:
+        reasons.append("GAP ACTIVE")
+    if breakout_active:
+        reasons.append("FIRST HOUR BREAKOUT")
+    if trend_impulsive:
+        reasons.append("EMA DIVERGENCE")
+    return {
+        "blocked": blocked,
+        "add_blocked": add_blocked,
+        "label": " | ".join(reasons) if reasons else "NORMAL",
+        "atr_now": atr_now,
+        "atr_mean": atr_mean,
+        "trend_divergence": divergence,
+    }
+
+
+def _titanyx_basket_levels(cluster_snapshot, atr_value, profile):
+    avg_entry = float(cluster_snapshot["avg_entry"])
+    if cluster_snapshot["direction"] == "BUY":
+        tp_price = avg_entry + atr_value * profile["tp_atr"]
+        stop_price = avg_entry - atr_value * profile["basket_stop_atr"]
+    else:
+        tp_price = avg_entry - atr_value * profile["tp_atr"]
+        stop_price = avg_entry + atr_value * profile["basket_stop_atr"]
+    return float(tp_price), float(stop_price)
+
+
+def _titanyx_update_stop_streak(strategy_name, was_stop):
+    runtime = strategy_runtime.setdefault(strategy_name, {})
+    if was_stop:
+        runtime["titanyx_stop_streak"] = int(runtime.get("titanyx_stop_streak", 0) or 0) + 1
+    else:
+        runtime["titanyx_stop_streak"] = 0
+    runtime["titanyx_last_cluster_exit"] = datetime.now()
+
+
+def get_titanyx_exit_reason(symbol, strategy_cfg, cluster_state, cluster_snapshot):
+    if not cluster_snapshot:
+        return None, None, None, None
+    family = strategy_cfg.get("symbol_family")
+    profile = TITANYX_PROFILES.get(family)
+    if not profile:
+        return None, None, None, None
+    df_m5 = get_m5_cached(symbol)
+    df_m15 = get_m15_cached(symbol)
+    if df_m5 is None or len(df_m5) < 80 or df_m15 is None or len(df_m15) < 40:
+        return None, None, None, None
+    tick = safe_tick(symbol)
+    if not tick:
+        return None, None, None, None
+
+    atr_now = float(df_m5["atr"].iloc[-2] or 0.0)
+    if atr_now <= 0:
+        return None, None, None, None
+
+    tp_price, stop_price = _titanyx_basket_levels(cluster_snapshot, atr_now, profile)
+    price_mid = (float(tick.ask) + float(tick.bid)) / 2.0
+    session_state = _titanyx_exchange_state(profile)
+    equity_state = _titanyx_equity_state(profile)
+
+    if equity_state["blocked"]:
+        return "EQUITY PROTECTION", "STOP", stop_price, tp_price
+    if session_state["force_flat"]:
+        return "SESSION FLAT", "TIME", stop_price, tp_price
+
+    if cluster_snapshot["direction"] == "BUY":
+        if price_mid >= tp_price:
+            return "BASKET TP", "TP", stop_price, tp_price
+        if price_mid <= stop_price:
+            return "BASKET STOP", "STOP", stop_price, tp_price
+    else:
+        if price_mid <= tp_price:
+            return "BASKET TP", "TP", stop_price, tp_price
+        if price_mid >= stop_price:
+            return "BASKET STOP", "STOP", stop_price, tp_price
+    return None, None, stop_price, tp_price
+
+
+def strategy_titanyx(df, symbol, branch_name, family):
+    profile = TITANYX_PROFILES[family]
+    strategy_cfg = get_strategy_config(branch_name) or {}
+    strategy_tag = strategy_cfg.get("tag", branch_name[:8])
+    session_state = _titanyx_exchange_state(profile)
+    if not session_state["entry_ok"]:
+        return blocked_signal(branch_name, "OUT SESSION", session_state["label"])
+    if _titanyx_news_blocked(profile):
+        return blocked_signal(branch_name, "NEWS LOCK")
+
+    equity_state = _titanyx_equity_state(profile)
+    if equity_state["blocked"]:
+        return blocked_signal(branch_name, "EQUITY LOCK", equity_state["label"])
+
+    runtime = strategy_runtime.setdefault(branch_name, {})
+    last_cluster_exit = runtime.get("titanyx_last_cluster_exit")
+    if isinstance(last_cluster_exit, datetime) and last_cluster_exit.date() < datetime.now().date():
+        runtime["titanyx_stop_streak"] = 0
+    if int(runtime.get("titanyx_stop_streak", 0) or 0) >= 2:
+        return blocked_signal(branch_name, "STOP STREAK", f"{runtime.get('titanyx_stop_streak', 0)} baskets")
+
+    df_m5 = get_m5_cached(symbol)
+    df_m15 = get_m15_cached(symbol)
+    if df_m5 is None or len(df_m5) < 100:
+        return blocked_signal(branch_name, "NO M5 DATA")
+    if df_m15 is None or len(df_m15) < 60:
+        return blocked_signal(branch_name, "NO M15 DATA")
+
+    tick = safe_tick(symbol)
+    if not tick:
+        return blocked_signal(branch_name, "NO TICK")
+
+    vol_state = _titanyx_volatility_state(symbol, df_m5, df_m15, profile)
+    if vol_state["blocked"]:
+        return blocked_signal(branch_name, "VOL BLOCK", vol_state["label"])
+
+    close_m5 = df_m5["close"]
+    ema20_m5 = close_m5.ewm(span=20).mean()
+    ema50_m5 = close_m5.ewm(span=50).mean()
+    ema20_m15 = df_m15["close"].ewm(span=20).mean()
+    ema50_m15 = df_m15["close"].ewm(span=50).mean()
+    rsi_m5 = compute_rsi(close_m5, 14)
+    spread_series = close_m5 - ema20_m5
+    zscore = compute_zscore(spread_series, 50)
+
+    atr_now = float(df_m5["atr"].iloc[-2] or 0.0)
+    if atr_now <= 0:
+        return blocked_signal(branch_name, "NO ATR")
+
+    confirm = df_m5.iloc[-2]
+    prev = df_m5.iloc[-3]
+    price_mid = (float(tick.ask) + float(tick.bid)) / 2.0
+    vwap = float(df_m5["vwap"].iloc[-2] or price_mid)
+    close_now = float(confirm["close"])
+    close_prev = float(prev["close"])
+    rsi_now = float(rsi_m5.iloc[-2])
+    z_now = float(zscore.iloc[-2])
+    ema20_now = float(ema20_m5.iloc[-2])
+    trend_divergence = abs(float(ema20_m15.iloc[-2] - ema50_m15.iloc[-2])) / max(atr_now, 1e-6)
+
+    cluster_snapshot = _titanyx_cluster_snapshot(symbol, strategy_tag)
+    if cluster_snapshot:
+        if vol_state["add_blocked"]:
+            return blocked_signal(branch_name, "GRID LOCK", vol_state["label"])
+        next_index = cluster_snapshot["orders"]
+        if next_index >= profile["max_orders"]:
+            return blocked_signal(branch_name, "MAX BASKET", f"{cluster_snapshot['orders']}/{profile['max_orders']}")
+        next_step = atr_now * profile["grid_step"] * (profile["grid_mult"] ** max(0, cluster_snapshot["orders"] - 1))
+        if cluster_snapshot["direction"] == "BUY":
+            adverse_distance = max(0.0, cluster_snapshot["avg_entry"] - price_mid)
+            absorb_ok = close_now >= close_prev and close_now >= float(confirm["open"])
+            if adverse_distance < next_step:
+                return blocked_signal(branch_name, "GRID NOT READY", pretrigger_text("GRID", next_step - adverse_distance, atr_now))
+            if not (price_mid < min(vwap, ema20_now) and z_now <= -profile["z_readd"] and rsi_now <= profile["rsi_readd_long"]):
+                return blocked_signal(branch_name, "MEAN LOST", f"Z {z_now:.2f} RSI {rsi_now:.1f}")
+            if cluster_snapshot["orders"] >= 2 and not absorb_ok:
+                return blocked_signal(branch_name, "NO ABSORB", f"Z {z_now:.2f}")
+            sl_price = cluster_snapshot["avg_entry"] - atr_now * profile["basket_stop_atr"]
+            tp_price = cluster_snapshot["avg_entry"] + atr_now * profile["tp_atr"]
+            risk_scale = profile["risk_scales"][min(next_index, len(profile["risk_scales"]) - 1)]
+            conf = min(88, profile["score_base"] + 5 + min(10, adverse_distance / max(atr_now, 1e-6) * 2.0))
+            details = {
+                "signal": "BUY",
+                "direction": "LONG",
+                "entry_level": float(tick.ask),
+                "max_orders": profile["max_orders"],
+                "tp_basket": float(tp_price),
+                "stop_basket": float(sl_price),
+                "volatility_state": vol_state["label"],
+                "equity_protection": equity_state["label"],
+                "summary": f"{profile['display']} LONG | TITANYX add #{cluster_snapshot['orders']+1} | entry {tick.ask:.2f} | max {profile['max_orders']} | TP basket {tp_price:.2f} | stop basket {sl_price:.2f} | vol {vol_state['label']} | equity {equity_state['label']}",
+            }
+            return {
+                "signal": "BUY",
+                "confidence": conf,
+                "name": branch_name,
+                "execution_df": df_m5,
+                "sl_price": round(sl_price, 5),
+                "tp_price": round(tp_price, 5),
+                "signal_key": f"{family}|TITANYX|{confirm['time'].isoformat()}|BUY|{cluster_snapshot['orders']+1}",
+                "signal_details": details,
+                "risk_multiplier_override": risk_scale,
+            }
+        adverse_distance = max(0.0, price_mid - cluster_snapshot["avg_entry"])
+        absorb_ok = close_now <= close_prev and close_now <= float(confirm["open"])
+        if adverse_distance < next_step:
+            return blocked_signal(branch_name, "GRID NOT READY", pretrigger_text("GRID", next_step - adverse_distance, atr_now))
+        if not (price_mid > max(vwap, ema20_now) and z_now >= profile["z_readd"] and rsi_now >= profile["rsi_readd_short"]):
+            return blocked_signal(branch_name, "MEAN LOST", f"Z {z_now:.2f} RSI {rsi_now:.1f}")
+        if cluster_snapshot["orders"] >= 2 and not absorb_ok:
+            return blocked_signal(branch_name, "NO ABSORB", f"Z {z_now:.2f}")
+        sl_price = cluster_snapshot["avg_entry"] + atr_now * profile["basket_stop_atr"]
+        tp_price = cluster_snapshot["avg_entry"] - atr_now * profile["tp_atr"]
+        risk_scale = profile["risk_scales"][min(next_index, len(profile["risk_scales"]) - 1)]
+        conf = min(88, profile["score_base"] + 5 + min(10, adverse_distance / max(atr_now, 1e-6) * 2.0))
+        details = {
+            "signal": "SELL",
+            "direction": "SHORT",
+            "entry_level": float(tick.bid),
+            "max_orders": profile["max_orders"],
+            "tp_basket": float(tp_price),
+            "stop_basket": float(sl_price),
+            "volatility_state": vol_state["label"],
+            "equity_protection": equity_state["label"],
+            "summary": f"{profile['display']} SHORT | TITANYX add #{cluster_snapshot['orders']+1} | entry {tick.bid:.2f} | max {profile['max_orders']} | TP basket {tp_price:.2f} | stop basket {sl_price:.2f} | vol {vol_state['label']} | equity {equity_state['label']}",
+        }
+        return {
+            "signal": "SELL",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_m5,
+            "sl_price": round(sl_price, 5),
+            "tp_price": round(tp_price, 5),
+            "signal_key": f"{family}|TITANYX|{confirm['time'].isoformat()}|SELL|{cluster_snapshot['orders']+1}",
+            "signal_details": details,
+            "risk_multiplier_override": risk_scale,
+        }
+
+    mean_long = price_mid < min(vwap, ema20_now) and z_now <= -profile["z_entry"] and rsi_now <= profile["rsi_long"]
+    mean_short = price_mid > max(vwap, ema20_now) and z_now >= profile["z_entry"] and rsi_now >= profile["rsi_short"]
+    revert_long = close_now >= close_prev and close_now >= float(confirm["open"])
+    revert_short = close_now <= close_prev and close_now <= float(confirm["open"])
+    if trend_divergence > profile["ema_divergence"]:
+        return blocked_signal(branch_name, "IMPULSIVE TREND", f"DIV {trend_divergence:.2f}")
+
+    if mean_long and revert_long:
+        sl_price = float(tick.ask) - atr_now * profile["basket_stop_atr"]
+        tp_price = float(tick.ask) + atr_now * profile["tp_atr"]
+        conf = min(86, profile["score_base"] + int(abs(z_now) * 4))
+        details = {
+            "signal": "BUY",
+            "direction": "LONG",
+            "entry_level": float(tick.ask),
+            "max_orders": profile["max_orders"],
+            "tp_basket": float(tp_price),
+            "stop_basket": float(sl_price),
+            "volatility_state": vol_state["label"],
+            "equity_protection": equity_state["label"],
+            "summary": f"{profile['display']} LONG | TITANYX init | entry {tick.ask:.2f} | max {profile['max_orders']} | TP basket {tp_price:.2f} | stop basket {sl_price:.2f} | vol {vol_state['label']} | equity {equity_state['label']}",
+        }
+        return {
+            "signal": "BUY",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_m5,
+            "sl_price": round(sl_price, 5),
+            "tp_price": round(tp_price, 5),
+            "signal_key": f"{family}|TITANYX|{confirm['time'].isoformat()}|BUY|1",
+            "signal_details": details,
+            "risk_multiplier_override": profile["risk_scales"][0],
+        }
+
+    if mean_short and revert_short:
+        sl_price = float(tick.bid) + atr_now * profile["basket_stop_atr"]
+        tp_price = float(tick.bid) - atr_now * profile["tp_atr"]
+        conf = min(86, profile["score_base"] + int(abs(z_now) * 4))
+        details = {
+            "signal": "SELL",
+            "direction": "SHORT",
+            "entry_level": float(tick.bid),
+            "max_orders": profile["max_orders"],
+            "tp_basket": float(tp_price),
+            "stop_basket": float(sl_price),
+            "volatility_state": vol_state["label"],
+            "equity_protection": equity_state["label"],
+            "summary": f"{profile['display']} SHORT | TITANYX init | entry {tick.bid:.2f} | max {profile['max_orders']} | TP basket {tp_price:.2f} | stop basket {sl_price:.2f} | vol {vol_state['label']} | equity {equity_state['label']}",
+        }
+        return {
+            "signal": "SELL",
+            "confidence": conf,
+            "name": branch_name,
+            "execution_df": df_m5,
+            "sl_price": round(sl_price, 5),
+            "tp_price": round(tp_price, 5),
+            "signal_key": f"{family}|TITANYX|{confirm['time'].isoformat()}|SELL|1",
+            "signal_details": details,
+            "risk_multiplier_override": profile["risk_scales"][0],
+        }
+
+    if price_mid < ema20_now and z_now <= -profile["z_entry"]:
+        return blocked_signal(branch_name, "NO RECLAIM", f"Z {z_now:.2f} RSI {rsi_now:.1f}")
+    if price_mid > ema20_now and z_now >= profile["z_entry"]:
+        return blocked_signal(branch_name, "NO REJECT", f"Z {z_now:.2f} RSI {rsi_now:.1f}")
+    return blocked_signal(branch_name, "MEAN WAIT", f"Z {z_now:.2f} RSI {rsi_now:.1f}")
+
+
+def strategy_us500_titanyx(df, symbol):
+    return strategy_titanyx(df, symbol, "US500_TITANYX", "US500")
+
+
+def strategy_eustx50_titanyx(df, symbol):
+    return strategy_titanyx(df, symbol, "EUSTX50_TITANYX", "EUSTX50")
+
+
+def strategy_uk100_titanyx(df, symbol):
+    return strategy_titanyx(df, symbol, "UK100_TITANYX", "UK100")
+
+
+def strategy_fra40_titanyx(df, symbol):
+    return strategy_titanyx(df, symbol, "FRA40_TITANYX", "FRA40")
+
+
+def strategy_us30_titanyx(df, symbol):
+    return strategy_titanyx(df, symbol, "US30_TITANYX", "US30")
+
+
+LIQUIDITY_SNIPER_REGISTRY = [
+    {"name": "USTECH_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "U1CL", "family": "USTECH", "kind": "CONTINUATION", "strategy_id": "SND_CLP_USTECH", "risk": 0.18, "score": 0.62, "cooldown": 1800},
+    {"name": "USTECH_REVERSAL_SWEEP", "tag": "U1RV", "family": "USTECH", "kind": "REVERSAL", "strategy_id": "SND_REV_USTECH", "risk": 0.17, "score": 0.64, "cooldown": 2100},
+    {"name": "GER40_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "G4CL", "family": "GER40", "kind": "CONTINUATION", "strategy_id": "SND_CLP_GER40", "risk": 0.17, "score": 0.62, "cooldown": 1800},
+    {"name": "GER40_REVERSAL_SWEEP", "tag": "G4RV", "family": "GER40", "kind": "REVERSAL", "strategy_id": "SND_REV_GER40", "risk": 0.16, "score": 0.64, "cooldown": 2100},
+    {"name": "US500_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "U5CL", "family": "US500", "kind": "CONTINUATION", "strategy_id": "SND_CLP_US500", "risk": 0.17, "score": 0.62, "cooldown": 1800},
+    {"name": "US500_REVERSAL_SWEEP", "tag": "U5RV", "family": "US500", "kind": "REVERSAL", "strategy_id": "SND_REV_US500", "risk": 0.16, "score": 0.64, "cooldown": 2100},
+    {"name": "JPN225_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "J2CL", "family": "JPN225", "kind": "CONTINUATION", "strategy_id": "SND_CLP_JPN225", "risk": 0.16, "score": 0.61, "cooldown": 2100},
+    {"name": "JPN225_REVERSAL_SWEEP", "tag": "J2RV", "family": "JPN225", "kind": "REVERSAL", "strategy_id": "SND_REV_JPN225", "risk": 0.15, "score": 0.63, "cooldown": 2400},
+    {"name": "EUSTX50_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "E5CL", "family": "EUSTX50", "kind": "CONTINUATION", "strategy_id": "SND_CLP_EUSTX50", "risk": 0.16, "score": 0.61, "cooldown": 1800},
+    {"name": "EUSTX50_REVERSAL_SWEEP", "tag": "E5RV", "family": "EUSTX50", "kind": "REVERSAL", "strategy_id": "SND_REV_EUSTX50", "risk": 0.15, "score": 0.63, "cooldown": 2100},
+    {"name": "US30_REVERSAL_SWEEP", "tag": "U3RV", "family": "US30", "kind": "REVERSAL", "strategy_id": "SND_REV_US30", "risk": 0.17, "score": 0.64, "cooldown": 2100},
+    {"name": "US30_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "U3CL", "family": "US30", "kind": "CONTINUATION", "strategy_id": "SND_CLP_US30", "risk": 0.16, "score": 0.62, "cooldown": 1800},
+    {"name": "UK100_REVERSAL_SWEEP", "tag": "K1RV", "family": "UK100", "kind": "REVERSAL", "strategy_id": "SND_REV_UK100", "risk": 0.15, "score": 0.64, "cooldown": 2100},
+    {"name": "UK100_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "K1CL", "family": "UK100", "kind": "CONTINUATION", "strategy_id": "SND_CLP_UK100", "risk": 0.14, "score": 0.62, "cooldown": 1800},
+    {"name": "US2000_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "U2CL", "family": "US2000", "kind": "CONTINUATION", "strategy_id": "SND_CLP_US2000", "risk": 0.16, "score": 0.61, "cooldown": 1800},
+    {"name": "US2000_REVERSAL_SWEEP", "tag": "U2RV", "family": "US2000", "kind": "REVERSAL", "strategy_id": "SND_REV_US2000", "risk": 0.15, "score": 0.63, "cooldown": 2100},
+    {"name": "FRA40_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "F4CL", "family": "FRA40", "kind": "CONTINUATION", "strategy_id": "SND_CLP_FRA40", "risk": 0.14, "score": 0.61, "cooldown": 1800},
+    {"name": "FRA40_REVERSAL_SWEEP", "tag": "F4RV", "family": "FRA40", "kind": "REVERSAL", "strategy_id": "SND_REV_FRA40", "risk": 0.14, "score": 0.63, "cooldown": 2100},
+    {"name": "SMI20_REVERSAL_SWEEP", "tag": "S2RV", "family": "SMI20", "kind": "REVERSAL", "strategy_id": "SND_REV_SMI20", "risk": 0.14, "score": 0.64, "cooldown": 2100},
+    {"name": "SMI20_CONTINUATION_LIQUIDITY_PULLBACK", "tag": "S2CL", "family": "SMI20", "kind": "CONTINUATION", "strategy_id": "SND_CLP_SMI20", "risk": 0.13, "score": 0.62, "cooldown": 1800},
+]
+
+for spec in LIQUIDITY_SNIPER_REGISTRY:
+    runner = _make_liquidity_runner(spec["kind"], spec["name"], spec["family"])
+    register_strategy(
+        spec["name"],
+        runner,
+        tag=spec["tag"],
+        symbol_family=spec["family"],
+        execution_mode="STD_ONLY",
+        risk_multiplier=spec["risk"],
+        min_score=spec["score"],
+        cooldown_sec=spec["cooldown"],
+        allowed_regimes={"TREND", "RANGE"},
+        filter_func=default_strategy_filter,
+        market_filter_func=fast_market_filter,
+        sl_atr_multiplier=1.0,
+        tp_rr_multiplier=2.4 if spec["kind"] == "CONTINUATION" else 2.6,
+        auto_disable=False,
+        be_trigger_progress=0.18,
+        be_buffer_progress=0.10,
+        trail_steps=[(0.28, 0.10), (0.52, 0.30), (0.86, 0.58)],
+        session_label="S&D",
+        exclusive_symbol=True,
+    )
+    cfg = get_strategy_config(spec["name"])
+    if cfg:
+        cfg["suite"] = "SND_LIQUIDITY_SNIPER"
+        cfg["strategy_id"] = spec["strategy_id"]
+        cfg["priority_rank"] = LIQUIDITY_SNIPER_PROFILES[spec["family"]]["priority_rank"]
+        cfg["setup_kind"] = spec["kind"]
+        LIQUIDITY_SNIPER_STRATEGY_NAMES.add(spec["name"])
+
+
 register_strategy(
     "XAU_TREND",
     strategy_trend_vwap,
     tag="XTRD",
     symbol_family="XAUUSD",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.60,
-    min_score=0.43,
-    cooldown_sec=35,
+    risk_multiplier=0.42,
+    min_score=0.49,
+    cooldown_sec=45,
     allowed_regimes={"TREND", "RANGE"},
-    filter_func=default_strategy_filter,
+    filter_func=swing_filter,
     market_filter_func=fast_market_filter,
     sl_atr_multiplier=0.96,
     tp_rr_multiplier=2.05,
@@ -3937,51 +8553,24 @@ register_strategy(
     multi_tp_tp2_gap_eur=0.42,
     multi_tp_step_gap_eur=0.22,
     min_splits=4,
-    max_splits=5,
-)
-register_strategy(
-    "XAU_ORB",
-    strategy_xau_orb,
-    tag="XORB",
-    symbol_family="XAUUSD",
-    execution_mode="MULTI_ONLY",
-    risk_multiplier=0.28,
-    min_score=0.50,
-    cooldown_sec=80,
-    allowed_regimes={"TREND", "RANGE"},
-    filter_func=default_strategy_filter,
-    market_filter_func=fast_market_filter,
-    sl_atr_multiplier=0.68,
-    tp_rr_multiplier=1.82,
-    auto_disable=False,
-    be_trigger_progress=0.06,
-    be_buffer_progress=0.10,
-    trail_steps=[(0.14, 0.36), (0.24, 0.60), (0.36, 0.82)],
-    session_label="14:30-22:30",
-    multi_tp_eur_min=0.70,
-    multi_tp_eur_max=1.50,
-    multi_tp_target_eur=1.05,
-    multi_tp_first_atr=0.11,
-    multi_tp_curve=[1.0, 1.70, 2.50, 3.55, 4.90, 6.55, 8.55, 10.9],
-    multi_tp_tp2_gap_eur=0.40,
-    multi_tp_step_gap_eur=0.20,
-    min_splits=4,
-    max_splits=5,
+    max_splits=4,
 )
 register_strategy(
     "XAU_M1_SCALP",
     strategy_xau_m1_scalp,
+    enabled=True,
+    toggle_arm=True,
     tag="XM1S",
     symbol_family="XAUUSD",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.32,
-    min_score=0.43,
-    cooldown_sec=24,
+    risk_multiplier=0.17,
+    min_score=0.54,
+    cooldown_sec=42,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=scalping_filter,
     market_filter_func=fast_market_filter_scalping,
-    sl_atr_multiplier=0.74,
-    tp_rr_multiplier=1.42,
+    sl_atr_multiplier=0.70,
+    tp_rr_multiplier=1.54,
     auto_disable=False,
     be_trigger_progress=0.12,
     be_buffer_progress=0.08,
@@ -3995,20 +8584,83 @@ register_strategy(
     multi_tp_tp2_gap_eur=0.40,
     multi_tp_step_gap_eur=0.20,
     min_splits=4,
-    max_splits=8,
+    max_splits=5,
 )
+get_strategy_config("XAU_M1_SCALP")["disabled_reason"] = ""
+register_strategy(
+    "XAU_BREAK_RETEST",
+    strategy_xau_break_retest,
+    tag="XBRT",
+    symbol_family="XAUUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.24,
+    min_score=0.50,
+    cooldown_sec=52,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=0.78,
+    tp_rr_multiplier=1.84,
+    auto_disable=False,
+    be_trigger_progress=0.12,
+    be_buffer_progress=0.09,
+    trail_steps=[(0.22, 0.14), (0.36, 0.30), (0.54, 0.50)],
+    session_label="13-03",
+    multi_tp_eur_min=0.70,
+    multi_tp_eur_max=1.45,
+    multi_tp_target_eur=0.96,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.82, 2.80, 4.10, 5.70, 7.80, 10.20, 13.10],
+    multi_tp_tp2_gap_eur=0.42,
+    multi_tp_step_gap_eur=0.22,
+    min_splits=4,
+    max_splits=5,
+)
+register_strategy(
+    "XAU_VWAP_RECLAIM",
+    strategy_xau_vwap_reclaim,
+    enabled=False,
+    toggle_arm=False,
+    tag="XVRC",
+    symbol_family="XAUUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.20,
+    min_score=0.52,
+    cooldown_sec=46,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=scalping_filter,
+    market_filter_func=fast_market_filter_scalping,
+    sl_atr_multiplier=0.74,
+    tp_rr_multiplier=1.62,
+    auto_disable=False,
+    be_trigger_progress=0.11,
+    be_buffer_progress=0.08,
+    trail_steps=[(0.22, 0.12), (0.36, 0.28), (0.54, 0.48)],
+    session_label="13-03",
+    multi_tp_eur_min=0.65,
+    multi_tp_eur_max=1.35,
+    multi_tp_target_eur=0.90,
+    multi_tp_first_atr=0.09,
+    multi_tp_curve=[1.0, 1.75, 2.65, 3.85, 5.25, 7.05, 9.20, 11.80],
+    multi_tp_tp2_gap_eur=0.40,
+    multi_tp_step_gap_eur=0.20,
+    min_splits=4,
+    max_splits=5,
+)
+get_strategy_config("XAU_VWAP_RECLAIM")["disabled_reason"] = "TEST BENCH"
 register_strategy(
     "BTC_TREND",
     strategy_btc_trend,
-    enabled=False,
+    enabled=True,
+    toggle_arm=True,
     tag="BTCR",
     symbol_family="BTCUSD",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.24,
-    min_score=0.48,
-    cooldown_sec=40,
+    min_score=0.46,
+    cooldown_sec=32,
     allowed_regimes={"TREND", "RANGE"},
-    filter_func=default_strategy_filter,
+    filter_func=swing_filter,
     market_filter_func=fast_market_filter,
     sl_atr_multiplier=0.92,
     tp_rr_multiplier=2.10,
@@ -4027,10 +8679,253 @@ register_strategy(
     min_splits=4,
     max_splits=8,
 )
+get_strategy_config("BTC_TREND")["disabled_reason"] = ""
+register_strategy(
+    "BTC_SANTO_GRAAL",
+    strategy_btc_santo_graal,
+    tag="BTSG",
+    symbol_family="BTCUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.18,
+    min_score=0.50,
+    cooldown_sec=900,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.4,
+    auto_disable=False,
+    be_trigger_progress=0.22,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.30, 0.10), (0.55, 0.34), (0.90, 0.64)],
+    session_label="24/7",
+    multi_tp_eur_min=0.85,
+    multi_tp_eur_max=1.70,
+    multi_tp_target_eur=1.18,
+    multi_tp_first_atr=0.12,
+    multi_tp_curve=[1.0, 2.1, 3.6, 5.6, 8.2, 11.6, 15.2, 19.4],
+    multi_tp_tp2_gap_eur=0.48,
+    multi_tp_step_gap_eur=0.26,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "BTC_KUMO_BREAKOUT",
+    strategy_btc_kumo_breakout,
+    tag="BTKB",
+    symbol_family="BTCUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.16,
+    min_score=0.50,
+    cooldown_sec=600,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.2,
+    auto_disable=False,
+    be_trigger_progress=0.18,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.28, 0.10), (0.50, 0.30), (0.82, 0.58)],
+    session_label="24/7",
+    multi_tp_eur_min=0.82,
+    multi_tp_eur_max=1.65,
+    multi_tp_target_eur=1.14,
+    multi_tp_first_atr=0.11,
+    multi_tp_curve=[1.0, 1.95, 3.20, 4.95, 7.30, 10.20, 13.80, 18.00],
+    multi_tp_tp2_gap_eur=0.46,
+    multi_tp_step_gap_eur=0.24,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "BTC_PURIA",
+    strategy_btc_puria,
+    tag="BTPU",
+    symbol_family="BTCUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.17,
+    min_score=0.52,
+    cooldown_sec=900,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.20,
+    auto_disable=False,
+    be_trigger_progress=0.20,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.30, 0.10), (0.54, 0.32), (0.88, 0.60)],
+    session_label="24/7",
+    multi_tp_eur_min=0.82,
+    multi_tp_eur_max=1.65,
+    multi_tp_target_eur=1.16,
+    multi_tp_first_atr=0.11,
+    multi_tp_curve=[1.0, 2.0, 3.20, 4.95, 7.15, 10.00, 13.60, 17.50],
+    multi_tp_tp2_gap_eur=0.46,
+    multi_tp_step_gap_eur=0.24,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "BTC_DOUBLE_MACD",
+    strategy_btc_double_macd,
+    tag="BTDM",
+    symbol_family="BTCUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.17,
+    min_score=0.52,
+    cooldown_sec=14400,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.30,
+    auto_disable=False,
+    be_trigger_progress=0.22,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.32, 0.10), (0.56, 0.34), (0.90, 0.62)],
+    session_label="24/7",
+    multi_tp_eur_min=0.82,
+    multi_tp_eur_max=1.65,
+    multi_tp_target_eur=1.18,
+    multi_tp_first_atr=0.12,
+    multi_tp_curve=[1.0, 2.05, 3.35, 5.15, 7.55, 10.55, 14.40, 18.70],
+    multi_tp_tp2_gap_eur=0.48,
+    multi_tp_step_gap_eur=0.25,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "BTC_HEIKEN_TDI",
+    strategy_btc_heiken_tdi,
+    tag="BTHT",
+    symbol_family="BTCUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.17,
+    min_score=0.52,
+    cooldown_sec=4200,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.20,
+    auto_disable=False,
+    be_trigger_progress=0.20,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.30, 0.10), (0.54, 0.32), (0.86, 0.60)],
+    session_label="24/7",
+    multi_tp_eur_min=0.82,
+    multi_tp_eur_max=1.65,
+    multi_tp_target_eur=1.14,
+    multi_tp_first_atr=0.11,
+    multi_tp_curve=[1.0, 1.98, 3.15, 4.75, 6.95, 9.55, 12.95, 16.90],
+    multi_tp_tp2_gap_eur=0.46,
+    multi_tp_step_gap_eur=0.24,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "BTC_SIDUS",
+    strategy_btc_sidus,
+    tag="BTSD",
+    symbol_family="BTCUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.17,
+    min_score=0.52,
+    cooldown_sec=900,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.25,
+    auto_disable=False,
+    be_trigger_progress=0.20,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.30, 0.10), (0.54, 0.32), (0.88, 0.60)],
+    session_label="24/7",
+    multi_tp_eur_min=0.82,
+    multi_tp_eur_max=1.65,
+    multi_tp_target_eur=1.16,
+    multi_tp_first_atr=0.11,
+    multi_tp_curve=[1.0, 2.0, 3.25, 5.0, 7.35, 10.25, 14.0, 18.1],
+    multi_tp_tp2_gap_eur=0.46,
+    multi_tp_step_gap_eur=0.24,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "BTC_BREAK_RETEST",
+    strategy_btc_break_retest,
+    tag="BBRT",
+    symbol_family="BTCUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.18,
+    min_score=0.48,
+    cooldown_sec=38,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=0.84,
+    tp_rr_multiplier=1.88,
+    auto_disable=False,
+    be_trigger_progress=0.12,
+    be_buffer_progress=0.09,
+    trail_steps=[(0.24, 0.14), (0.40, 0.30), (0.58, 0.52)],
+    session_label="24/7",
+    multi_tp_eur_min=0.80,
+    multi_tp_eur_max=1.55,
+    multi_tp_target_eur=1.10,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.82, 2.75, 4.00, 5.55, 7.55, 9.95, 12.85],
+    multi_tp_tp2_gap_eur=0.44,
+    multi_tp_step_gap_eur=0.22,
+    min_splits=4,
+    max_splits=6,
+)
+register_strategy(
+    "BTC_VWAP_RECLAIM",
+    strategy_btc_vwap_reclaim,
+    enabled=False,
+    toggle_arm=False,
+    tag="BVRC",
+    symbol_family="BTCUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.16,
+    min_score=0.50,
+    cooldown_sec=34,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=0.80,
+    tp_rr_multiplier=1.68,
+    auto_disable=False,
+    be_trigger_progress=0.11,
+    be_buffer_progress=0.09,
+    trail_steps=[(0.22, 0.12), (0.38, 0.28), (0.56, 0.48)],
+    session_label="24/7",
+    multi_tp_eur_min=0.75,
+    multi_tp_eur_max=1.45,
+    multi_tp_target_eur=1.02,
+    multi_tp_first_atr=0.09,
+    multi_tp_curve=[1.0, 1.78, 2.62, 3.78, 5.15, 6.95, 9.15, 11.80],
+    multi_tp_tp2_gap_eur=0.42,
+    multi_tp_step_gap_eur=0.21,
+    min_splits=4,
+    max_splits=6,
+)
+get_strategy_config("BTC_VWAP_RECLAIM")["disabled_reason"] = "TEST BENCH"
 register_strategy(
     "ETH_PULSE",
     strategy_eth_pulse,
-    enabled=False,
+    enabled=True,
+    toggle_arm=True,
     tag="ETHP",
     symbol_family="ETHUSD",
     execution_mode="MULTI_ONLY",
@@ -4038,7 +8933,7 @@ register_strategy(
     min_score=0.46,
     cooldown_sec=36,
     allowed_regimes={"TREND", "RANGE"},
-    filter_func=default_strategy_filter,
+    filter_func=swing_filter,
     market_filter_func=fast_market_filter,
     sl_atr_multiplier=0.88,
     tp_rr_multiplier=1.96,
@@ -4055,26 +8950,209 @@ register_strategy(
     multi_tp_tp2_gap_eur=0.40,
     multi_tp_step_gap_eur=0.20,
     min_splits=4,
-    max_splits=8,
+    max_splits=6,
 )
+get_strategy_config("ETH_PULSE")["disabled_reason"] = ""
+register_strategy(
+    "ETH_KUMO_BREAKOUT",
+    strategy_eth_kumo_breakout,
+    tag="ETKB",
+    symbol_family="ETHUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.15,
+    min_score=0.50,
+    cooldown_sec=660,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.1,
+    auto_disable=False,
+    be_trigger_progress=0.18,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.28, 0.10), (0.50, 0.30), (0.82, 0.56)],
+    session_label="24/7",
+    multi_tp_eur_min=0.72,
+    multi_tp_eur_max=1.36,
+    multi_tp_target_eur=1.00,
+    multi_tp_first_atr=0.11,
+    multi_tp_curve=[1.0, 1.90, 3.05, 4.65, 6.75, 9.35, 12.45, 16.10],
+    multi_tp_tp2_gap_eur=0.40,
+    multi_tp_step_gap_eur=0.21,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "ETH_PURIA",
+    strategy_eth_puria,
+    tag="ETPU",
+    symbol_family="ETHUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.15,
+    min_score=0.52,
+    cooldown_sec=960,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.05,
+    auto_disable=False,
+    be_trigger_progress=0.18,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.28, 0.10), (0.50, 0.30), (0.82, 0.56)],
+    session_label="24/7",
+    multi_tp_eur_min=0.72,
+    multi_tp_eur_max=1.36,
+    multi_tp_target_eur=1.00,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.88, 2.90, 4.35, 6.20, 8.60, 11.35, 14.60],
+    multi_tp_tp2_gap_eur=0.40,
+    multi_tp_step_gap_eur=0.21,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "ETH_DOUBLE_MACD",
+    strategy_eth_double_macd,
+    tag="ETDM",
+    symbol_family="ETHUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.15,
+    min_score=0.52,
+    cooldown_sec=14400,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.10,
+    auto_disable=False,
+    be_trigger_progress=0.20,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.30, 0.10), (0.52, 0.32), (0.84, 0.58)],
+    session_label="24/7",
+    multi_tp_eur_min=0.72,
+    multi_tp_eur_max=1.36,
+    multi_tp_target_eur=1.02,
+    multi_tp_first_atr=0.11,
+    multi_tp_curve=[1.0, 1.92, 3.00, 4.55, 6.35, 8.80, 11.70, 15.00],
+    multi_tp_tp2_gap_eur=0.42,
+    multi_tp_step_gap_eur=0.22,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "ETH_HEIKEN_TDI",
+    strategy_eth_heiken_tdi,
+    tag="ETHT",
+    symbol_family="ETHUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.15,
+    min_score=0.52,
+    cooldown_sec=4200,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.15,
+    auto_disable=False,
+    be_trigger_progress=0.20,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.30, 0.10), (0.52, 0.32), (0.84, 0.58)],
+    session_label="24/7",
+    multi_tp_eur_min=0.72,
+    multi_tp_eur_max=1.36,
+    multi_tp_target_eur=1.00,
+    multi_tp_first_atr=0.11,
+    multi_tp_curve=[1.0, 1.92, 3.00, 4.55, 6.35, 8.85, 11.85, 15.25],
+    multi_tp_tp2_gap_eur=0.41,
+    multi_tp_step_gap_eur=0.21,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "ETH_BREAK_RETEST",
+    strategy_eth_break_retest,
+    tag="EBRT",
+    symbol_family="ETHUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.16,
+    min_score=0.48,
+    cooldown_sec=40,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=0.82,
+    tp_rr_multiplier=1.82,
+    auto_disable=False,
+    be_trigger_progress=0.12,
+    be_buffer_progress=0.09,
+    trail_steps=[(0.24, 0.14), (0.40, 0.30), (0.58, 0.52)],
+    session_label="24/7",
+    multi_tp_eur_min=0.70,
+    multi_tp_eur_max=1.35,
+    multi_tp_target_eur=0.98,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.80, 2.72, 3.92, 5.30, 7.05, 9.10, 11.70],
+    multi_tp_tp2_gap_eur=0.40,
+    multi_tp_step_gap_eur=0.20,
+    min_splits=4,
+    max_splits=6,
+)
+register_strategy(
+    "ETH_VWAP_RECLAIM",
+    strategy_eth_vwap_reclaim,
+    enabled=False,
+    toggle_arm=False,
+    tag="EVRC",
+    symbol_family="ETHUSD",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.15,
+    min_score=0.50,
+    cooldown_sec=36,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=0.78,
+    tp_rr_multiplier=1.62,
+    auto_disable=False,
+    be_trigger_progress=0.11,
+    be_buffer_progress=0.09,
+    trail_steps=[(0.22, 0.12), (0.38, 0.28), (0.56, 0.48)],
+    session_label="24/7",
+    multi_tp_eur_min=0.65,
+    multi_tp_eur_max=1.25,
+    multi_tp_target_eur=0.92,
+    multi_tp_first_atr=0.09,
+    multi_tp_curve=[1.0, 1.76, 2.58, 3.72, 5.02, 6.70, 8.70, 11.10],
+    multi_tp_tp2_gap_eur=0.38,
+    multi_tp_step_gap_eur=0.19,
+    min_splits=4,
+    max_splits=6,
+)
+get_strategy_config("ETH_VWAP_RECLAIM")["disabled_reason"] = "TEST BENCH"
 register_strategy(
     "USTECH_TREND",
     strategy_ustech_trend,
+    enabled=True,
     tag="USTR",
     symbol_family="USTECH",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.28,
-    min_score=0.54,
-    cooldown_sec=60,
+    risk_multiplier=0.22,
+    min_score=0.50,
+    cooldown_sec=42,
     allowed_regimes={"TREND"},
-    filter_func=default_strategy_filter,
+    filter_func=swing_filter,
     market_filter_func=fast_market_filter,
-    sl_atr_multiplier=0.80,
-    tp_rr_multiplier=1.95,
+    sl_atr_multiplier=0.76,
+    tp_rr_multiplier=1.78,
     auto_disable=False,
-    be_trigger_progress=0.15,
-    be_buffer_progress=0.10,
-    trail_steps=[(0.26, 0.16), (0.40, 0.34), (0.58, 0.56)],
+    be_trigger_progress=0.12,
+    be_buffer_progress=0.09,
+    trail_steps=[(0.24, 0.14), (0.38, 0.30), (0.56, 0.50)],
     session_label="07-23",
     multi_tp_eur_min=0.70,
     multi_tp_eur_max=1.40,
@@ -4084,22 +9162,24 @@ register_strategy(
     multi_tp_tp2_gap_eur=0.38,
     multi_tp_step_gap_eur=0.18,
     min_splits=4,
-    max_splits=4,
+    max_splits=5,
 )
+get_strategy_config("USTECH_TREND")["disabled_reason"] = ""
 register_strategy(
     "USTECH_ORB",
     strategy_ustech_orb,
+    enabled=True,
     tag="UORB",
     symbol_family="USTECH",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.22,
-    min_score=0.58,
-    cooldown_sec=125,
+    risk_multiplier=0.16,
+    min_score=0.54,
+    cooldown_sec=95,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=default_strategy_filter,
     market_filter_func=fast_market_filter,
     sl_atr_multiplier=0.62,
-    tp_rr_multiplier=1.75,
+    tp_rr_multiplier=1.62,
     auto_disable=False,
     be_trigger_progress=0.08,
     be_buffer_progress=0.09,
@@ -4113,8 +9193,9 @@ register_strategy(
     multi_tp_tp2_gap_eur=0.42,
     multi_tp_step_gap_eur=0.20,
     min_splits=4,
-    max_splits=5,
+    max_splits=4,
 )
+get_strategy_config("USTECH_ORB")["disabled_reason"] = ""
 register_strategy(
     "USTECH_BREAK_RETEST",
     strategy_ustech_break_retest,
@@ -4145,14 +9226,195 @@ register_strategy(
     max_splits=6,
 )
 register_strategy(
-    "USTECH_PULLBACK_SCALP",
-    strategy_ustech_pullback_scalp,
-    tag="U1PB",
+    "USTECH_KUMO_BREAKOUT",
+    strategy_ustech_kumo_breakout,
+    tag="U1KB",
+    symbol_family="USTECH",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.15,
+    min_score=0.50,
+    cooldown_sec=540,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.05,
+    auto_disable=False,
+    be_trigger_progress=0.18,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.28, 0.10), (0.50, 0.30), (0.82, 0.56)],
+    session_label="13-23",
+    multi_tp_eur_min=0.68,
+    multi_tp_eur_max=1.40,
+    multi_tp_target_eur=0.98,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.88, 3.00, 4.55, 6.55, 9.05, 12.00, 15.50],
+    multi_tp_tp2_gap_eur=0.40,
+    multi_tp_step_gap_eur=0.21,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "USTECH_HEIKEN_TDI",
+    strategy_ustech_heiken_tdi,
+    tag="U1HT",
+    symbol_family="USTECH",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.16,
+    min_score=0.50,
+    cooldown_sec=3600,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.10,
+    auto_disable=False,
+    be_trigger_progress=0.18,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.28, 0.10), (0.50, 0.30), (0.82, 0.56)],
+    session_label="13-23",
+    multi_tp_eur_min=0.68,
+    multi_tp_eur_max=1.40,
+    multi_tp_target_eur=0.98,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.88, 2.95, 4.45, 6.35, 8.85, 11.75, 15.15],
+    multi_tp_tp2_gap_eur=0.40,
+    multi_tp_step_gap_eur=0.20,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "USTECH_PURIA",
+    strategy_ustech_puria,
+    tag="U1PU",
+    symbol_family="USTECH",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.16,
+    min_score=0.50,
+    cooldown_sec=780,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.05,
+    auto_disable=False,
+    be_trigger_progress=0.18,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.28, 0.10), (0.50, 0.30), (0.82, 0.56)],
+    session_label="13-23",
+    multi_tp_eur_min=0.68,
+    multi_tp_eur_max=1.40,
+    multi_tp_target_eur=0.98,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.90, 3.00, 4.55, 6.45, 8.90, 11.75, 15.00],
+    multi_tp_tp2_gap_eur=0.40,
+    multi_tp_step_gap_eur=0.20,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "USTECH_SIDUS",
+    strategy_ustech_sidus,
+    tag="U1SD",
+    symbol_family="USTECH",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.16,
+    min_score=0.50,
+    cooldown_sec=780,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.10,
+    auto_disable=False,
+    be_trigger_progress=0.18,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.28, 0.10), (0.50, 0.30), (0.82, 0.56)],
+    session_label="13-23",
+    multi_tp_eur_min=0.68,
+    multi_tp_eur_max=1.40,
+    multi_tp_target_eur=0.98,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.92, 3.05, 4.60, 6.55, 9.00, 11.85, 15.10],
+    multi_tp_tp2_gap_eur=0.40,
+    multi_tp_step_gap_eur=0.20,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "USTECH_TOP",
+    strategy_ustech_top,
+    tag="UTOP",
+    symbol_family="USTECH",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.12,
+    min_score=0.56,
+    cooldown_sec=28,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=scalping_filter,
+    market_filter_func=fast_market_filter_scalping,
+    sl_atr_multiplier=0.64,
+    tp_rr_multiplier=1.34,
+    auto_disable=False,
+    be_trigger_progress=0.10,
+    be_buffer_progress=0.08,
+    trail_steps=[(0.20, 0.12), (0.34, 0.26), (0.50, 0.44)],
+    session_label="13-23",
+    multi_tp_eur_min=0.60,
+    multi_tp_eur_max=1.30,
+    multi_tp_target_eur=0.90,
+    multi_tp_first_atr=0.08,
+    multi_tp_curve=[1.0, 1.75, 2.55, 3.55, 4.80, 6.35, 8.20, 10.40],
+    multi_tp_tp2_gap_eur=0.36,
+    multi_tp_step_gap_eur=0.18,
+    min_splits=4,
+    max_splits=6,
+)
+register_strategy(
+    "USTECH_SANTO_GRAAL",
+    strategy_ustech_santo_graal,
+    tag="U1SG",
     symbol_family="USTECH",
     execution_mode="MULTI_ONLY",
     risk_multiplier=0.18,
-    min_score=0.55,
-    cooldown_sec=18,
+    min_score=0.50,
+    cooldown_sec=900,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.2,
+    auto_disable=False,
+    be_trigger_progress=0.20,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.30, 0.10), (0.52, 0.32), (0.84, 0.58)],
+    session_label="13-23",
+    multi_tp_eur_min=0.70,
+    multi_tp_eur_max=1.45,
+    multi_tp_target_eur=1.00,
+    multi_tp_first_atr=0.11,
+    multi_tp_curve=[1.0, 2.0, 3.3, 5.0, 7.2, 10.0, 13.2, 17.0],
+    multi_tp_tp2_gap_eur=0.40,
+    multi_tp_step_gap_eur=0.22,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "USTECH_PULLBACK_SCALP",
+    strategy_ustech_pullback_scalp,
+    enabled=False,
+    toggle_arm=False,
+    tag="U1PB",
+    symbol_family="USTECH",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.10,
+    min_score=0.64,
+    cooldown_sec=34,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=scalping_filter,
     market_filter_func=fast_market_filter_scalping,
@@ -4171,51 +9433,114 @@ register_strategy(
     multi_tp_tp2_gap_eur=0.36,
     multi_tp_step_gap_eur=0.18,
     min_splits=4,
-    max_splits=8,
+    max_splits=6,
 )
+get_strategy_config("USTECH_PULLBACK_SCALP")["disabled_reason"] = "SUPERSEDED BY USTECH_TOP"
 register_strategy(
-    "JPN225_ORB",
-    strategy_jpn225_orb,
-    tag="JPOR",
+    "JPN225_TOP",
+    strategy_jpn225_top,
+    tag="JTOP",
     symbol_family="JPN225",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.30,
-    min_score=0.50,
-    cooldown_sec=70,
+    risk_multiplier=0.16,
+    min_score=0.54,
+    cooldown_sec=30,
     allowed_regimes={"TREND", "RANGE"},
-    filter_func=default_strategy_filter,
-    market_filter_func=fast_market_filter,
-    sl_atr_multiplier=0.84,
-    tp_rr_multiplier=1.85,
+    filter_func=scalping_filter,
+    market_filter_func=fast_market_filter_scalping,
+    sl_atr_multiplier=0.70,
+    tp_rr_multiplier=1.36,
     auto_disable=False,
-    be_trigger_progress=0.16,
-    be_buffer_progress=0.10,
-    trail_steps=[(0.30, 0.12), (0.46, 0.26), (0.64, 0.44)],
-    session_label="02:20-09:00",
+    be_trigger_progress=0.10,
+    be_buffer_progress=0.08,
+    trail_steps=[(0.22, 0.12), (0.36, 0.26), (0.54, 0.44)],
+    session_label="02-10",
     multi_tp_eur_min=0.70,
     multi_tp_eur_max=1.40,
     multi_tp_target_eur=0.95,
-    multi_tp_first_atr=0.10,
-    multi_tp_curve=[1.0, 1.65, 2.35, 3.30, 4.45, 5.95],
+    multi_tp_first_atr=0.09,
+    multi_tp_curve=[1.0, 1.70, 2.45, 3.35, 4.55, 6.05, 7.90, 10.10],
     multi_tp_tp2_gap_eur=0.36,
     multi_tp_step_gap_eur=0.18,
     min_splits=4,
     max_splits=6,
 )
 register_strategy(
+    "JPN225_VWAP_TREND",
+    strategy_jpn225_vwap_trend,
+    tag="JPVT",
+    symbol_family="JPN225",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.20,
+    min_score=0.50,
+    cooldown_sec=46,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=default_strategy_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=0.80,
+    tp_rr_multiplier=1.76,
+    auto_disable=False,
+    be_trigger_progress=0.12,
+    be_buffer_progress=0.09,
+    trail_steps=[(0.24, 0.14), (0.40, 0.30), (0.58, 0.52)],
+    session_label="02-10",
+    multi_tp_eur_min=0.70,
+    multi_tp_eur_max=1.35,
+    multi_tp_target_eur=0.96,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.78, 2.60, 3.72, 5.02, 6.72, 8.92, 11.32],
+    multi_tp_tp2_gap_eur=0.36,
+    multi_tp_step_gap_eur=0.18,
+    min_splits=4,
+    max_splits=5,
+)
+register_strategy(
+    "JPN225_BREAK_RETEST",
+    strategy_jpn225_break_retest,
+    enabled=False,
+    toggle_arm=False,
+    tag="JPBR",
+    symbol_family="JPN225",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.18,
+    min_score=0.52,
+    cooldown_sec=42,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=default_strategy_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=0.78,
+    tp_rr_multiplier=1.74,
+    auto_disable=False,
+    be_trigger_progress=0.11,
+    be_buffer_progress=0.09,
+    trail_steps=[(0.22, 0.12), (0.38, 0.28), (0.56, 0.48)],
+    session_label="02-10",
+    multi_tp_eur_min=0.70,
+    multi_tp_eur_max=1.35,
+    multi_tp_target_eur=0.94,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.76, 2.55, 3.65, 4.95, 6.55, 8.55, 10.90],
+    multi_tp_tp2_gap_eur=0.36,
+    multi_tp_step_gap_eur=0.18,
+    min_splits=4,
+    max_splits=5,
+)
+get_strategy_config("JPN225_BREAK_RETEST")["disabled_reason"] = "TEST BENCH"
+register_strategy(
     "US500_ORB",
     strategy_us500_orb,
+    enabled=True,
     tag="U5OB",
     symbol_family="US500",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.20,
-    min_score=0.57,
-    cooldown_sec=120,
+    risk_multiplier=0.13,
+    min_score=0.56,
+    cooldown_sec=105,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=default_strategy_filter,
     market_filter_func=fast_market_filter,
     sl_atr_multiplier=0.60,
-    tp_rr_multiplier=1.72,
+    tp_rr_multiplier=1.58,
     auto_disable=False,
     be_trigger_progress=0.08,
     be_buffer_progress=0.09,
@@ -4231,6 +9556,7 @@ register_strategy(
     min_splits=4,
     max_splits=4,
 )
+get_strategy_config("US500_ORB")["disabled_reason"] = ""
 register_strategy(
     "US500_TREND",
     strategy_us500_trend,
@@ -4261,23 +9587,174 @@ register_strategy(
     max_splits=6,
 )
 register_strategy(
-    "GER40_TREND",
-    strategy_ger40_trend,
-    tag="G4TR",
-    symbol_family="GER40",
+    "US500_SANTO_GRAAL",
+    strategy_us500_santo_graal,
+    tag="U5SG",
+    symbol_family="US500",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.28,
-    min_score=0.64,
-    cooldown_sec=75,
-    allowed_regimes={"TREND"},
+    risk_multiplier=0.15,
+    min_score=0.52,
+    cooldown_sec=1200,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.1,
+    auto_disable=False,
+    be_trigger_progress=0.20,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.28, 0.10), (0.50, 0.30), (0.82, 0.56)],
+    session_label="13-23",
+    multi_tp_eur_min=0.65,
+    multi_tp_eur_max=1.30,
+    multi_tp_target_eur=0.96,
+    multi_tp_first_atr=0.11,
+    multi_tp_curve=[1.0, 1.95, 3.15, 4.85, 6.95, 9.45, 12.40, 15.90],
+    multi_tp_tp2_gap_eur=0.38,
+    multi_tp_step_gap_eur=0.20,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "US500_DOUBLE_MACD",
+    strategy_us500_double_macd,
+    tag="U5DM",
+    symbol_family="US500",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.15,
+    min_score=0.52,
+    cooldown_sec=14400,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.05,
+    auto_disable=False,
+    be_trigger_progress=0.20,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.30, 0.10), (0.50, 0.30), (0.82, 0.56)],
+    session_label="24H",
+    multi_tp_eur_min=0.65,
+    multi_tp_eur_max=1.30,
+    multi_tp_target_eur=0.98,
+    multi_tp_first_atr=0.11,
+    multi_tp_curve=[1.0, 1.90, 2.95, 4.40, 6.10, 8.30, 11.00, 14.00],
+    multi_tp_tp2_gap_eur=0.38,
+    multi_tp_step_gap_eur=0.19,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "US500_TOP",
+    strategy_us500_top,
+    tag="P5TP",
+    symbol_family="US500",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.13,
+    min_score=0.55,
+    cooldown_sec=30,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=scalping_filter,
+    market_filter_func=fast_market_filter_scalping,
+    sl_atr_multiplier=0.66,
+    tp_rr_multiplier=1.34,
+    auto_disable=False,
+    be_trigger_progress=0.10,
+    be_buffer_progress=0.08,
+    trail_steps=[(0.20, 0.12), (0.34, 0.26), (0.50, 0.44)],
+    session_label="13-23",
+    multi_tp_eur_min=0.60,
+    multi_tp_eur_max=1.20,
+    multi_tp_target_eur=0.88,
+    multi_tp_first_atr=0.08,
+    multi_tp_curve=[1.0, 1.70, 2.45, 3.35, 4.55, 6.05, 7.90, 10.10],
+    multi_tp_tp2_gap_eur=0.34,
+    multi_tp_step_gap_eur=0.17,
+    min_splits=4,
+    max_splits=6,
+)
+register_strategy(
+    "US30_VWAP_TREND",
+    strategy_us30_vwap_trend,
+    tag="U3VT",
+    symbol_family="US30",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.18,
+    min_score=0.50,
+    cooldown_sec=44,
+    allowed_regimes={"TREND", "RANGE"},
     filter_func=default_strategy_filter,
     market_filter_func=fast_market_filter,
     sl_atr_multiplier=0.82,
-    tp_rr_multiplier=1.90,
+    tp_rr_multiplier=1.80,
     auto_disable=False,
-    be_trigger_progress=0.18,
-    be_buffer_progress=0.10,
-    trail_steps=[(0.32, 0.10), (0.50, 0.24), (0.68, 0.42)],
+    be_trigger_progress=0.12,
+    be_buffer_progress=0.09,
+    trail_steps=[(0.24, 0.14), (0.40, 0.30), (0.58, 0.52)],
+    session_label="13-23",
+    multi_tp_eur_min=0.65,
+    multi_tp_eur_max=1.30,
+    multi_tp_target_eur=0.94,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.80, 2.62, 3.78, 5.12, 6.85, 9.05, 11.55],
+    multi_tp_tp2_gap_eur=0.36,
+    multi_tp_step_gap_eur=0.18,
+    min_splits=4,
+    max_splits=5,
+)
+register_strategy(
+    "US30_BREAK_RETEST",
+    strategy_us30_break_retest,
+    enabled=False,
+    toggle_arm=False,
+    tag="U3BR",
+    symbol_family="US30",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.16,
+    min_score=0.52,
+    cooldown_sec=40,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=default_strategy_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=0.80,
+    tp_rr_multiplier=1.74,
+    auto_disable=False,
+    be_trigger_progress=0.11,
+    be_buffer_progress=0.09,
+    trail_steps=[(0.22, 0.12), (0.38, 0.28), (0.56, 0.48)],
+    session_label="13-23",
+    multi_tp_eur_min=0.65,
+    multi_tp_eur_max=1.30,
+    multi_tp_target_eur=0.92,
+    multi_tp_first_atr=0.09,
+    multi_tp_curve=[1.0, 1.76, 2.55, 3.68, 5.00, 6.65, 8.70, 11.10],
+    multi_tp_tp2_gap_eur=0.36,
+    multi_tp_step_gap_eur=0.18,
+    min_splits=4,
+    max_splits=5,
+)
+get_strategy_config("US30_BREAK_RETEST")["disabled_reason"] = "TEST BENCH"
+register_strategy(
+    "GER40_TREND",
+    strategy_ger40_trend,
+    enabled=True,
+    tag="G4TR",
+    symbol_family="GER40",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.20,
+    min_score=0.58,
+    cooldown_sec=52,
+    allowed_regimes={"TREND"},
+    filter_func=default_strategy_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=0.76,
+    tp_rr_multiplier=1.76,
+    auto_disable=False,
+    be_trigger_progress=0.14,
+    be_buffer_progress=0.09,
+    trail_steps=[(0.28, 0.12), (0.44, 0.28), (0.62, 0.46)],
     session_label="08-17",
     multi_tp_eur_min=0.60,
     multi_tp_eur_max=1.20,
@@ -4287,7 +9764,98 @@ register_strategy(
     multi_tp_tp2_gap_eur=0.34,
     multi_tp_step_gap_eur=0.17,
     min_splits=4,
-    max_splits=6,
+    max_splits=5,
+)
+get_strategy_config("GER40_TREND")["disabled_reason"] = ""
+register_strategy(
+    "GER40_SANTO_GRAAL",
+    strategy_ger40_santo_graal,
+    tag="G4SG",
+    symbol_family="GER40",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.14,
+    min_score=0.52,
+    cooldown_sec=1200,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.1,
+    auto_disable=False,
+    be_trigger_progress=0.20,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.28, 0.10), (0.50, 0.30), (0.82, 0.56)],
+    session_label="08-18",
+    multi_tp_eur_min=0.60,
+    multi_tp_eur_max=1.28,
+    multi_tp_target_eur=0.94,
+    multi_tp_first_atr=0.11,
+    multi_tp_curve=[1.0, 1.95, 3.10, 4.75, 6.80, 9.20, 12.00, 15.40],
+    multi_tp_tp2_gap_eur=0.36,
+    multi_tp_step_gap_eur=0.19,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "GER40_PURIA",
+    strategy_ger40_puria,
+    tag="G4PU",
+    symbol_family="GER40",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.15,
+    min_score=0.52,
+    cooldown_sec=840,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.00,
+    auto_disable=False,
+    be_trigger_progress=0.18,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.28, 0.10), (0.50, 0.30), (0.82, 0.56)],
+    session_label="08-18",
+    multi_tp_eur_min=0.60,
+    multi_tp_eur_max=1.28,
+    multi_tp_target_eur=0.95,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.90, 2.95, 4.45, 6.20, 8.45, 11.20, 14.30],
+    multi_tp_tp2_gap_eur=0.38,
+    multi_tp_step_gap_eur=0.19,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
+)
+register_strategy(
+    "GER40_SIDUS",
+    strategy_ger40_sidus,
+    tag="G4SD",
+    symbol_family="GER40",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.15,
+    min_score=0.52,
+    cooldown_sec=840,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=swing_filter,
+    market_filter_func=fast_market_filter,
+    sl_atr_multiplier=1.0,
+    tp_rr_multiplier=2.08,
+    auto_disable=False,
+    be_trigger_progress=0.18,
+    be_buffer_progress=0.10,
+    trail_steps=[(0.28, 0.10), (0.50, 0.30), (0.82, 0.56)],
+    session_label="08-18",
+    multi_tp_eur_min=0.60,
+    multi_tp_eur_max=1.28,
+    multi_tp_target_eur=0.95,
+    multi_tp_first_atr=0.10,
+    multi_tp_curve=[1.0, 1.92, 3.00, 4.55, 6.35, 8.70, 11.55, 14.85],
+    multi_tp_tp2_gap_eur=0.38,
+    multi_tp_step_gap_eur=0.19,
+    min_splits=3,
+    max_splits=4,
+    exclusive_symbol=True,
 )
 register_strategy(
     "GER40_BREAK_RETEST",
@@ -4319,8 +9887,68 @@ register_strategy(
     max_splits=6,
 )
 register_strategy(
+    "GER40_TOP",
+    strategy_ger40_top,
+    tag="GTOP",
+    symbol_family="GER40",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.16,
+    min_score=0.54,
+    cooldown_sec=16,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=scalping_filter,
+    market_filter_func=fast_market_filter_scalping,
+    sl_atr_multiplier=0.64,
+    tp_rr_multiplier=1.30,
+    auto_disable=False,
+    be_trigger_progress=0.10,
+    be_buffer_progress=0.08,
+    trail_steps=[(0.20, 0.12), (0.34, 0.26), (0.50, 0.44)],
+    session_label="08-18",
+    multi_tp_eur_min=0.55,
+    multi_tp_eur_max=1.20,
+    multi_tp_target_eur=0.85,
+    multi_tp_first_atr=0.08,
+    multi_tp_curve=[1.0, 1.70, 2.45, 3.35, 4.50, 5.95, 7.70, 9.80],
+    multi_tp_tp2_gap_eur=0.34,
+    multi_tp_step_gap_eur=0.17,
+    min_splits=4,
+    max_splits=8,
+)
+register_strategy(
+    "UK100_TOP",
+    strategy_uk100_top,
+    tag="KTOP",
+    symbol_family="UK100",
+    execution_mode="MULTI_ONLY",
+    risk_multiplier=0.15,
+    min_score=0.55,
+    cooldown_sec=18,
+    allowed_regimes={"TREND", "RANGE"},
+    filter_func=scalping_filter,
+    market_filter_func=fast_market_filter_scalping,
+    sl_atr_multiplier=0.64,
+    tp_rr_multiplier=1.30,
+    auto_disable=False,
+    be_trigger_progress=0.10,
+    be_buffer_progress=0.08,
+    trail_steps=[(0.20, 0.12), (0.34, 0.26), (0.50, 0.44)],
+    session_label="08-18",
+    multi_tp_eur_min=0.55,
+    multi_tp_eur_max=1.20,
+    multi_tp_target_eur=0.86,
+    multi_tp_first_atr=0.08,
+    multi_tp_curve=[1.0, 1.70, 2.45, 3.35, 4.50, 5.95, 7.70, 9.80],
+    multi_tp_tp2_gap_eur=0.34,
+    multi_tp_step_gap_eur=0.17,
+    min_splits=4,
+    max_splits=8,
+)
+register_strategy(
     "GER40_PULLBACK_SCALP",
     strategy_ger40_pullback_scalp,
+    enabled=False,
+    toggle_arm=False,
     tag="G1PB",
     symbol_family="GER40",
     execution_mode="MULTI_ONLY",
@@ -4347,10 +9975,12 @@ register_strategy(
     min_splits=4,
     max_splits=8,
 )
+get_strategy_config("GER40_PULLBACK_SCALP")["disabled_reason"] = "SUPERSEDED BY GER40_TOP"
 register_strategy(
     "GER40_SCALP",
     strategy_ger40_scalping,
     enabled=False,
+    toggle_arm=False,
     tag="G4SC",
     symbol_family="GER40",
     execution_mode="STD_ONLY",
@@ -4370,6 +10000,117 @@ register_strategy(
     trail_steps=[(0.52, 0.18), (0.70, 0.36), (0.86, 0.58)],
     session_label="08-17",
 )
+
+DEPRECATED_STRATEGY_NAMES = {
+    "USTECH_TOP",
+    "US500_TOP",
+    "JPN225_TOP",
+    "GER40_TOP",
+    "UK100_TOP",
+    "USTECH_PULLBACK_SCALP",
+}
+
+
+def _strategy_selection_priority(strategy):
+    name = str(strategy.get("name", "") or "")
+    if name.endswith("_TITANYX"):
+        return 8
+    if name in LIQUIDITY_SNIPER_STRATEGY_NAMES:
+        return 12
+    if name.endswith("_TREND"):
+        return 18
+    if name.endswith("_BREAK_RETEST"):
+        return 20
+    if name.endswith("_ORB"):
+        return 22
+    if name.endswith("_SCALP"):
+        return 24
+    if name.endswith("_VWAP_RECLAIM") or name.endswith("_VWAP_TREND"):
+        return 26
+    if name.endswith("_SANTO_GRAAL"):
+        return 30
+    if name.endswith("_KUMO_BREAKOUT"):
+        return 32
+    if name.endswith("_PURIA"):
+        return 34
+    if name.endswith("_SIDUS"):
+        return 36
+    if name.endswith("_DOUBLE_MACD"):
+        return 38
+    if name.endswith("_HEIKEN_TDI"):
+        return 40
+    return 50
+
+
+def _apply_v160_strategy_governance():
+    global STRATEGIES
+    kept = []
+    for strategy in STRATEGIES:
+        if strategy["name"] in DEPRECATED_STRATEGY_NAMES:
+            continue
+        kept.append(strategy)
+    STRATEGIES = kept
+
+    for deprecated_name in DEPRECATED_STRATEGY_NAMES:
+        strategy_stats.pop(deprecated_name, None)
+        strategy_runtime.pop(deprecated_name, None)
+
+    for strategy in STRATEGIES:
+        strategy["enabled"] = True
+        strategy["toggle_arm"] = True
+        if strategy.get("disabled_reason") in {
+            "S&D LIQUIDITY SNIPER CONTROL",
+            "TEST BENCH",
+            "SUPERSEDED BY USTECH_TOP",
+            "SUPERSEDED BY GER40_TOP",
+        }:
+            strategy["disabled_reason"] = ""
+        strategy["selection_priority"] = _strategy_selection_priority(strategy)
+
+
+_apply_v160_strategy_governance()
+
+
+TITANYX_REGISTRY = [
+    {"name": "US500_TITANYX", "func": strategy_us500_titanyx, "tag": "U5TX", "family": "US500", "risk": 0.15, "score": 0.52, "cooldown": 75},
+    {"name": "EUSTX50_TITANYX", "func": strategy_eustx50_titanyx, "tag": "E5TX", "family": "EUSTX50", "risk": 0.14, "score": 0.51, "cooldown": 75},
+    {"name": "UK100_TITANYX", "func": strategy_uk100_titanyx, "tag": "K1TX", "family": "UK100", "risk": 0.13, "score": 0.51, "cooldown": 75},
+    {"name": "FRA40_TITANYX", "func": strategy_fra40_titanyx, "tag": "F4TX", "family": "FRA40", "risk": 0.13, "score": 0.50, "cooldown": 90},
+    {"name": "US30_TITANYX", "func": strategy_us30_titanyx, "tag": "U3TX", "family": "US30", "risk": 0.14, "score": 0.50, "cooldown": 90},
+]
+
+for spec in TITANYX_REGISTRY:
+    register_strategy(
+        spec["name"],
+        spec["func"],
+        tag=spec["tag"],
+        symbol_family=spec["family"],
+        execution_mode="STD_ONLY",
+        risk_multiplier=spec["risk"],
+        min_score=spec["score"],
+        cooldown_sec=spec["cooldown"],
+        allowed_regimes={"RANGE", "TREND"},
+        filter_func=titanyx_filter,
+        market_filter_func=fast_market_filter,
+        sl_atr_multiplier=1.0,
+        tp_rr_multiplier=1.0,
+        auto_disable=False,
+        be_trigger_progress=0.08,
+        be_buffer_progress=0.04,
+        trail_steps=[],
+        session_label="TITANYX",
+        exclusive_symbol=True,
+    )
+    cfg = get_strategy_config(spec["name"])
+    if cfg:
+        profile = TITANYX_PROFILES[spec["family"]]
+        cfg["suite"] = "TITANYX"
+        cfg["strategy_id"] = f"TITANYX_{spec['family']}"
+        cfg["priority_rank"] = profile["priority_rank"]
+        cfg["allow_scale_in_cluster"] = True
+        cfg["max_basket_orders"] = int(profile["max_orders"])
+        cfg["titanyx_spread_atr"] = 0.18
+        cfg["selection_priority"] = _strategy_selection_priority(cfg)
 
 
 def compute_asset_score(symbol, df, sig, conf, strategy_cfg=None):
@@ -4392,7 +10133,7 @@ def compute_asset_score(symbol, df, sig, conf, strategy_cfg=None):
 # ==============================================================================
 # EXECUTION LAYER PRO (MULTI-TP)
 # ==============================================================================
-def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None, strategy_cfg=None, execution_df=None):
+def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None, strategy_cfg=None, execution_df=None, signal_payload=None):
     acc, info, tick = mt5.account_info(), safe_info(symbol), safe_tick(symbol)
     if not acc or not info or not tick or info.trade_tick_size <= 0:
         set_live_log(symbol, "❌ EXEC CANCEL: Missing Info")
@@ -4404,6 +10145,10 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
     risk_multiplier = strategy_cfg.get("risk_multiplier", 1.0)
     sl_atr_multiplier = strategy_cfg.get("sl_atr_multiplier", 1.2)
     tp_rr_multiplier = strategy_cfg.get("tp_rr_multiplier", 2.0)
+    signal_payload = signal_payload or {}
+    risk_multiplier = float(signal_payload.get("risk_multiplier_override", risk_multiplier) or risk_multiplier)
+    allow_scale_in_cluster = bool(strategy_cfg.get("allow_scale_in_cluster"))
+    max_basket_orders = int(strategy_cfg.get("max_basket_orders", 1) or 1)
 
     live_pos = safe_positions()
     open_clusters = {
@@ -4411,9 +10156,21 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
         for p in live_pos
         if p.symbol == symbol and p.magic == MAGIC_ID
     }
+    existing_cluster_positions = get_strategy_cluster_positions(symbol, strategy_tag) if allow_scale_in_cluster else []
     if strategy_tag in open_clusters:
-        set_live_log(symbol, f"⚠️ EXEC CANCEL: {strategy_tag} already active")
-        return False, "ALREADY ACTIVE"
+        if not allow_scale_in_cluster:
+            set_live_log(symbol, f"⚠️ EXEC CANCEL: {strategy_tag} already active")
+            return False, "ALREADY ACTIVE"
+        if len(existing_cluster_positions) >= max_basket_orders:
+            set_live_log(symbol, f"⚠️ EXEC CANCEL: {strategy_tag} max basket orders")
+            return False, "MAX BASKET"
+        existing_side = "BUY" if existing_cluster_positions and existing_cluster_positions[0].type == 0 else "SELL"
+        if existing_cluster_positions and existing_side != signal:
+            set_live_log(symbol, f"⚠️ EXEC CANCEL: {strategy_tag} opposite basket active")
+            return False, "OPPOSITE BASKET"
+    if strategy_cfg.get("exclusive_symbol") and not (allow_scale_in_cluster and existing_cluster_positions) and any(p.symbol == symbol and p.magic == MAGIC_ID for p in live_pos):
+        set_live_log(symbol, f"⚠️ EXEC CANCEL: {strategy_tag} exclusive symbol lock")
+        return False, "SYMBOL ACTIVE"
     symbol_cluster_cap = get_max_clusters_for_symbol(symbol)
     if len(open_clusters) >= symbol_cluster_cap:
         set_live_log(symbol, "⚠️ EXEC CANCEL: Max strategy clusters reached")
@@ -4422,7 +10179,14 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
     price = tick.ask if signal == "BUY" else tick.bid
     working_df = execution_df if execution_df is not None else df
     atr = working_df["atr"].iloc[-1]
-    sl_dist = atr * sl_atr_multiplier
+    custom_sl_price = signal_payload.get("sl_price")
+    custom_tp_price = signal_payload.get("tp_price")
+    if custom_sl_price is not None:
+        custom_sl_price = float(custom_sl_price)
+        sl_dist = abs(price - custom_sl_price)
+    else:
+        sl_dist = atr * sl_atr_multiplier
+    sl_dist = max(sl_dist, max(info.point * 20, atr * 0.35))
 
     risk_money = acc.equity * compute_dynamic_risk() * risk_multiplier
     projected_risk = get_total_open_risk() + (risk_money / max(acc.equity, 1e-6))
@@ -4447,8 +10211,9 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
         use_multi = USE_MULTI_TP and should_use_multi_tp(df, symbol)
 
     if not use_multi:
-        tp = price + sl_dist * tp_rr_multiplier if signal == "BUY" else price - sl_dist * tp_rr_multiplier
-        sl = price - sl_dist if signal == "BUY" else price + sl_dist
+        broker_tp_disabled = bool(signal_payload.get("broker_tp_disabled"))
+        tp = 0.0 if broker_tp_disabled else (float(custom_tp_price) if custom_tp_price is not None else (price + sl_dist * tp_rr_multiplier if signal == "BUY" else price - sl_dist * tp_rr_multiplier))
+        sl = custom_sl_price if custom_sl_price is not None else (price - sl_dist if signal == "BUY" else price + sl_dist)
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -4467,6 +10232,20 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
         with mt5_lock:
             res = mt5.order_send(request)
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            if strategy_cfg.get("suite") == "TITANYX":
+                cluster_key = (symbol, strategy_tag)
+                cluster_state = trade_memory.setdefault(cluster_key, {"legs": {}, "abort_cluster": False})
+                cluster_state.update(
+                    {
+                        "opened_at": datetime.now(),
+                        "signal": signal,
+                        "suite": "TITANYX",
+                        "titanyx_last_add_price": float(price),
+                        "titanyx_last_add_time": datetime.now(),
+                        "titanyx_last_volatility": signal_payload.get("signal_details", {}).get("volatility_state", "---"),
+                        "titanyx_last_equity": signal_payload.get("signal_details", {}).get("equity_protection", "---"),
+                    }
+                )
             last_trade_time[symbol] = time.time()
             last_signal[symbol] = signal
             return True, "EXECUTED"
@@ -4485,35 +10264,40 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
     )
     strategy_cfg = plan_cfg
     record_strategy_tp_plan(strat_name, plan_text)
-    lot_per_trade = total_lot / splits
-
-    if lot_per_trade < MIN_LOT_PER_SPLIT:
-        splits = max(1, int(total_lot / MIN_LOT_PER_SPLIT))
-        lot_per_trade = total_lot / splits
-
-    lot_per_trade = round(lot_per_trade / info.volume_step) * info.volume_step
-
-    if lot_per_trade < info.volume_min:
+    lot_plan = build_dynamic_multi_tp_lot_plan(
+        total_lot,
+        info,
+        strategy_cfg,
+        splits,
+        float(strategy_cfg.get("effective_tp_quality", 0.5) or 0.5),
+    )
+    if not lot_plan:
         set_live_log(symbol, "❌ MULTI-TP CANCEL: Lot too small")
         return False, "LOT TOO SMALL"
+    splits = len(lot_plan)
+    lot_per_trade = round((sum(lot_plan) / max(splits, 1)) / info.volume_step) * info.volume_step
+    lot_per_trade = max(info.volume_min, lot_per_trade)
 
     success_count = 0
     successful_tp_prices = []
     successful_projected_profits = []
+    successful_lots = []
     spread_price = abs(tick.ask - tick.bid)
     tp_prices, projected_profits = build_dynamic_multi_tp_prices(
         symbol, signal, price, info, lot_per_trade, atr, spread_price, strategy_cfg, splits
     )
-    set_live_log(symbol, f"📤 SEND MULTI ORDER | {splits} x {lot_per_trade} | TP1~{projected_profits[0]}€")
+    set_live_log(symbol, f"📤 SEND MULTI ORDER | {splits} legs | avg {lot_per_trade} | TP1~{projected_profits[0]}€")
 
     for i in range(splits):
         tp_price = tp_prices[i]
-        sl_price = price - sl_dist if signal == "BUY" else price + sl_dist
+        leg_lot = float(lot_plan[i])
+        projected_profit = round(price_distance_to_profit(info, leg_lot, abs(tp_price - price)), 2)
+        sl_price = custom_sl_price if custom_sl_price is not None else (price - sl_dist if signal == "BUY" else price + sl_dist)
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
-            "volume": float(lot_per_trade),
+            "volume": leg_lot,
             "type": mt5.ORDER_TYPE_BUY if signal == "BUY" else mt5.ORDER_TYPE_SELL,
             "price": price,
             "sl": round(sl_price, info.digits),
@@ -4528,7 +10312,8 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
         if res and res.retcode == mt5.TRADE_RETCODE_DONE:
             success_count += 1
             successful_tp_prices.append(float(tp_price))
-            successful_projected_profits.append(float(projected_profits[i]))
+            successful_projected_profits.append(projected_profit)
+            successful_lots.append(leg_lot)
         time.sleep(0.05)
 
     if success_count > 0:
@@ -4547,6 +10332,7 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
                 "signal": signal,
                 "score": round(score, 3),
                 "confidence": round(confidence_value, 1),
+                "signal_meta": signal_payload,
                 "tp_quality": round(strategy_cfg.get("effective_tp_quality", 0.5), 3),
                 "be_trigger_progress": strategy_cfg.get("effective_be_trigger", cluster_profile["be_trigger_progress"]),
                 "be_buffer_progress": strategy_cfg.get("effective_be_buffer_progress", cluster_profile["be_buffer_progress"]),
@@ -4560,11 +10346,16 @@ def open_scaled_trade(symbol, signal, df, strat_name, score=1.0, confidence=None
                 "tp_splits": success_count,
                 "tp_prices": [round(tp, info.digits) for tp in successful_tp_prices],
                 "tp_projected_profits": [round(x, 2) for x in successful_projected_profits],
+                "tp_lot_plan": [round(x, 4) for x in successful_lots],
                 "tp_high_conf": tp_high_conf,
                 "tp_be_after_legs": tp_be_after_legs,
                 "tp_lock_offset": tp_lock_offset,
+                "tp3_bridge_ratio": cluster_profile["tp3_bridge_ratio"],
+                "runner_peak_keep_ratio": cluster_profile["runner_peak_keep_ratio"],
+                "runner_realized_lock_ratio": cluster_profile["runner_realized_lock_ratio"],
                 "tp1_projected": successful_projected_profits[0] if successful_projected_profits else 0.0,
                 "tp2_projected": successful_projected_profits[1] if len(successful_projected_profits) > 1 else (successful_projected_profits[0] if successful_projected_profits else 0.0),
+                "peak_open_profit": 0.0,
                 "abort_cluster": False,
                 "abort_reason": "",
             }
@@ -4599,7 +10390,25 @@ def tick_management():
         cluster_positions.setdefault(cluster_key, []).append(p)
 
     for cluster_key, live_positions in cluster_positions.items():
-        hydrate_cluster_tp_state(cluster_key, live_positions)
+        cluster_state = hydrate_cluster_tp_state(cluster_key, live_positions)
+        open_legs = sorted(
+            idx for idx in (
+                extract_leg_index(getattr(p, "comment", "") or "")
+                for p in live_positions
+            )
+            if idx is not None
+        )
+        if open_legs:
+            cluster_state["open_legs"] = open_legs
+            stopped_leg_indexes = sorted(
+                idx for idx, leg in cluster_state.get("legs", {}).items()
+                if leg.get("reason") == "SL"
+            )
+            if stopped_leg_indexes:
+                highest_stopped_leg = max(stopped_leg_indexes)
+                if highest_stopped_leg >= 3 and any(idx > highest_stopped_leg for idx in open_legs):
+                    cluster_state["abort_cluster"] = True
+                    cluster_state["abort_reason"] = f"TP{highest_stopped_leg} runner stop cascade"
 
     cluster_abort_logged = set()
     for p in positions:
@@ -4648,6 +10457,8 @@ def tick_management():
                     cluster_abort_logged.add((p.symbol, strategy_tag))
 
     positions = safe_positions()
+    sg_exit_logged = set()
+    titanyx_managed = set()
     for p in positions:
         if p.magic != MAGIC_ID:
             continue
@@ -4666,6 +10477,102 @@ def tick_management():
         strategy_cfg = get_strategy_by_tag(strategy_tag) if strategy_tag else None
         strategy_name = strategy_cfg["name"] if strategy_cfg else strategy_tag
         is_orb_cluster = bool(strategy_cfg and strategy_cfg["name"].endswith("_ORB"))
+        if strategy_cfg and strategy_cfg["name"].endswith("_TITANYX"):
+            cluster_key = (p.symbol, strategy_tag)
+            if cluster_key in titanyx_managed:
+                continue
+            titanyx_managed.add(cluster_key)
+            cluster_state = trade_memory.setdefault(cluster_key, {"legs": {}, "abort_cluster": False})
+            cluster_snapshot = _titanyx_cluster_snapshot(p.symbol, strategy_tag)
+            titanyx_reason, titanyx_exit_kind, titanyx_sl, titanyx_tp = get_titanyx_exit_reason(p.symbol, strategy_cfg, cluster_state, cluster_snapshot)
+            live_cluster_positions = cluster_positions.get(cluster_key, [])
+            if cluster_snapshot and titanyx_sl is not None and titanyx_tp is not None:
+                for basket_pos in live_cluster_positions:
+                    info_basket = safe_info(basket_pos.symbol)
+                    tick_basket = safe_tick(basket_pos.symbol)
+                    if not info_basket or not tick_basket:
+                        continue
+                    price_basket = tick_basket.bid if basket_pos.type == 0 else tick_basket.ask
+                    min_dist = max((info_basket.trade_stops_level + 5) * info_basket.point, info_basket.point * 20)
+                    sl_ok = titanyx_sl < price_basket - min_dist if basket_pos.type == 0 else titanyx_sl > price_basket + min_dist
+                    tp_ok = titanyx_tp > price_basket + min_dist if basket_pos.type == 0 else titanyx_tp < price_basket - min_dist
+                    if sl_ok and tp_ok:
+                        update_position_sltp_levels(basket_pos, info_basket, titanyx_sl, titanyx_tp)
+            if titanyx_reason:
+                closed = close_strategy_cluster(p.symbol, strategy_tag)
+                if closed > 0:
+                    was_stop = titanyx_exit_kind == "STOP"
+                    _titanyx_update_stop_streak(strategy_name, was_stop)
+                    set_live_log(p.symbol, f"🧲 TITANYX EXIT {strategy_tag} | {titanyx_reason}")
+                    record_strategy_event(strategy_name, f"TITANYX {titanyx_reason}")
+                continue
+            continue
+        if strategy_cfg and (
+            strategy_cfg["name"].endswith("_CONTINUATION_LIQUIDITY_PULLBACK")
+            or strategy_cfg["name"].endswith("_REVERSAL_SWEEP")
+        ):
+            sniper_reason = get_liquidity_sniper_exit_reason(p.symbol, strategy_cfg, cluster_state.get("signal", "BUY"))
+            if sniper_reason:
+                closed = close_strategy_cluster(p.symbol, strategy_tag)
+                if closed > 0 and (p.symbol, strategy_tag) not in sg_exit_logged:
+                    set_live_log(p.symbol, f"🎯 S&D EXIT {strategy_tag} | {sniper_reason}")
+                    record_strategy_event(strategy_name, "S&D EXIT")
+                    sg_exit_logged.add((p.symbol, strategy_tag))
+                continue
+        if strategy_cfg and strategy_cfg["name"].endswith("_HEIKEN_TDI"):
+            htdi_reason = get_heiken_tdi_exit_reason(p.symbol, strategy_cfg, cluster_state.get("signal", "BUY"))
+            if htdi_reason:
+                closed = close_strategy_cluster(p.symbol, strategy_tag)
+                if closed > 0 and (p.symbol, strategy_tag) not in sg_exit_logged:
+                    set_live_log(p.symbol, f"🟦 HEIKEN+TDI EXIT {strategy_tag} | {htdi_reason}")
+                    record_strategy_event(strategy_name, "HEIKEN+TDI EXIT")
+                    sg_exit_logged.add((p.symbol, strategy_tag))
+                continue
+        if strategy_cfg and strategy_cfg["name"].endswith("_DOUBLE_MACD"):
+            dmacd_reason = get_double_macd_exit_reason(p.symbol, strategy_cfg, cluster_state.get("signal", "BUY"))
+            if dmacd_reason:
+                closed = close_strategy_cluster(p.symbol, strategy_tag)
+                if closed > 0 and (p.symbol, strategy_tag) not in sg_exit_logged:
+                    set_live_log(p.symbol, f"📊 DOUBLE MACD EXIT {strategy_tag} | {dmacd_reason}")
+                    record_strategy_event(strategy_name, "DOUBLE MACD EXIT")
+                    sg_exit_logged.add((p.symbol, strategy_tag))
+                continue
+        if strategy_cfg and strategy_cfg["name"].endswith("_PURIA"):
+            puria_reason = get_puria_exit_reason(p.symbol, strategy_cfg, cluster_state.get("signal", "BUY"))
+            if puria_reason:
+                closed = close_strategy_cluster(p.symbol, strategy_tag)
+                if closed > 0 and (p.symbol, strategy_tag) not in sg_exit_logged:
+                    set_live_log(p.symbol, f"🧪 PURIA EXIT {strategy_tag} | {puria_reason}")
+                    record_strategy_event(strategy_name, "PURIA EXIT")
+                    sg_exit_logged.add((p.symbol, strategy_tag))
+                continue
+        if strategy_cfg and strategy_cfg["name"].endswith("_SIDUS"):
+            sidus_reason = get_sidus_exit_reason(p.symbol, strategy_cfg, cluster_state.get("signal", "BUY"))
+            if sidus_reason:
+                closed = close_strategy_cluster(p.symbol, strategy_tag)
+                if closed > 0 and (p.symbol, strategy_tag) not in sg_exit_logged:
+                    set_live_log(p.symbol, f"🧭 SIDUS EXIT {strategy_tag} | {sidus_reason}")
+                    record_strategy_event(strategy_name, "SIDUS EXIT")
+                    sg_exit_logged.add((p.symbol, strategy_tag))
+                continue
+        if strategy_cfg and strategy_cfg["name"].endswith("_KUMO_BREAKOUT"):
+            kumo_reason = get_kumo_breakout_exit_reason(p.symbol, strategy_cfg, cluster_state.get("signal", "BUY"))
+            if kumo_reason:
+                closed = close_strategy_cluster(p.symbol, strategy_tag)
+                if closed > 0 and (p.symbol, strategy_tag) not in sg_exit_logged:
+                    set_live_log(p.symbol, f"☁️ KUMO EXIT {strategy_tag} | {kumo_reason}")
+                    record_strategy_event(strategy_name, "KUMO EXIT")
+                    sg_exit_logged.add((p.symbol, strategy_tag))
+                continue
+        if strategy_cfg and strategy_cfg["name"].endswith("_SANTO_GRAAL"):
+            sg_reason = get_santo_graal_exit_reason(p.symbol, strategy_cfg, cluster_state.get("signal", "BUY"))
+            if sg_reason:
+                closed = close_strategy_cluster(p.symbol, strategy_tag)
+                if closed > 0 and (p.symbol, strategy_tag) not in sg_exit_logged:
+                    set_live_log(p.symbol, f"🕊️ SANTO GRAAL EXIT {strategy_tag} | {sg_reason}")
+                    record_strategy_event(strategy_name, "SANTO GRAAL EXIT")
+                    sg_exit_logged.add((p.symbol, strategy_tag))
+                continue
 
         if int(time.time()) % 10 == 0:
             set_live_log(p.symbol, f"📌 MANAGING | PnL: {round(p.profit,2)}€ ({round(profit_points,1)} pts)")
@@ -4723,6 +10630,8 @@ def tick_management():
                 hit_label = f"C{positive_legs}"
 
             realized_profit = cluster_state.get("realized_profit", 0.0)
+            peak_open_profit = max(float(cluster_state.get("peak_open_profit", 0.0) or 0.0), float(cluster_meta.get("open_profit", 0.0) or 0.0))
+            cluster_state["peak_open_profit"] = round(peak_open_profit, 2)
             if positive_legs >= guard_after_legs and realized_profit > 0:
                 tp1_guard_floor = 0.10 if symbol_in_family(p.symbol, "XAUUSD") else 0.14
                 tp1_guard_limit = max(tp1_guard_floor, realized_profit * cluster_profile["tp1_guard_ratio"])
@@ -4751,6 +10660,16 @@ def tick_management():
                     set_live_log(p.symbol, f"💼 CLUSTER EXIT {strategy_tag} | protect realized")
                     record_strategy_event(strategy_name, "CLUSTER PROFIT LOCK")
                 continue
+            if positive_legs >= 3 and realized_profit > 0 and peak_open_profit > 0:
+                runner_open_floor = max(0.18 if symbol_in_family(p.symbol, "XAUUSD") else 0.14, peak_open_profit * cluster_profile["runner_peak_keep_ratio"])
+                runner_realized_floor = realized_profit * cluster_profile["runner_realized_lock_ratio"]
+                runner_floor = max(runner_open_floor, runner_realized_floor)
+                if cluster_meta.get("open_profit", 0.0) <= runner_floor:
+                    closed = close_strategy_cluster(p.symbol, strategy_tag)
+                    if closed > 0:
+                        set_live_log(p.symbol, f"🎯 TP3 RUNNER LOCK {strategy_tag} | keep extension")
+                        record_strategy_event(strategy_name, "TP3 RUNNER LOCK")
+                    continue
             if is_orb_cluster and positive_legs >= guard_after_legs and realized_profit > 0 and cluster_meta.get("open_profit", 0.0) <= max(0.18, realized_profit * cluster_profile["hard_lock_ratio"]):
                 closed = close_strategy_cluster(p.symbol, strategy_tag)
                 if closed > 0:
@@ -4805,38 +10724,36 @@ def tick_management():
 
         if p.type == 0:
             if new_sl > p.sl and new_sl < (price - min_dist):
-                with mt5_lock:
-                    mt5.order_send(
-                        {
-                            "action": mt5.TRADE_ACTION_SLTP,
-                            "symbol": p.symbol,
-                            "position": p.ticket,
-                            "sl": round(new_sl, info.digits),
-                            "tp": p.tp,
-                        }
-                    )
-                set_live_log(p.symbol, f"🔒 SL UPDATED {strategy_tag or ''} {hit_label}".strip())
+                updated, retcode = update_position_sltp(p, info, new_sl)
+                if updated:
+                    set_live_log(p.symbol, f"🔒 SL UPDATED {strategy_tag or ''} {hit_label}".strip())
+                elif is_dynamic_tp_cluster and positive_legs >= max(3, guard_after_legs + 1):
+                    closed = close_strategy_cluster(p.symbol, strategy_tag)
+                    if closed > 0:
+                        set_live_log(p.symbol, f"🧷 RUNNER SYNC EXIT {strategy_tag} | SL sync failed rc={retcode}")
+                        record_strategy_event(strategy_name, "RUNNER SYNC EXIT")
+                    else:
+                        set_live_log(p.symbol, f"⚠️ SL UPDATE FAIL {strategy_tag} rc={retcode}")
 
         elif p.type == 1:
             if (p.sl == 0 or new_sl < p.sl) and new_sl > (price + min_dist):
-                with mt5_lock:
-                    mt5.order_send(
-                        {
-                            "action": mt5.TRADE_ACTION_SLTP,
-                            "symbol": p.symbol,
-                            "position": p.ticket,
-                            "sl": round(new_sl, info.digits),
-                            "tp": p.tp,
-                        }
-                    )
-                set_live_log(p.symbol, f"🔒 SL UPDATED {strategy_tag or ''} {hit_label}".strip())
+                updated, retcode = update_position_sltp(p, info, new_sl)
+                if updated:
+                    set_live_log(p.symbol, f"🔒 SL UPDATED {strategy_tag or ''} {hit_label}".strip())
+                elif is_dynamic_tp_cluster and positive_legs >= max(3, guard_after_legs + 1):
+                    closed = close_strategy_cluster(p.symbol, strategy_tag)
+                    if closed > 0:
+                        set_live_log(p.symbol, f"🧷 RUNNER SYNC EXIT {strategy_tag} | SL sync failed rc={retcode}")
+                        record_strategy_event(strategy_name, "RUNNER SYNC EXIT")
+                    else:
+                        set_live_log(p.symbol, f"⚠️ SL UPDATE FAIL {strategy_tag} rc={retcode}")
 
 
 # ==============================================================================
 # MAIN ENGINE
 # ==============================================================================
 def learn_from_history():
-    global last_history_check, session_stats, performance_memory, legacy_stats
+    global last_history_check, session_stats, performance_memory, legacy_stats, liquidity_sniper_day_state
 
     now = datetime.now()
     broker_offset = get_live_broker_offset()
@@ -4864,6 +10781,7 @@ def learn_from_history():
         if d.magic == MAGIC_ID and d.entry == mt5.DEAL_ENTRY_OUT and getattr(d, "time", 0) >= broker_session_started_at.timestamp()
     ]
     deals = sorted(deals, key=lambda d: (getattr(d, "time", 0), _deal_ticket(d) or 0))
+    liquidity_sniper_day_state = _build_liquidity_sniper_day_state(deals, fresh_position_map)
 
     def apply_closed_deal(d, session_acc, perf_acc, strategy_acc, legacy_acc, trade_acc, latest_acc):
         realized_pnl = get_deal_realized_pnl(d)
@@ -5024,7 +10942,7 @@ def learn_from_history():
 
 
 def run_cycle():
-    global last_heartbeat_time, last_global_trade_time, debug_state
+    global last_heartbeat_time, last_global_trade_time, debug_state, liquidity_sniper_cycle_symbols
     if bot_killed:
         return
 
@@ -5042,6 +10960,7 @@ def run_cycle():
 
     learn_from_history()
     tick_management()
+    liquidity_sniper_cycle_symbols = []
 
     for s in symbols:
         debug_state[s] = {
@@ -5136,18 +11055,30 @@ def run_cycle():
                     "name": strat_name,
                     "cfg": strategy,
                     "execution_df": res.get("execution_df", df),
+                    "signal_key": res.get("signal_key"),
+                    "sl_price": res.get("sl_price"),
+                    "tp_price": res.get("tp_price"),
+                    "risk_multiplier_override": res.get("risk_multiplier_override"),
+                    "signal_details": res.get("signal_details"),
                 }
             )
             set_live_log(s, f"🧠 {strat_name} -> {sig} ({round(conf, 1)}%)")
+            if res.get("signal_details"):
+                set_live_log(s, f"📐 {format_santo_graal_signal_details(res['signal_details'])}")
 
         debug_state[s]["signal"] = ",".join([x["name"] for x in active_signals]) if active_signals else "NONE"
 
         if not active_signals:
             primary_block = None
             for blocked in blocked_signals:
-                if blocked["reason"] not in {"NO SETUP", "SCALP OFF"}:
+                if blocked["reason"] not in {"NO SETUP", "SCALP OFF", "OUT SESSION"}:
                     primary_block = blocked
                     break
+            if primary_block is None:
+                for blocked in blocked_signals:
+                    if blocked["reason"] not in {"NO SETUP", "SCALP OFF"}:
+                        primary_block = blocked
+                        break
             if primary_block is None and blocked_signals:
                 primary_block = blocked_signals[0]
 
@@ -5162,6 +11093,14 @@ def run_cycle():
 
         decision_stats["signals"] += len(active_signals)
         session_decision_stats["signals"] += len(active_signals)
+        active_signals.sort(
+            key=lambda item: (
+                int(item["cfg"].get("selection_priority", 999)),
+                -float(item.get("confidence", 0.0) or 0.0),
+                -float(item["cfg"].get("min_score", 0.0) or 0.0),
+                str(item.get("name", "")),
+            )
+        )
         push_debug(s, "SIGNAL", debug_state[s]["signal"])
         update_radar_state(
             s,
@@ -5202,6 +11141,12 @@ def run_cycle():
                 continue
 
             runtime = strategy_runtime.get(strat_name, {})
+            signal_key = signal_data.get("signal_key")
+            if signal_key and runtime.get("last_signal_key_by_symbol", {}).get(s) == signal_key:
+                record_strategy_event(strat_name, "DUPLICATE LEG")
+                set_live_log(s, f"🚫 {strat_name}: DUPLICATE LEG")
+                last_reason = f"{strat_name} DUPLICATE"
+                continue
             last_loss_time = runtime.get("last_loss_time")
             last_loss_profit = float(runtime.get("last_loss_profit", 0.0) or 0.0)
             if (
@@ -5257,11 +11202,15 @@ def run_cycle():
             push_debug(s, "EXECUTION", f"ATTEMPTING {strat_name}")
             debug_state[s]["final"] = "READY"
 
-            trade_ok, trade_status = open_scaled_trade(s, sig, df, strat_name, score, conf, strategy_cfg, execution_df)
+            trade_ok, trade_status = open_scaled_trade(s, sig, df, strat_name, score, conf, strategy_cfg, execution_df, signal_data)
             if trade_ok:
                 executed += 1
                 last_global_trade_time = time.time()
                 last_strategy_trade_time[cooldown_key] = time.time()
+                if signal_key:
+                    runtime.setdefault("last_signal_key_by_symbol", {})[s] = signal_key
+                if signal_data.get("signal_details"):
+                    runtime["last_signal_details"] = signal_data["signal_details"]
                 decision_stats["executed"] += 1
                 session_decision_stats["executed"] += 1
                 record_strategy_event(strat_name, "LIVE")
@@ -5270,6 +11219,7 @@ def run_cycle():
                 debug_state[s]["final"] = "EXECUTED"
                 update_radar_state(s, sig, int(score * 100), strat_name, "EXECUTED")
                 last_reason = "EXECUTED"
+                break
             else:
                 normalized_status = str(trade_status or "ORDER FAIL").upper()
                 if normalized_status == "ALREADY ACTIVE":
@@ -5278,6 +11228,7 @@ def run_cycle():
                     debug_state[s]["final"] = "LIVE"
                     update_radar_state(s, sig, int(score * 100), strat_name, "LIVE")
                     last_reason = "LIVE"
+                    break
                 else:
                     record_strategy_event(strat_name, normalized_status)
                     push_debug(s, "DONE", normalized_status)
