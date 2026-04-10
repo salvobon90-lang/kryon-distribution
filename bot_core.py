@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ==============================================================================
-# CONFIGURAZIONE (KRYON ULTIMATE PRO V 16.4.0 - PROBABILITY ENGINE)
+# CONFIGURAZIONE (KRYON ULTIMATE PRO V 16.4.4 - RELEASE CHECK + LUKE DATA FIX)
 # ==============================================================================
 PROFIT_MODE = True
 PRIMARY_SYMBOL = "XAUUSD"
@@ -26,13 +26,13 @@ symbols = symbols_list.copy()
 
 TIMEFRAME_MAIN = mt5.TIMEFRAME_M5
 MAX_UNIQUE_SYMBOLS = 13
-MAX_CLUSTERS_PER_SYMBOL = 4
-SYMBOL_CLUSTER_CAPS = {"USTECH": 4, "GER40": 4, "US500": 4, "XAUUSD": 4, "BTCUSD": 4}
+MAX_CLUSTERS_PER_SYMBOL = 5
+SYMBOL_CLUSTER_CAPS = {"USTECH": 5, "GER40": 5, "US500": 5, "XAUUSD": 5, "BTCUSD": 5}
 
 MAX_NEW_TRADES_PER_CYCLE = 4
 MAX_TRADES_PER_CYCLE = 8
 MAX_PARALLEL_SYMBOL_SCANS = MAX_UNIQUE_SYMBOLS
-MAX_COMPATIBLE_STRATEGIES_PER_SYMBOL = 2
+MAX_COMPATIBLE_STRATEGIES_PER_SYMBOL = 5
 RISK_PER_TRADE_PERCENT = 0.65
 MAX_TOTAL_RISK = 0.11
 CURRENT_OPTIMIZER_PROFILE = "BALANCED"
@@ -41,11 +41,12 @@ USE_FULL_SYMBOL_SCAN_PARALLELISM = True
 USE_FULL_STRATEGY_EVAL_PARALLELISM = True
 MAX_PARALLEL_STRATEGY_EVAL = 10
 PROBABILITY_ENGINE_ENABLED = True
-PROBABILITY_MIN_THRESHOLD = 44.0
-PROBABILITY_HARD_THRESHOLD = 38.0
+PROBABILITY_MIN_THRESHOLD = 20.0
+PROBABILITY_HARD_THRESHOLD = 20.0
 PROBABILITY_CONFIRM_CYCLES = 3
 PROBABILITY_MIN_AGE_SEC = 75
 PROBABILITY_RECHECK_SEC = 3.0
+STRATEGY_EVENT_SAMPLE_SEC = 20.0
 
 OPTIMIZER_PROFILES = {
     "SAFE": {"risk_per_trade_percent": 0.40, "max_total_risk": 0.07, "max_trades_per_cycle": 4},
@@ -334,6 +335,16 @@ def register_strategy(
             "probability_threshold": PROBABILITY_MIN_THRESHOLD,
             "probability_symbol": "---",
             "probability_time": None,
+            "session_attempts": 0,
+            "session_signals": 0,
+            "session_blocked": 0,
+            "session_block_counts": {},
+            "session_last_block": "---",
+            "session_last_block_time": None,
+            "session_last_block_key": None,
+            "session_last_block_at": None,
+            "session_last_signal_key": None,
+            "session_last_signal_at": None,
         },
     )
 
@@ -370,6 +381,23 @@ def _ensure_symbol_state(symbol):
             "stage": "INIT",
             "final": "NONE",
         }
+
+
+def _family_key_for_symbol(symbol):
+    upper_symbol = str(symbol).upper()
+    for family, aliases in SYMBOL_ALIASES.items():
+        for alias in aliases:
+            if alias.upper() in upper_symbol:
+                return family
+    return str(symbol)
+
+
+def _symbol_state_keys(symbol):
+    keys = [str(symbol)]
+    family_key = _family_key_for_symbol(symbol)
+    if family_key not in keys:
+        keys.append(family_key)
+    return keys
 
 
 def symbol_in_family(symbol, family):
@@ -540,6 +568,86 @@ def format_runtime_timestamp(ts):
     if isinstance(ts, datetime):
         return ts.strftime("%H:%M:%S")
     return str(ts)
+
+
+def _blank_strategy_runtime_session():
+    return {
+        "session_attempts": 0,
+        "session_signals": 0,
+        "session_entries": 0,
+        "session_blocked": 0,
+        "session_block_counts": {},
+        "session_last_block": "---",
+        "session_last_block_time": None,
+        "session_last_block_key": None,
+        "session_last_block_at": None,
+        "session_last_signal_key": None,
+        "session_last_signal_at": None,
+    }
+
+
+def _normalize_strategy_event_block(event_text):
+    event_upper = str(event_text or "INIT").upper()
+    if event_upper.startswith("NO SETUP "):
+        return event_upper.replace("NO SETUP ", "")[:24]
+    if "NO SETUP" in event_upper:
+        return "NO SETUP"
+    if "COOLDOWN" in event_upper:
+        return "COOLDOWN"
+    if "OUT SESSION" in event_upper:
+        return "OUT SESSION"
+    if "FAST" in event_upper:
+        return "FAST"
+    if "SPREAD" in event_upper:
+        return "SPREAD"
+    if "LOW SCORE" in event_upper:
+        return "LOW SCORE"
+    if "REGIME" in event_upper:
+        return "REGIME"
+    if "LIVE" in event_upper or "ENTRY" in event_upper:
+        return "LIVE"
+    if "FAIL" in event_upper:
+        return "FAIL"
+    if "FILTER" in event_upper:
+        return event_upper.replace("FILTER ", "")[:18]
+    return event_upper[:18] or "INIT"
+
+
+def _is_strategy_block_event(event_text, live_block):
+    event_upper = str(event_text or "").upper()
+    live_upper = str(live_block or "INIT").upper()
+    if event_upper.startswith("ENTRY"):
+        return False
+    if event_upper.startswith("RESULT"):
+        return False
+    if event_upper == "LIVE":
+        return False
+    if " EXIT" in event_upper or event_upper.endswith("EXIT"):
+        return False
+    if live_upper in {"LIVE", "WIN", "LOSS", "BE", "READY", "INIT"}:
+        return False
+    return True
+
+
+def _sample_strategy_runtime_event(runtime, prefix, event_key, now, sample_sec=STRATEGY_EVENT_SAMPLE_SEC):
+    key_field = f"{prefix}_key"
+    at_field = f"{prefix}_at"
+    last_key = runtime.get(key_field)
+    last_at = runtime.get(at_field)
+    if last_key == event_key and isinstance(last_at, datetime):
+        if (now - last_at).total_seconds() < sample_sec:
+            return False
+    runtime[key_field] = event_key
+    runtime[at_field] = now
+    return True
+
+
+def _get_runtime_main_block(runtime):
+    counts = dict(runtime.get("session_block_counts") or {})
+    if not counts:
+        return "---"
+    last_block = str(runtime.get("session_last_block") or "---")
+    return max(counts.items(), key=lambda item: (int(item[1] or 0), item[0] == last_block))[0]
 
 
 def _blank_portfolio_snapshot():
@@ -719,6 +827,21 @@ def _rebuild_strategy_matrix_snapshot():
         live_row = strategy_live.get(strategy["name"], {})
         live_pnl = round(float(live_row.get("live_pnl", 0.0) or 0.0), 2)
         open_positions = int(live_row.get("open_positions", 0) or 0)
+        session_closed = int(stats.get("closed", 0) or 0)
+        session_net_profit = round(float(stats.get("net_profit", 0.0) or 0.0), 2)
+        session_attempts = int(runtime.get("session_attempts", 0) or 0)
+        session_signals = int(runtime.get("session_signals", 0) or 0)
+        session_entries = int(runtime.get("session_entries", 0) or 0)
+        session_blocked = int(runtime.get("session_blocked", 0) or 0)
+        session_main_block = _get_runtime_main_block(runtime)
+        session_avg_profit = round(session_net_profit / session_closed, 2) if session_closed > 0 else 0.0
+        used_today = open_positions > 0 or session_closed > 0
+        blocked_today = (not used_today) and (
+            session_attempts > 0
+            or session_signals > 0
+            or session_blocked > 0
+            or str(runtime.get("pretrigger", "---") or "---") not in {"---", ""}
+        )
         dashboard.append(
             {
                 "session_id": session_runtime_id,
@@ -737,14 +860,22 @@ def _rebuild_strategy_matrix_snapshot():
                 "trail": " | ".join([f"{int(t*100)}>{int(l*100)}" for t, l in strategy.get("trail_steps", [])]) if strategy.get("trail_steps") else "---",
                 "winrate": round(winrate, 1),
                 "profit_factor": profit_factor_display,
-                "closed": int(stats.get("closed", 0) or 0),
-                "net_profit": round(float(stats.get("net_profit", 0.0) or 0.0), 2),
+                "closed": session_closed,
+                "net_profit": session_net_profit,
                 "live_pnl": live_pnl,
                 "open_positions": open_positions,
-                "total_net_profit": round(float(stats.get("net_profit", 0.0) or 0.0) + live_pnl, 2),
+                "total_net_profit": round(session_net_profit + live_pnl, 2),
                 "session_winrate": round(winrate, 1),
-                "session_closed": int(stats.get("closed", 0) or 0),
-                "session_net_profit": round(float(stats.get("net_profit", 0.0) or 0.0), 2),
+                "session_closed": session_closed,
+                "session_net_profit": session_net_profit,
+                "session_avg_profit": session_avg_profit,
+                "session_attempts": session_attempts,
+                "session_signals": session_signals,
+                "session_entries": session_entries,
+                "session_blocked": session_blocked,
+                "session_main_block": session_main_block,
+                "used_today": used_today,
+                "blocked_today": blocked_today,
                 "disabled_reason": strategy.get("disabled_reason", ""),
                 "auto_disable": strategy.get("auto_disable", False),
                 "last_signal": runtime.get("last_signal", "---"),
@@ -803,6 +934,7 @@ def _rebuild_strategy_matrix_snapshot():
                 "session_winrate": round((legacy_stats.get("wins", 0) / legacy_total) * 100, 1) if legacy_total > 0 else 0.0,
                 "session_closed": legacy_stats.get("closed", 0),
                 "session_net_profit": round(legacy_stats.get("net_profit", 0.0), 2),
+                "session_entries": legacy_stats.get("closed", 0),
                 "disabled_reason": "UNMAPPED DEALS",
                 "auto_disable": False,
                 "last_signal": "---",
@@ -834,13 +966,31 @@ def _rebuild_visual_snapshots(acc=None, live_pnl=None):
 def record_strategy_signal(name, symbol, signal, confidence):
     with strategy_runtime_lock:
         runtime = strategy_runtime.setdefault(name, {})
+        now = datetime.now()
         runtime["last_signal"] = signal
         runtime["last_signal_conf"] = round(confidence, 1)
         runtime["last_signal_symbol"] = symbol
-        runtime["last_signal_time"] = datetime.now()
+        runtime["last_signal_time"] = now
         runtime["last_event"] = f"SIGNAL {signal}"
         runtime["live_block"] = "READY"
         runtime["pretrigger"] = "TRIGGER READY"
+        if session_active:
+            signal_key = f"{symbol}|{signal}"
+            if _sample_strategy_runtime_event(runtime, "session_last_signal", signal_key, now, max(8.0, STRATEGY_EVENT_SAMPLE_SEC * 0.5)):
+                runtime["session_signals"] = int(runtime.get("session_signals", 0) or 0) + 1
+                runtime["session_attempts"] = int(runtime.get("session_attempts", 0) or 0) + 1
+
+
+def record_strategy_entry(name, symbol, signal):
+    with strategy_runtime_lock:
+        runtime = strategy_runtime.setdefault(name, {})
+        now = datetime.now()
+        runtime["last_event"] = f"ENTRY {signal}"
+        runtime["live_block"] = "LIVE"
+        if session_active:
+            entry_key = f"{symbol}|{signal}"
+            if _sample_strategy_runtime_event(runtime, "session_last_entry", entry_key, now, 2.0):
+                runtime["session_entries"] = int(runtime.get("session_entries", 0) or 0) + 1
 
 
 def set_strategy_pretrigger(name, pretrigger_text_value="---"):
@@ -870,31 +1020,17 @@ def record_strategy_event(name, event_text):
     with strategy_runtime_lock:
         runtime = strategy_runtime.setdefault(name, {})
         runtime["last_event"] = event_text
-        event_upper = str(event_text).upper()
-        if event_upper.startswith("NO SETUP "):
-            runtime["live_block"] = event_upper.replace("NO SETUP ", "")[:24]
-        elif "NO SETUP" in event_upper:
-            runtime["live_block"] = "NO SETUP"
-        elif "COOLDOWN" in event_upper:
-            runtime["live_block"] = "COOLDOWN"
-        elif "OUT SESSION" in event_upper:
-            runtime["live_block"] = "OUT SESSION"
-        elif "FAST" in event_upper:
-            runtime["live_block"] = "FAST"
-        elif "SPREAD" in event_upper:
-            runtime["live_block"] = "SPREAD"
-        elif "LOW SCORE" in event_upper:
-            runtime["live_block"] = "LOW SCORE"
-        elif "REGIME" in event_upper:
-            runtime["live_block"] = "REGIME"
-        elif "LIVE" in event_upper or "ENTRY" in event_upper:
-            runtime["live_block"] = "LIVE"
-        elif "FAIL" in event_upper:
-            runtime["live_block"] = "FAIL"
-        elif "FILTER" in event_upper:
-            runtime["live_block"] = event_upper.replace("FILTER ", "")[:18]
-        else:
-            runtime["live_block"] = event_upper[:18]
+        now = datetime.now()
+        live_block = _normalize_strategy_event_block(event_text)
+        runtime["live_block"] = live_block
+        if session_active and _is_strategy_block_event(event_text, live_block):
+            runtime["session_last_block"] = live_block
+            runtime["session_last_block_time"] = now
+            if _sample_strategy_runtime_event(runtime, "session_last_block", live_block, now):
+                runtime["session_blocked"] = int(runtime.get("session_blocked", 0) or 0) + 1
+                runtime["session_attempts"] = int(runtime.get("session_attempts", 0) or 0) + 1
+                block_counts = runtime.setdefault("session_block_counts", {})
+                block_counts[live_block] = int(block_counts.get(live_block, 0) or 0) + 1
 
 
 def record_strategy_result(name, profit, result_time=None):
@@ -1915,10 +2051,10 @@ def evaluate_cluster_probability(symbol, strategy_cfg, cluster_state, live_posit
 
     probability = clamp(probability, 0.0, 100.0)
     previous_below_count = int(cluster_state.get("probability_below_count", 0) or 0)
-    below_count = previous_below_count + 1 if probability < PROBABILITY_MIN_THRESHOLD else 0
+    below_count = previous_below_count + 1 if probability <= PROBABILITY_MIN_THRESHOLD else 0
     should_exit = False
     if mode == "LIVE" and age_sec >= PROBABILITY_MIN_AGE_SEC:
-        should_exit = probability < PROBABILITY_HARD_THRESHOLD or below_count >= PROBABILITY_CONFIRM_CYCLES
+        should_exit = probability <= PROBABILITY_HARD_THRESHOLD or below_count >= PROBABILITY_CONFIRM_CYCLES
 
     result.update(
         {
@@ -2002,22 +2138,25 @@ def get_latest_live_logs():
 
 
 def push_debug(symbol, stage, reason):
-    debug_state[symbol]["stage"] = stage
-    debug_state[symbol]["blocked_by"] = reason
+    for key in _symbol_state_keys(symbol):
+        _ensure_symbol_state(key)
+        debug_state[key]["stage"] = stage
+        debug_state[key]["blocked_by"] = reason
 
 
 def update_radar_state(symbol, sig, conf, strat, status):
-    if symbol not in radar_state:
-        radar_state[symbol] = {
-            "sig": "NEUTRAL",
-            "timing": "---",
-            "conf": 0,
-            "strat": "---",
-            "status": "INIT",
-            "live_conf": "N/A",
-            "action": "---",
-        }
-    radar_state[symbol].update({"sig": sig, "conf": conf, "strat": strat, "status": status})
+    for key in _symbol_state_keys(symbol):
+        if key not in radar_state:
+            radar_state[key] = {
+                "sig": "NEUTRAL",
+                "timing": "---",
+                "conf": 0,
+                "strat": "---",
+                "status": "INIT",
+                "live_conf": "N/A",
+                "action": "---",
+            }
+        radar_state[key].update({"sig": sig, "conf": conf, "strat": strat, "status": status})
 
 
 def get_debug_state():
@@ -2222,9 +2361,15 @@ def reset_session_tracking():
         for strategy_name in list(strategy_stats.keys()):
             strategy_stats[strategy_name] = _blank_stats_row()
         for runtime in strategy_runtime.values():
+            runtime["last_signal"] = "---"
+            runtime["last_signal_conf"] = 0.0
+            runtime["last_signal_symbol"] = "---"
+            runtime["last_signal_time"] = None
             runtime["last_result"] = "---"
             runtime["last_result_profit"] = 0.0
             runtime["last_result_time"] = None
+            runtime["last_event"] = "INIT"
+            runtime["live_block"] = "INIT"
             runtime["last_tp_plan"] = "---"
             runtime["pretrigger"] = "---"
             runtime["probability"] = 0.0
@@ -2233,8 +2378,7 @@ def reset_session_tracking():
             runtime["probability_threshold"] = PROBABILITY_MIN_THRESHOLD
             runtime["probability_symbol"] = "---"
             runtime["probability_time"] = None
-            if runtime.get("live_block") in {"WIN", "LOSS", "BE", "LIVE", "READY", "INIT"}:
-                runtime["live_block"] = "INIT"
+            runtime.update(_blank_strategy_runtime_session())
         processed_deals.clear()
         trade_memory.clear()
         position_strategy_map.clear()
@@ -2795,7 +2939,7 @@ def final_filter(symbol, df, score):
     attack = is_attack_runtime()
     is_crypto = any(symbol_in_family(symbol, family) for family in ["BTCUSD", "ETHUSD"])
     broker_hour = get_broker_hour()
-    late_gold = symbol_in_family(symbol, "XAUUSD") and (broker_hour >= 21 or broker_hour <= 2)
+    late_gold = symbol_in_family(symbol, "XAUUSD") and (broker_hour >= 20 or broker_hour <= 3)
     min_score = 0.34 if attack else 0.38
     min_momentum = atr * (0.04 if attack else 0.07)
     min_vol = 0.00022 if attack else 0.00035
@@ -2971,16 +3115,16 @@ def scalping_filter(symbol, signal, score, market_df, execution_df, strategy_cfg
 
     attack = is_attack_runtime()
     broker_hour = get_broker_hour()
-    late_gold = symbol_in_family(symbol, "XAUUSD") and (broker_hour >= 21 or broker_hour <= 2)
+    late_gold = symbol_in_family(symbol, "XAUUSD") and (broker_hour >= 20 or broker_hour <= 3)
     min_score = strategy_cfg.get("min_score", 0.55) - 0.04
     spread_limit = atr_m1 * 0.22
     body_floor = atr_m1 * 0.09
     momentum_floor = atr_m1 * 0.16
     if late_gold:
-        min_score = max(0.34 if attack else 0.38, min_score - 0.03)
-        spread_limit = atr_m1 * (0.28 if attack else 0.24)
-        body_floor = atr_m1 * (0.06 if attack else 0.08)
-        momentum_floor = atr_m1 * (0.12 if attack else 0.14)
+        min_score = max(0.31 if attack else 0.35, min_score - 0.05)
+        spread_limit = atr_m1 * (0.32 if attack else 0.28)
+        body_floor = atr_m1 * (0.055 if attack else 0.072)
+        momentum_floor = atr_m1 * (0.10 if attack else 0.12)
     if STRESS_TEST_ACTIVE:
         min_score = max(0.32, min_score - 0.03)
         spread_limit *= 1.12
@@ -3090,14 +3234,14 @@ LUKE_PROFILES = {
     "XAUUSD": {
         "display": "XAUUSD",
         "session_tz": "Europe/Rome",
-        "session_windows": [("09:30", "18:00")],
+        "session_windows": [("09:30", "22:00")],
         "news_windows": [],
-        "max_risk_pct": 1.0,
+        "max_risk_pct": 0.75,
         "legs": 6,
         "spread_buffer_points": 0.6,
         "min_stop_points": 8.0,
         "max_stop_points": 12.0,
-        "no_chase_points": 4.0,
+        "no_chase_points": 4.8,
         "tp_points": [4, 8, 12, 15, 19, 26],
         "runner_enabled": False,
         "runner_points": 35.0,
@@ -3112,9 +3256,9 @@ LUKE_PROFILES = {
         "continuation_zone_low": 0.38,
         "continuation_zone_high": 0.61,
         "exhaustion_atr": 2.0,
-        "volatility_ratio_max": 2.2,
-        "range_ratio_max": 1.5,
-        "ema_divergence_atr": 1.7,
+        "volatility_ratio_max": 2.60,
+        "range_ratio_max": 1.80,
+        "ema_divergence_atr": 2.10,
     }
 }
 
@@ -3256,7 +3400,7 @@ def strategy_xau_luke(df, symbol):
     df_m1 = get_m1_cached(symbol)
     if df_m5 is None or len(df_m5) < 80:
         return blocked_signal(branch_name, "NO M5 DATA")
-    if df_m1 is None or len(df_m1) < 120:
+    if df_m1 is None or len(df_m1) < 90:
         return blocked_signal(branch_name, "NO M1 DATA")
 
     tick = safe_tick(symbol)
@@ -4212,6 +4356,7 @@ def strategy_trend_vwap(df, symbol):
     atr = df["atr"].iloc[-1]
     last = df.iloc[-1]
     prev = df.iloc[-2]
+    candle_key = last["time"].isoformat() if "time" in df.columns else str(df.index[-1])
     body = abs(last["close"] - last["open"])
     wick_up = last["high"] - max(last["open"], last["close"])
     wick_down = min(last["open"], last["close"]) - last["low"]
@@ -4232,7 +4377,7 @@ def strategy_trend_vwap(df, symbol):
             and strong_body
             and clean_long_candle
         ):
-            return {"signal": "BUY", "confidence": 72, "name": "XAU_TREND"}
+            return {"signal": "BUY", "confidence": 72, "name": "XAU_TREND", "signal_key": f"XTRD|BUY|{candle_key}"}
         if (
             ema20 < ema50
             and price < vwap
@@ -4241,8 +4386,9 @@ def strategy_trend_vwap(df, symbol):
             and last["high"] <= ema20 + atr * ema_hold_pad
             and strong_body
             and clean_short_candle
+            and trend_strength >= (0.22 if attack else 0.34)
         ):
-            return {"signal": "SELL", "confidence": 72, "name": "XAU_TREND"}
+            return {"signal": "SELL", "confidence": 72, "name": "XAU_TREND", "signal_key": f"XTRD|SELL|{candle_key}"}
         if ema20 > ema50 and price > vwap and distance >= atr * vwap_limit:
             return blocked_signal("XAU_TREND", "VWAP TOO FAR", pretrigger_text("RETRACE", distance - atr * vwap_limit, atr))
         if ema20 < ema50 and price < vwap and distance >= atr * vwap_limit:
@@ -4256,6 +4402,8 @@ def strategy_trend_vwap(df, symbol):
         return blocked_signal("XAU_TREND", "EMA NOT READY", pretrigger_text("EMA", abs(ema20 - ema50), atr))
 
     mtf_sig = get_multi_tf_signal(symbol)[0]
+    if is_xau and sig == "SELL" and mtf_sig != "SELL":
+        return blocked_signal("XAU_TREND", "MTF NOT ALIGNED", "SELL NEEDS M1/M5/M15")
     if mtf_sig not in {sig, "NEUTRAL"}:
         return blocked_signal("XAU_TREND", "MTF NOT ALIGNED", "ALIGN M1/M5/M15")
     if mtf_sig == "NEUTRAL":
@@ -4286,7 +4434,7 @@ def strategy_trend_vwap(df, symbol):
             return blocked_signal("XAU_TREND", "NO CLOSE CONFIRM", pretrigger_text("CLOSE", price - (prev["low"] + atr * confirm_pad), atr))
         conf = max(conf, 72)
 
-    return {"signal": sig, "confidence": conf, "name": "XAU_TREND"}
+    return {"signal": sig, "confidence": conf, "name": "XAU_TREND", "signal_key": f"XTRD|{sig}|{candle_key}"}
 
 
 def strategy_liquidity_sweep(df, symbol):
@@ -4404,7 +4552,7 @@ def strategy_xau_m1_scalp(df, symbol):
         return blocked_signal("XAU_M1_SCALP", "SCALP OFF")
 
     now = get_broker_now()
-    if not (now.hour >= 13 or now.hour <= 3):
+    if not (now.hour >= 11 or now.hour <= 4):
         return blocked_signal("XAU_M1_SCALP", "OUT SESSION")
 
     df_m1 = get_data(symbol, mt5.TIMEFRAME_M1, 220)
@@ -4422,7 +4570,7 @@ def strategy_xau_m1_scalp(df, symbol):
     atr_m5 = df["atr"].iloc[-1]
     spread = tick.ask - tick.bid
     attack = is_attack_runtime()
-    if spread > atr_m1 * (0.34 if attack else 0.26):
+    if spread > atr_m1 * (0.42 if attack else 0.34):
         return blocked_signal("XAU_M1_SCALP", "SPREAD HIGH")
 
     close_m1 = df_m1["close"]
@@ -4438,6 +4586,7 @@ def strategy_xau_m1_scalp(df, symbol):
     rsi = compute_rsi(close_m1, 14)
     last = df_m1.iloc[-1]
     prev = df_m1.iloc[-2]
+    candle_key = last["time"].isoformat() if "time" in df_m1.columns else str(df_m1.index[-1])
     body = abs(last["close"] - last["open"])
     wick_up = last["high"] - max(last["open"], last["close"])
     wick_down = min(last["open"], last["close"]) - last["low"]
@@ -4447,7 +4596,7 @@ def strategy_xau_m1_scalp(df, symbol):
     vwap = df["vwap"].iloc[-1]
     trend_strength = compute_trend_strength(df)
 
-    min_trend = 0.10 if attack else 0.18
+    min_trend = 0.08 if attack else 0.14
     long_bias = ema20_m5 > ema50_m5 and ema20_m15 > ema50_m15 and price > vwap and trend_strength >= min_trend
     short_bias = ema20_m5 < ema50_m5 and ema20_m15 < ema50_m15 and price < vwap and trend_strength >= min_trend
 
@@ -4457,23 +4606,23 @@ def strategy_xau_m1_scalp(df, symbol):
     short_pullback = max(prev["high"], last["high"]) >= (ema21.iloc[-1] - atr_m1 * (0.26 if attack else 0.18))
     long_reclaim = last["close"] > ema8.iloc[-1] and last["close"] > last["open"]
     short_reject = last["close"] < ema8.iloc[-1] and last["close"] < last["open"]
-    long_break = last["close"] >= (recent_high - atr_m1 * (0.16 if attack else 0.04))
-    short_break = last["close"] <= (recent_low + atr_m1 * (0.16 if attack else 0.04))
+    long_break = last["close"] >= (recent_high - atr_m1 * (0.18 if attack else 0.08))
+    short_break = last["close"] <= (recent_low + atr_m1 * (0.18 if attack else 0.08))
     strong_body = body >= atr_m1 * (0.05 if attack else 0.06)
     clean_long = wick_up <= max(body * (1.24 if attack else 1.08), atr_m1 * (0.20 if attack else 0.14))
     clean_short = wick_down <= max(body * (1.24 if attack else 1.08), atr_m1 * (0.20 if attack else 0.14))
 
-    if long_bias and long_stack and long_pullback and long_reclaim and long_break and strong_body and clean_long and 48 <= rsi.iloc[-1] <= 78:
+    if long_bias and long_stack and long_pullback and long_reclaim and long_break and strong_body and clean_long and 46 <= rsi.iloc[-1] <= 80:
         conf = 78
         if price >= vwap + atr_m5 * 0.08 and trend_strength > 0.70:
             conf = 82
-        return {"signal": "BUY", "confidence": conf, "name": "XAU_M1_SCALP", "execution_df": df_m1}
+        return {"signal": "BUY", "confidence": conf, "name": "XAU_M1_SCALP", "execution_df": df_m1, "signal_key": f"XM1S|BUY|{candle_key}"}
 
-    if short_bias and short_stack and short_pullback and short_reject and short_break and strong_body and clean_short and 22 <= rsi.iloc[-1] <= 52:
+    if short_bias and short_stack and short_pullback and short_reject and short_break and strong_body and clean_short and 20 <= rsi.iloc[-1] <= 54:
         conf = 78
         if price <= vwap - atr_m5 * 0.08 and trend_strength > 0.70:
             conf = 82
-        return {"signal": "SELL", "confidence": conf, "name": "XAU_M1_SCALP", "execution_df": df_m1}
+        return {"signal": "SELL", "confidence": conf, "name": "XAU_M1_SCALP", "execution_df": df_m1, "signal_key": f"XM1S|SELL|{candle_key}"}
 
     if not long_bias and not short_bias:
         return blocked_signal("XAU_M1_SCALP", "TREND NOT READY", f"STR {round(trend_strength, 2)}")
@@ -4545,26 +4694,27 @@ def strategy_btc_trend(df, symbol):
     recent_high = df["high"].rolling(14).max().iloc[-2]
     recent_low = df["low"].rolling(14).min().iloc[-2]
 
-    trend_min = 0.20 if attack else 0.34
-    m15_min = 0.10 if attack else 0.18
+    trend_min = 0.18 if attack else 0.30
+    m15_min = 0.08 if attack else 0.16
     if trend_strength >= (1.00 if attack else 0.86):
         m15_min = max(0.08 if attack else 0.14, m15_min - 0.04)
-    vwap_limit = 3.70 if attack else 3.15
+    vwap_limit = 4.05 if attack else 3.45
     if trend_strength >= (0.90 if attack else 1.05):
-        vwap_limit += 0.65
+        vwap_limit += 0.75
     if m15_strength >= (0.55 if attack else 0.42):
-        vwap_limit += 0.45
+        vwap_limit += 0.55
     long_trigger = recent_high - atr * (0.10 if attack else 0.04)
     short_trigger = recent_low + atr * (0.10 if attack else 0.04)
     long_break_gap = max(0.0, long_trigger - price)
     short_break_gap = max(0.0, price - short_trigger)
-    long_pullback = min(m1_prev["low"], m1_last["low"]) <= (ema20_m1 + atr_m1 * (0.40 if attack else 0.30))
-    short_pullback = max(m1_prev["high"], m1_last["high"]) >= (ema20_m1 - atr_m1 * (0.40 if attack else 0.30))
-    long_reclaim = m1_last["close"] > ema9_m1 and ema9_m1 > ema20_m1 > ema50_m1
-    short_reclaim = m1_last["close"] < ema9_m1 and ema9_m1 < ema20_m1 < ema50_m1
-    strong_body = body >= atr * (0.035 if attack else 0.05)
-    clean_long_candle = wick_up <= max(body * (1.28 if attack else 1.06), atr * 0.16)
-    clean_short_candle = wick_down <= max(body * (1.28 if attack else 1.06), atr * 0.16)
+    long_pullback = min(m1_prev["low"], m1_last["low"]) <= (ema20_m1 + atr_m1 * (0.44 if attack else 0.34))
+    short_pullback = max(m1_prev["high"], m1_last["high"]) >= (ema20_m1 - atr_m1 * (0.44 if attack else 0.34))
+    reclaim_slack = atr_m1 * (0.028 if attack else 0.014)
+    long_reclaim = m1_last["close"] >= ema9_m1 - reclaim_slack and ema9_m1 > ema20_m1 > ema50_m1
+    short_reclaim = m1_last["close"] <= ema9_m1 + reclaim_slack and ema9_m1 < ema20_m1 < ema50_m1
+    strong_body = body >= atr * (0.032 if attack else 0.045)
+    clean_long_candle = wick_up <= max(body * (1.34 if attack else 1.10), atr * 0.18)
+    clean_short_candle = wick_down <= max(body * (1.34 if attack else 1.10), atr * 0.18)
     long_break_failed = m1_last["high"] >= long_trigger and m1_last["close"] < long_trigger
     short_break_failed = m1_last["low"] <= short_trigger and m1_last["close"] > short_trigger
 
@@ -4682,20 +4832,20 @@ def strategy_eth_pulse(df, symbol):
     short_pullback_band = ema21_m1.iloc[-1] - atr_m1 * (0.24 if attack else 0.20)
     long_break_trigger = df_m1["high"].iloc[-2] - atr_m1 * (0.12 if attack else 0.05)
     short_break_trigger = df_m1["low"].iloc[-2] + atr_m1 * (0.12 if attack else 0.05)
-    trend_min = 0.22 if attack else 0.40
-    m15_min = 0.15 if attack else 0.24
+    trend_min = 0.18 if attack else 0.34
+    m15_min = 0.12 if attack else 0.20
 
     long_setup = (
         ema20 > ema50
         and ema20_m15 > ema50_m15
         and price > vwap
-        and vwap_dist <= atr * (2.85 if attack else 2.45)
+        and vwap_dist <= atr * (3.05 if attack else 2.60)
         and trend_strength >= trend_min
         and m15_strength >= m15_min
         and ema9_m1.iloc[-1] > ema21_m1.iloc[-1] > ema55_m1.iloc[-1]
         and min(prev["low"], last["low"]) <= long_pullback_band
         and last["close"] > ema9_m1.iloc[-1]
-        and (last["close"] - last["open"]) > atr_m1 * (0.07 if attack else 0.07)
+        and (last["close"] - last["open"]) > atr_m1 * (0.06 if attack else 0.06)
         and wick_up <= max(body * 1.22, atr_m1 * 0.16)
         and last["close"] >= long_break_trigger
         and 47 <= rsi_m1.iloc[-1] <= 78
@@ -4708,13 +4858,13 @@ def strategy_eth_pulse(df, symbol):
         ema20 < ema50
         and ema20_m15 < ema50_m15
         and price < vwap
-        and vwap_dist <= atr * (2.85 if attack else 2.45)
+        and vwap_dist <= atr * (3.05 if attack else 2.60)
         and trend_strength >= trend_min
         and m15_strength >= m15_min
         and ema9_m1.iloc[-1] < ema21_m1.iloc[-1] < ema55_m1.iloc[-1]
         and max(prev["high"], last["high"]) >= short_pullback_band
         and last["close"] < ema9_m1.iloc[-1]
-        and (last["open"] - last["close"]) > atr_m1 * (0.07 if attack else 0.07)
+        and (last["open"] - last["close"]) > atr_m1 * (0.06 if attack else 0.06)
         and wick_down <= max(body * 1.22, atr_m1 * 0.16)
         and last["close"] <= short_break_trigger
         and 22 <= rsi_m1.iloc[-1] <= 53
@@ -4735,8 +4885,8 @@ def strategy_eth_pulse(df, symbol):
         return blocked_signal("ETH_PULSE", "VWAP LOST", pretrigger_text("VWAP", vwap - price, atr))
     if ema20 < ema50 and price >= vwap:
         return blocked_signal("ETH_PULSE", "VWAP LOST", pretrigger_text("VWAP", price - vwap, atr))
-    if vwap_dist > atr * (2.85 if attack else 2.45):
-        return blocked_signal("ETH_PULSE", "VWAP TOO FAR", pretrigger_text("VWAP", vwap_dist - atr * (2.85 if attack else 2.45), atr))
+    if vwap_dist > atr * (3.05 if attack else 2.60):
+        return blocked_signal("ETH_PULSE", "VWAP TOO FAR", pretrigger_text("VWAP", vwap_dist - atr * (3.05 if attack else 2.60), atr))
     if ema20 > ema50:
         if not (ema9_m1.iloc[-1] > ema21_m1.iloc[-1] > ema55_m1.iloc[-1]):
             return blocked_signal("ETH_PULSE", "EMA STACK MISS", pretrigger_text("STACK", max(ema21_m1.iloc[-1] - ema9_m1.iloc[-1], ema55_m1.iloc[-1] - ema21_m1.iloc[-1]), atr_m1))
@@ -4744,8 +4894,8 @@ def strategy_eth_pulse(df, symbol):
             return blocked_signal("ETH_PULSE", "NO PULLBACK", pretrigger_text("PB", min(prev["low"], last["low"]) - long_pullback_band, atr_m1))
         if not (last["close"] > ema9_m1.iloc[-1]):
             return blocked_signal("ETH_PULSE", "EMA9 NOT HELD", pretrigger_text("EMA9", ema9_m1.iloc[-1] - last["close"], atr_m1))
-        if not ((last["close"] - last["open"]) > atr_m1 * (0.07 if attack else 0.07)):
-            return blocked_signal("ETH_PULSE", "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (0.07 if attack else 0.07) - (last["close"] - last["open"]), atr_m1))
+        if not ((last["close"] - last["open"]) > atr_m1 * (0.06 if attack else 0.06)):
+            return blocked_signal("ETH_PULSE", "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (0.06 if attack else 0.06) - (last["close"] - last["open"]), atr_m1))
         if not (last["close"] >= long_break_trigger):
             return blocked_signal("ETH_PULSE", "NO BREAKOUT", pretrigger_text("BRK", long_break_trigger - last["close"], atr_m1))
         if not (wick_up <= max(body * 1.22, atr_m1 * 0.16)):
@@ -4758,8 +4908,8 @@ def strategy_eth_pulse(df, symbol):
             return blocked_signal("ETH_PULSE", "NO PULLBACK", pretrigger_text("PB", short_pullback_band - max(prev["high"], last["high"]), atr_m1))
         if not (last["close"] < ema9_m1.iloc[-1]):
             return blocked_signal("ETH_PULSE", "EMA9 NOT LOST", pretrigger_text("EMA9", last["close"] - ema9_m1.iloc[-1], atr_m1))
-        if not ((last["open"] - last["close"]) > atr_m1 * (0.07 if attack else 0.07)):
-            return blocked_signal("ETH_PULSE", "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (0.07 if attack else 0.07) - (last["open"] - last["close"]), atr_m1))
+        if not ((last["open"] - last["close"]) > atr_m1 * (0.06 if attack else 0.06)):
+            return blocked_signal("ETH_PULSE", "WEAK CANDLE", pretrigger_text("BODY", atr_m1 * (0.06 if attack else 0.06) - (last["open"] - last["close"]), atr_m1))
         if not (last["close"] <= short_break_trigger):
             return blocked_signal("ETH_PULSE", "NO BREAKDOWN", pretrigger_text("BRK", last["close"] - short_break_trigger, atr_m1))
         if not (wick_down <= max(body * 1.22, atr_m1 * 0.16)):
@@ -4779,13 +4929,13 @@ def strategy_xau_orb(df, symbol):
         return blocked_signal("XAU_ORB", "NO M1 DATA")
 
     range_start, range_end = broker_window_from_local_df(df_m1, 14, 0, 14, 30)
-    session_start, session_end = broker_window_from_local_df(df_m1, 14, 30, 22, 30)
+    session_start, session_end = broker_window_from_local_df(df_m1, 14, 30, 23, 0)
     broker_now = df_m1["time"].iloc[-1].to_pydatetime()
 
     if broker_now < session_start:
         return blocked_signal("XAU_ORB", "BUILDING RANGE", "ORB 14:00-14:30")
     if broker_now > session_end:
-        return blocked_signal("XAU_ORB", "OUT SESSION", "ORB 14:30-22:30")
+        return blocked_signal("XAU_ORB", "OUT SESSION", "ORB 14:30-23:00")
 
     orb_window = df_m1[(df_m1["time"] >= range_start) & (df_m1["time"] < range_end)]
     if len(orb_window) < 12:
@@ -5006,13 +5156,13 @@ def strategy_ustech_orb(df, symbol):
         return blocked_signal("USTECH_ORB", "NO M1 DATA")
 
     range_start, range_end = broker_window_from_local_df(df_m1, 15, 30, 15, 45)
-    session_start, session_end = broker_window_from_local_df(df_m1, 15, 45, 22, 15)
+    session_start, session_end = broker_window_from_local_df(df_m1, 15, 45, 23, 0)
     broker_now = df_m1["time"].iloc[-1].to_pydatetime()
 
     if broker_now < session_start:
         return blocked_signal("USTECH_ORB", "BUILDING RANGE", "ORB 15:30-15:45")
     if broker_now > session_end:
-        return blocked_signal("USTECH_ORB", "OUT SESSION", "ORB 15:45-22:15")
+        return blocked_signal("USTECH_ORB", "OUT SESSION", "ORB 15:45-23:00")
 
     orb_window = df_m1[(df_m1["time"] >= range_start) & (df_m1["time"] < range_end)]
     if len(orb_window) < 8:
@@ -5385,12 +5535,12 @@ def strategy_ger40_break_retest(df, symbol):
     strong_break = breakout_body >= atr * (0.09 if attack else 0.12)
     strong_confirm = body >= atr * (0.05 if attack else 0.08)
 
-    long_break = prev["close"] >= resistance + atr * (0.02 if attack else 0.04) and prev["close"] > prev["open"] and strong_break
-    short_break = prev["close"] <= support - atr * (0.02 if attack else 0.04) and prev["close"] < prev["open"] and strong_break
-    long_retest = last["low"] <= resistance + atr * (0.16 if attack else 0.10) and last["close"] >= resistance - atr * (0.03 if attack else 0.02)
-    short_retest = last["high"] >= support - atr * (0.16 if attack else 0.10) and last["close"] <= support + atr * (0.03 if attack else 0.02)
-    long_confirm = last["close"] > last["open"] and last["close"] >= max(resistance, prev["high"] - atr * (0.10 if attack else 0.03))
-    short_confirm = last["close"] < last["open"] and last["close"] <= min(support, prev["low"] + atr * (0.10 if attack else 0.03))
+    long_break = prev["close"] >= resistance + atr * (0.015 if attack else 0.03) and prev["close"] > prev["open"] and strong_break
+    short_break = prev["close"] <= support - atr * (0.015 if attack else 0.03) and prev["close"] < prev["open"] and strong_break
+    long_retest = last["low"] <= resistance + atr * (0.18 if attack else 0.12) and last["close"] >= resistance - atr * (0.04 if attack else 0.03)
+    short_retest = last["high"] >= support - atr * (0.18 if attack else 0.12) and last["close"] <= support + atr * (0.04 if attack else 0.03)
+    long_confirm = last["close"] > last["open"] and last["close"] >= max(resistance, prev["high"] - atr * (0.12 if attack else 0.04))
+    short_confirm = last["close"] < last["open"] and last["close"] <= min(support, prev["low"] + atr * (0.12 if attack else 0.04))
     m15_bias_up = df_m15["close"].iloc[-1] > ema50_m15
     m15_bias_down = df_m15["close"].iloc[-1] < ema50_m15
     vwap_limit = 1.95 if attack else 1.45
@@ -6026,17 +6176,17 @@ def strategy_eth_top(df, symbol):
 
 BREAK_RETEST_TEST_PROFILES = {
     "XAUUSD": {
-        "session": (13, 3),
-        "spread_mult": (0.42, 0.30),
-        "trend_min": (0.10, 0.20),
-        "vwap_limit": (2.45, 1.85),
+        "session": (11, 4),
+        "spread_mult": (0.46, 0.34),
+        "trend_min": (0.08, 0.16),
+        "vwap_limit": (2.70, 2.05),
         "lookback": 24,
         "break_pad": (0.02, 0.04),
-        "retest_top": (0.22, 0.16),
+        "retest_top": (0.24, 0.18),
         "retest_hold": (0.06, 0.04),
-        "confirm_pad": (0.12, 0.06),
+        "confirm_pad": (0.14, 0.08),
         "break_body": (0.08, 0.11),
-        "body_floor": (0.05, 0.07),
+        "body_floor": (0.045, 0.06),
         "wick_ratio": (1.22, 1.02),
         "wick_atr": (0.20, 0.14),
         "base_conf": 76,
@@ -6050,10 +6200,10 @@ BREAK_RETEST_TEST_PROFILES = {
         "trend_min": (0.12, 0.20),
         "vwap_limit": (3.00, 2.25),
         "lookback": 26,
-        "break_pad": (0.01, 0.03),
-        "retest_top": (0.24, 0.18),
+        "break_pad": (0.00, 0.02),
+        "retest_top": (0.26, 0.20),
         "retest_hold": (0.06, 0.04),
-        "confirm_pad": (0.12, 0.06),
+        "confirm_pad": (0.14, 0.08),
         "break_body": (0.07, 0.10),
         "body_floor": (0.05, 0.07),
         "wick_ratio": (1.18, 1.00),
@@ -6107,10 +6257,10 @@ BREAK_RETEST_TEST_PROFILES = {
         "trend_min": (0.16, 0.26),
         "vwap_limit": (2.25, 1.70),
         "lookback": 24,
-        "break_pad": (0.02, 0.04),
-        "retest_top": (0.18, 0.12),
+        "break_pad": (0.015, 0.03),
+        "retest_top": (0.20, 0.14),
         "retest_hold": (0.05, 0.03),
-        "confirm_pad": (0.10, 0.05),
+        "confirm_pad": (0.11, 0.06),
         "break_body": (0.08, 0.11),
         "body_floor": (0.05, 0.07),
         "wick_ratio": (1.18, 0.98),
@@ -6124,21 +6274,21 @@ BREAK_RETEST_TEST_PROFILES = {
 
 RECLAIM_TEST_PROFILES = {
     "XAUUSD": {
-        "session": (13, 3),
-        "spread_mult": (0.36, 0.26),
-        "trend_min": (0.10, 0.18),
-        "m15_min": (0.08, 0.14),
-        "vwap_limit": (2.40, 1.80),
-        "pullback_top": (0.12, 0.09),
-        "pullback_bottom": (0.20, 0.14),
+        "session": (11, 4),
+        "spread_mult": (0.40, 0.30),
+        "trend_min": (0.08, 0.14),
+        "m15_min": (0.06, 0.12),
+        "vwap_limit": (2.60, 2.00),
+        "pullback_top": (0.14, 0.10),
+        "pullback_bottom": (0.22, 0.16),
         "reclaim_pad": (0.02, 0.01),
-        "confirm_pad": (0.14, 0.08),
-        "body_floor": (0.045, 0.06),
+        "confirm_pad": (0.16, 0.10),
+        "body_floor": (0.04, 0.055),
         "wick_ratio": (1.24, 1.04),
         "wick_atr": (0.20, 0.14),
         "recent_bars": 8,
-        "rsi_long": (50, 76),
-        "rsi_short": (24, 50),
+        "rsi_long": (48, 78),
+        "rsi_short": (22, 52),
         "boost_rsi": (58, 42),
         "base_conf": 75,
         "boost_conf": 81,
@@ -6152,8 +6302,8 @@ RECLAIM_TEST_PROFILES = {
         "vwap_limit": (2.90, 2.20),
         "pullback_top": (0.14, 0.10),
         "pullback_bottom": (0.22, 0.16),
-        "reclaim_pad": (0.02, 0.01),
-        "confirm_pad": (0.12, 0.06),
+        "reclaim_pad": (0.015, 0.00),
+        "confirm_pad": (0.14, 0.07),
         "body_floor": (0.04, 0.055),
         "wick_ratio": (1.18, 1.00),
         "wick_atr": (0.18, 0.12),
@@ -6215,8 +6365,8 @@ RECLAIM_TEST_PROFILES = {
         "vwap_limit": (2.20, 1.60),
         "pullback_top": (0.14, 0.10),
         "pullback_bottom": (0.22, 0.16),
-        "reclaim_pad": (0.02, 0.01),
-        "confirm_pad": (0.12, 0.06),
+        "reclaim_pad": (0.015, 0.00),
+        "confirm_pad": (0.13, 0.07),
         "body_floor": (0.05, 0.06),
         "wick_ratio": (1.18, 0.98),
         "wick_atr": (0.18, 0.12),
@@ -6274,6 +6424,7 @@ def strategy_break_retest_profiled(df, symbol, branch_name, family):
     vwap_limit = profile["vwap_limit"][0] if attack else profile["vwap_limit"][1]
     last = df.iloc[-1]
     prev = df.iloc[-2]
+    candle_key = last["time"].isoformat() if "time" in df.columns else str(df.index[-1])
     breakout_ref = df.iloc[-profile["lookback"]:-3] if len(df) >= (profile["lookback"] + 4) else df.iloc[:-3]
     if len(breakout_ref) < 8:
         return blocked_signal(branch_name, "NO STRUCTURE")
@@ -6317,7 +6468,7 @@ def strategy_break_retest_profiled(df, symbol, branch_name, family):
         conf = profile["base_conf"]
         if trend_strength > profile["boost_trend"] and price >= resistance + atr * profile["boost_pad"]:
             conf = profile["boost_conf"]
-        return {"signal": "BUY", "confidence": conf, "name": branch_name}
+        return {"signal": "BUY", "confidence": conf, "name": branch_name, "signal_key": f"{branch_name}|BUY|{candle_key}"}
 
     if (
         price < ema50.iloc[-1]
@@ -6333,7 +6484,7 @@ def strategy_break_retest_profiled(df, symbol, branch_name, family):
         conf = profile["base_conf"]
         if trend_strength > profile["boost_trend"] and price <= support - atr * profile["boost_pad"]:
             conf = profile["boost_conf"]
-        return {"signal": "SELL", "confidence": conf, "name": branch_name}
+        return {"signal": "SELL", "confidence": conf, "name": branch_name, "signal_key": f"{branch_name}|SELL|{candle_key}"}
 
     if price > ema50.iloc[-1] and not m15_bias_up:
         return blocked_signal(branch_name, "M15 NOT ALIGNED", pretrigger_text("EMA50", ema50_m15 - df_m15["close"].iloc[-1], atr))
@@ -6420,6 +6571,7 @@ def strategy_reclaim_profiled(df, symbol, branch_name, family):
 
     last = df_m1.iloc[-1]
     prev = df_m1.iloc[-2]
+    candle_key = last["time"].isoformat() if "time" in df_m1.columns else str(df_m1.index[-1])
     recent_high = df_m1["high"].tail(profile["recent_bars"]).max()
     recent_low = df_m1["low"].tail(profile["recent_bars"]).min()
     body = abs(last["close"] - last["open"])
@@ -6479,13 +6631,13 @@ def strategy_reclaim_profiled(df, symbol, branch_name, family):
         conf = profile["base_conf"]
         if rsi.iloc[-1] >= boost_rsi_long and last["close"] >= ema9.iloc[-1] + atr_m1 * profile["boost_pad"]:
             conf = profile["boost_conf"]
-        return {"signal": "BUY", "confidence": conf, "name": branch_name, "execution_df": df_m1}
+        return {"signal": "BUY", "confidence": conf, "name": branch_name, "execution_df": df_m1, "signal_key": f"{branch_name}|BUY|{candle_key}"}
 
     if short_trend and short_pullback and short_confirm and strong_body and clean_short and rsi_short_min <= rsi.iloc[-1] <= rsi_short_max:
         conf = profile["base_conf"]
         if rsi.iloc[-1] <= boost_rsi_short and last["close"] <= ema9.iloc[-1] - atr_m1 * profile["boost_pad"]:
             conf = profile["boost_conf"]
-        return {"signal": "SELL", "confidence": conf, "name": branch_name, "execution_df": df_m1}
+        return {"signal": "SELL", "confidence": conf, "name": branch_name, "execution_df": df_m1, "signal_key": f"{branch_name}|SELL|{candle_key}"}
 
     if not long_trend and not short_trend:
         if m15_strength < m15_min:
@@ -8520,13 +8672,13 @@ def strategy_us500_orb(df, symbol):
         return blocked_signal("US500_ORB", "NO M1 DATA")
 
     range_start, range_end = broker_window_from_local_df(df_m1, 15, 30, 15, 45)
-    session_start, session_end = broker_window_from_local_df(df_m1, 15, 45, 22, 15)
+    session_start, session_end = broker_window_from_local_df(df_m1, 15, 45, 23, 0)
     broker_now = df_m1["time"].iloc[-1].to_pydatetime()
 
     if broker_now < session_start:
         return blocked_signal("US500_ORB", "BUILDING RANGE", "ORB 15:30-15:45")
     if broker_now > session_end:
-        return blocked_signal("US500_ORB", "OUT SESSION", "ORB 15:45-22:15")
+        return blocked_signal("US500_ORB", "OUT SESSION", "ORB 15:45-23:00")
 
     orb_window = df_m1[(df_m1["time"] >= range_start) & (df_m1["time"] < range_end)]
     if len(orb_window) < 8:
@@ -9919,10 +10071,10 @@ register_strategy(
     tag="XTRD",
     symbol_family="XAUUSD",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.42,
-    min_score=0.49,
-    cooldown_sec=45,
-    allowed_regimes={"TREND", "RANGE"},
+    risk_multiplier=0.30,
+    min_score=0.46,
+    cooldown_sec=120,
+    allowed_regimes={"TREND"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
     sl_atr_multiplier=0.96,
@@ -9950,9 +10102,9 @@ register_strategy(
     tag="XM1S",
     symbol_family="XAUUSD",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.17,
-    min_score=0.54,
-    cooldown_sec=42,
+    risk_multiplier=0.16,
+    min_score=0.50,
+    cooldown_sec=60,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=scalping_filter,
     market_filter_func=fast_market_filter_scalping,
@@ -9980,9 +10132,9 @@ register_strategy(
     tag="XBRT",
     symbol_family="XAUUSD",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.24,
-    min_score=0.50,
-    cooldown_sec=52,
+    risk_multiplier=0.20,
+    min_score=0.47,
+    cooldown_sec=70,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=swing_filter,
     market_filter_func=fast_market_filter,
@@ -10006,14 +10158,14 @@ register_strategy(
 register_strategy(
     "XAU_VWAP_RECLAIM",
     strategy_xau_vwap_reclaim,
-    enabled=False,
-    toggle_arm=False,
+    enabled=True,
+    toggle_arm=True,
     tag="XVRC",
     symbol_family="XAUUSD",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=0.20,
-    min_score=0.52,
-    cooldown_sec=46,
+    risk_multiplier=0.18,
+    min_score=0.48,
+    cooldown_sec=65,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=scalping_filter,
     market_filter_func=fast_market_filter_scalping,
@@ -10034,7 +10186,7 @@ register_strategy(
     min_splits=4,
     max_splits=5,
 )
-get_strategy_config("XAU_VWAP_RECLAIM")["disabled_reason"] = "TEST BENCH"
+get_strategy_config("XAU_VWAP_RECLAIM")["disabled_reason"] = ""
 register_strategy(
     "XAU_LUKE",
     strategy_xau_luke,
@@ -10043,9 +10195,9 @@ register_strategy(
     tag="XLUK",
     symbol_family="XAUUSD",
     execution_mode="MULTI_ONLY",
-    risk_multiplier=1.0,
-    min_score=0.58,
-    cooldown_sec=90,
+    risk_multiplier=0.55,
+    min_score=0.54,
+    cooldown_sec=40,
     allowed_regimes={"TREND", "RANGE"},
     filter_func=luke_filter,
     market_filter_func=fast_market_filter_scalping,
@@ -10055,7 +10207,7 @@ register_strategy(
     be_trigger_progress=0.18,
     be_buffer_progress=0.02,
     trail_steps=[],
-    session_label="09:30-18",
+    session_label="09:30-22",
     multi_tp_eur_min=0.70,
     multi_tp_eur_max=1.60,
     multi_tp_target_eur=1.00,
@@ -11516,6 +11668,21 @@ def _expand_session_tuple(session, start_pad=0, end_pad=0):
     return max(0, int(start) - int(start_pad)), min(23, int(end) + int(end_pad))
 
 
+def _derive_runtime_signal_key(symbol, strategy_name, signal, market_df=None, execution_df=None):
+    source_df = execution_df if execution_df is not None else market_df
+    candle_key = "NA"
+    try:
+        if source_df is not None and len(source_df) > 0:
+            if hasattr(source_df, "columns") and "time" in source_df.columns:
+                candle = source_df.iloc[-1]["time"]
+            else:
+                candle = source_df.index[-1]
+            candle_key = candle.isoformat() if hasattr(candle, "isoformat") else str(candle)
+    except Exception:
+        candle_key = "NA"
+    return f"{strategy_name}|{symbol}|{signal}|{candle_key}"
+
+
 def _apply_v160_strategy_governance():
     global STRATEGIES
     kept = []
@@ -11592,12 +11759,20 @@ def _apply_v160_entry_push_governance():
             strategy["cooldown_sec"] = max(180, int(cooldown_sec * 0.40))
             strategy["min_score"] = round(clamp(strategy["min_score"] - 0.02, 0.38, 0.52), 3)
         elif name.endswith("_ORB"):
-            strategy["cooldown_sec"] = max(30, int(cooldown_sec * 0.45))
+            strategy["cooldown_sec"] = max(45, int(cooldown_sec * 0.50))
             strategy["min_score"] = round(clamp(strategy["min_score"] - 0.02, 0.42, 0.58), 3)
         elif name.endswith("_TREND"):
-            strategy["cooldown_sec"] = max(20, int(cooldown_sec * 0.50))
+            strategy["cooldown_sec"] = max(45, int(cooldown_sec * 0.55))
+            strategy["min_score"] = round(clamp(strategy["min_score"], 0.36, 0.58), 3)
+        elif name.endswith("_PULLBACK_SCALP"):
+            strategy["cooldown_sec"] = max(36, int(cooldown_sec * 0.55))
+            strategy["min_score"] = round(clamp(strategy["min_score"], 0.38, 0.58), 3)
+        elif name.endswith("_SCALP"):
+            strategy["cooldown_sec"] = max(24, int(cooldown_sec * 0.55))
+            strategy["min_score"] = round(clamp(strategy["min_score"], 0.38, 0.58), 3)
         elif name.endswith("_BREAK_RETEST") or name.endswith("_VWAP_RECLAIM") or name.endswith("_VWAP_TREND"):
-            strategy["cooldown_sec"] = max(22, int(cooldown_sec * 0.50))
+            strategy["cooldown_sec"] = max(36, int(cooldown_sec * 0.55))
+            strategy["min_score"] = round(clamp(strategy["min_score"], 0.36, 0.56), 3)
 
         strategy["enabled"] = True
         strategy["toggle_arm"] = True
@@ -11643,7 +11818,7 @@ def _apply_v163_stress_test_governance():
             strategy["risk_multiplier"] = round(max(0.10, base_risk * 0.94), 3)
         elif suite == "TITANYX" or name.endswith("_TITANYX"):
             strategy["min_score"] = round(clamp(base_min_score - 0.08, 0.34, 0.50), 3)
-            strategy["cooldown_sec"] = max(18, int(base_cooldown * 0.45))
+            strategy["cooldown_sec"] = max(24, int(base_cooldown * 0.50))
         elif name.endswith("_SANTO_GRAAL"):
             strategy["min_score"] = round(clamp(base_min_score - 0.08, 0.34, 0.50), 3)
             strategy["cooldown_sec"] = max(120, int(base_cooldown * 0.24))
@@ -11659,15 +11834,58 @@ def _apply_v163_stress_test_governance():
         elif name.endswith("_HEIKEN_TDI"):
             strategy["min_score"] = round(clamp(base_min_score - 0.08, 0.32, 0.50), 3)
             strategy["cooldown_sec"] = max(900, int(base_cooldown * 0.24))
+        elif name.endswith("_ORB"):
+            strategy["min_score"] = round(clamp(base_min_score - 0.04, 0.40, 0.56), 3)
+            strategy["cooldown_sec"] = max(42, int(base_cooldown * 0.52))
+        elif name.endswith("_PULLBACK_SCALP"):
+            strategy["min_score"] = round(clamp(base_min_score - 0.04, 0.40, 0.56), 3)
+            strategy["cooldown_sec"] = max(34, int(base_cooldown * 0.55))
+        elif name.endswith("_SCALP"):
+            strategy["min_score"] = round(clamp(base_min_score - 0.04, 0.38, 0.54), 3)
+            strategy["cooldown_sec"] = max(26, int(base_cooldown * 0.55))
         elif name.endswith("_BREAK_RETEST") or name.endswith("_VWAP_RECLAIM") or name.endswith("_VWAP_TREND"):
-            strategy["min_score"] = round(clamp(base_min_score - 0.06, 0.34, 0.54), 3)
-            strategy["cooldown_sec"] = max(18, int(base_cooldown * 0.42))
+            strategy["min_score"] = round(clamp(base_min_score - 0.06, 0.36, 0.54), 3)
+            strategy["cooldown_sec"] = max(30, int(base_cooldown * 0.48))
         elif name.endswith("_TREND") or filter_name == "luke_filter":
-            strategy["min_score"] = round(clamp(base_min_score - 0.05, 0.34, 0.56), 3)
-            strategy["cooldown_sec"] = max(18, int(base_cooldown * 0.45))
+            strategy["min_score"] = round(clamp(base_min_score - 0.05, 0.36, 0.56), 3)
+            strategy["cooldown_sec"] = max(36, int(base_cooldown * 0.52))
 
         strategy["enabled"] = True
         strategy["toggle_arm"] = True
+
+    xau_overrides = {
+        "XAU_TREND": {"min_score": 0.44, "cooldown_sec": 90, "risk_multiplier": 0.30, "allowed_regimes": {"TREND"}},
+        "XAU_M1_SCALP": {"min_score": 0.46, "cooldown_sec": 28, "risk_multiplier": 0.16, "allowed_regimes": {"TREND", "RANGE"}},
+        "XAU_BREAK_RETEST": {"min_score": 0.40, "cooldown_sec": 24, "risk_multiplier": 0.20, "allowed_regimes": {"TREND", "RANGE"}},
+        "XAU_VWAP_RECLAIM": {"min_score": 0.41, "cooldown_sec": 22, "risk_multiplier": 0.18, "allowed_regimes": {"TREND", "RANGE"}},
+        "XAU_LUKE": {"min_score": 0.42, "cooldown_sec": 20, "risk_multiplier": 0.55, "allowed_regimes": {"TREND", "RANGE"}},
+    }
+    for name, override in xau_overrides.items():
+        strategy = get_strategy_config(name)
+        if not strategy:
+            continue
+        strategy.update(override)
+        strategy["enabled"] = True
+        strategy["toggle_arm"] = True
+        if name == "XAU_VWAP_RECLAIM":
+            strategy["disabled_reason"] = ""
+
+    branch_overrides = {
+        "US500_ORB": {"min_score": 0.44, "cooldown_sec": 54},
+        "ETH_BREAK_RETEST": {"min_score": 0.38, "cooldown_sec": 36},
+        "GER40_PULLBACK_SCALP": {"min_score": 0.58, "cooldown_sec": 60},
+        "GER40_SCALP": {"min_score": 0.56, "cooldown_sec": 42},
+        "BTC_TREND": {"min_score": 0.40, "cooldown_sec": 42},
+        "ETH_PULSE": {"min_score": 0.40, "cooldown_sec": 34},
+        "US500_TREND": {"min_score": 0.42, "cooldown_sec": 42},
+        "USTECH_TREND": {"min_score": 0.42, "cooldown_sec": 42},
+    }
+    for name, override in branch_overrides.items():
+        strategy = get_strategy_config(name)
+        if strategy:
+            strategy.update(override)
+            strategy["enabled"] = True
+            strategy["toggle_arm"] = True
 
     for profile in SANTO_GRAAL_PROFILES.values():
         profile["session"] = _expand_session_tuple(profile["session"], 1, 1)
@@ -11735,7 +11953,7 @@ def _apply_v163_stress_test_governance():
         profile["max_daily_drawdown_eur"] = round(float(profile.get("max_daily_drawdown_eur", 4.0)) * 1.20, 2)
 
     for profile in TITANYX_PROFILES.values():
-        profile["entry_windows"] = _expand_exchange_windows(profile["entry_windows"], before_minutes=10, after_minutes=25)
+        profile["entry_windows"] = _expand_exchange_windows(profile["entry_windows"], before_minutes=15, after_minutes=55)
         profile["z_entry"] = max(1.70, float(profile["z_entry"]) - 0.20)
         profile["z_readd"] = max(1.35, float(profile["z_readd"]) - 0.12)
         profile["rsi_long"] = min(36, int(profile["rsi_long"]) + 3)
@@ -11924,21 +12142,21 @@ for spec in TITANYX_REGISTRY:
 
 
 _DORMANT_STRESS_RELAX_OVERRIDES = {
-    "GBRT": {"min_score": 0.42, "cooldown_sec": 14},
+    "GBRT": {"min_score": 0.38, "cooldown_sec": 30},
     "G4CL": {"min_score": 0.42, "cooldown_sec": 90},
     "G4PU": {"min_score": 0.39, "cooldown_sec": 150},
     "G4RV": {"min_score": 0.45, "cooldown_sec": 105},
     "G4SG": {"min_score": 0.39, "cooldown_sec": 120},
-    "G4SC": {"min_score": 0.55, "cooldown_sec": 36},
+    "G4SC": {"min_score": 0.56, "cooldown_sec": 42},
     "G4SD": {"min_score": 0.39, "cooldown_sec": 150},
-    "G4TR": {"min_score": 0.44, "cooldown_sec": 14},
+    "G4TR": {"min_score": 0.46, "cooldown_sec": 48},
     "U5CL": {"min_score": 0.40, "cooldown_sec": 90},
     "U5DM": {"min_score": 0.28, "cooldown_sec": 600},
     "U5RV": {"min_score": 0.42, "cooldown_sec": 96},
     "U5SG": {"min_score": 0.30, "cooldown_sec": 84},
     "U5TX": {"min_score": 0.47, "cooldown_sec": 54},
-    "U5TR": {"min_score": 0.38, "cooldown_sec": 14},
-    "UBRT": {"min_score": 0.36, "cooldown_sec": 14},
+    "U5TR": {"min_score": 0.42, "cooldown_sec": 42},
+    "UBRT": {"min_score": 0.38, "cooldown_sec": 30},
     "U1CL": {"min_score": 0.40, "cooldown_sec": 90},
     "U1HT": {"min_score": 0.33, "cooldown_sec": 600},
     "U1KB": {"min_score": 0.31, "cooldown_sec": 105},
@@ -11946,11 +12164,11 @@ _DORMANT_STRESS_RELAX_OVERRIDES = {
     "U1RV": {"min_score": 0.42, "cooldown_sec": 96},
     "U1SG": {"min_score": 0.30, "cooldown_sec": 84},
     "U1SD": {"min_score": 0.29, "cooldown_sec": 84},
-    "USTR": {"min_score": 0.36, "cooldown_sec": 14},
-    "XBRT": {"min_score": 0.35, "cooldown_sec": 14},
-    "XLUK": {"min_score": 0.44, "cooldown_sec": 16},
-    "XTRD": {"min_score": 0.35, "cooldown_sec": 14},
-    "XVRC": {"min_score": 0.37, "cooldown_sec": 14},
+    "USTR": {"min_score": 0.42, "cooldown_sec": 42},
+    "XBRT": {"min_score": 0.40, "cooldown_sec": 24},
+    "XLUK": {"min_score": 0.42, "cooldown_sec": 20},
+    "XTRD": {"min_score": 0.44, "cooldown_sec": 90},
+    "XVRC": {"min_score": 0.41, "cooldown_sec": 22},
 }
 
 
@@ -13380,7 +13598,14 @@ def run_cycle():
             continue
 
         runtime = strategy_runtime.get(strat_name, {})
-        signal_key = candidate.get("signal_key")
+        signal_key = candidate.get("signal_key") or _derive_runtime_signal_key(
+            s,
+            strat_name,
+            sig,
+            market_df=df,
+            execution_df=execution_df,
+        )
+        candidate["signal_key"] = signal_key
         if signal_key and runtime.get("last_signal_key_by_symbol", {}).get(s) == signal_key:
             record_strategy_event(strat_name, "DUPLICATE LEG")
             set_live_log(s, f"🚫 {strat_name}: DUPLICATE LEG")
@@ -13447,6 +13672,7 @@ def run_cycle():
             state["executed"] += 1
             state["planned"].append(candidate)
             new_trades_executed += 1
+            record_strategy_entry(strat_name, s, sig)
             last_global_trade_time = time.time()
             last_strategy_trade_time[cooldown_key] = time.time()
             if signal_key:

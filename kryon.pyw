@@ -16,7 +16,7 @@ from kryon_license import LicenseManager
 from kryon_update import UpdateManager
 from kryon_runtime import get_runtime_dir
 
-VERSION = "KRYON ULTIMATE PRO V 16.4.0"
+VERSION = "KRYON ULTIMATE PRO V 16.4.4"
 AUTHOR_BRAND = ""
 running = False
 
@@ -794,8 +794,8 @@ workspace = tk.Frame(root, bg=BG_ALT)
 workspace.grid(row=0, column=1, sticky="nsew")
 
 workspace.grid_rowconfigure(0, weight=3, minsize=220)
-workspace.grid_rowconfigure(1, weight=5, minsize=280)
-workspace.grid_rowconfigure(2, weight=5, minsize=320)
+workspace.grid_rowconfigure(1, weight=4, minsize=240)
+workspace.grid_rowconfigure(2, weight=4, minsize=260)
 workspace.grid_columnconfigure(0, weight=1)
 workspace.grid_columnconfigure(1, weight=1)
 
@@ -845,8 +845,8 @@ tree.tag_configure("low_vol", foreground=BTN_GOLD)
 top_right = tk.Frame(workspace, bg=BG_ALT)
 top_right.grid(row=0, column=1, sticky="nsew")
 top_right.grid_rowconfigure(0, weight=1)
-top_right.grid_columnconfigure(0, weight=1, uniform="top_right")
-top_right.grid_columnconfigure(1, weight=1, uniform="top_right")
+top_right.grid_columnconfigure(0, weight=1)
+top_right.grid_columnconfigure(1, weight=4)
 
 mod_portfolio = make_card(top_right)
 mod_portfolio.grid(row=0, column=0, sticky="nsew", padx=(5, 3), pady=5)
@@ -890,18 +890,19 @@ optimizer_buttons_wrap.pack(fill="x")
 optimizer_buttons = {}
 optimizer_signal_labels = {}
 optimizer_specs = [
-    ("SAFE", "🛡️ SAFE", TEXT_DIM, 114),
-    ("BALANCED", "⚖️ BALANCED", BTN_BLUE, 146),
-    ("ATTACK", "🚀 ATTACK", TEXT_DIM, 120),
+    ("SAFE", "🛡️ SAFE", TEXT_DIM, 126),
+    ("BALANCED", "⚖️ BALANCED", BTN_BLUE, 126),
+    ("ATTACK", "🚀 ATTACK", TEXT_DIM, 126),
 ]
 for idx, (name, label, color, width) in enumerate(optimizer_specs):
-    optimizer_buttons_wrap.grid_columnconfigure(idx, weight=1)
     cell = tk.Frame(optimizer_buttons_wrap, bg=CARD_BG)
-    cell.grid(row=0, column=idx, padx=6 if idx else (0, 6), sticky="n")
-    button = RoundedButton(cell, label, color, lambda p=name: apply_optimizer_profile(p), width, 34)
-    button.pack()
-    signal = tk.Label(cell, text="●", fg=BORDER_SOFT, bg=CARD_BG, font=("Segoe UI Symbol", 13, "bold"))
-    signal.pack(pady=(4, 0))
+    cell.pack(fill="x", pady=(0, 6 if idx < len(optimizer_specs) - 1 else 0))
+    row = tk.Frame(cell, bg=CARD_BG)
+    row.pack(fill="x")
+    button = RoundedButton(row, label, color, lambda p=name: apply_optimizer_profile(p), width, 34)
+    button.pack(side="left")
+    signal = tk.Label(row, text="●", fg=BORDER_SOFT, bg=CARD_BG, font=("Segoe UI Symbol", 13, "bold"))
+    signal.pack(side="left", padx=(10, 0))
     optimizer_buttons[name] = button
     optimizer_signal_labels[name] = signal
 refresh_optimizer_buttons()
@@ -909,61 +910,74 @@ refresh_optimizer_guidance_lights()
 
 mod_strategies = make_card(top_right)
 mod_strategies.grid(row=0, column=1, sticky="nsew", padx=(3, 5), pady=5)
-add_title(mod_strategies, "STRATEGIES", "Live matrix sessione e stato branch")
+add_title(mod_strategies, "STRATEGIES", "Doppia lista sessione: chi funziona e chi resta bloccata")
 
 strategy_frame = tk.Frame(mod_strategies, bg=CARD_BG)
 strategy_frame.pack(fill="both", expand=True, padx=0, pady=0)
-strategy_overview_var = tk.StringVar(value="Assets 0 | Branch 0 | Active 0 | Open 0 | Live 0.0€ | Session 0.0€")
+strategy_overview_var = tk.StringVar(value="Session 0.0€ | Used 0 | Blocked 0 | Open 0 | Best --- | Worst ---")
 strategy_overview = tk.Frame(strategy_frame, bg=CARD_BG)
 strategy_overview.pack(fill="x", padx=6, pady=(6, 0))
-tk.Label(strategy_overview, text="LIVE MATRIX", bg=CARD_BG, fg=FG, font=("Segoe UI Semibold", 8)).pack(side="left")
+tk.Label(strategy_overview, text="LIVE MATRIX SESSION", bg=CARD_BG, fg=FG, font=("Segoe UI Semibold", 8)).pack(side="left")
 tk.Label(strategy_overview, textvariable=strategy_overview_var, bg=CARD_BG, fg=TEXT_DIM, font=("Segoe UI", 8)).pack(side="right")
 
-strategy_summary_wrap = tk.Frame(strategy_frame, bg=CARD_BG)
-strategy_summary_wrap.pack(fill="x", padx=6, pady=(4, 4))
-strategy_summary = ttk.Treeview(strategy_summary_wrap, columns=("Branch", "State", "Block", "Live", "Open", "Net", "WR", "Trd"), show="headings", height=12)
-for col in ("Branch", "State", "Block", "Live", "Open", "Net", "WR", "Trd"):
-    strategy_summary.heading(col, text=col, anchor="center")
-strategy_summary.heading("Live", text="Live", anchor="center")
-strategy_summary.heading("Open", text="Open", anchor="center")
-strategy_summary.heading("Net", text="Sess Net", anchor="center")
-strategy_summary.heading("WR", text="Sess WR", anchor="center")
-strategy_summary.heading("Trd", text="Sess Trd", anchor="center")
-strategy_summary.column("Branch", width=108, minwidth=98, stretch=True, anchor="w")
-strategy_summary.column("State", width=64, minwidth=60, stretch=False, anchor="center")
-strategy_summary.column("Block", width=98, minwidth=90, stretch=False, anchor="center")
-strategy_summary.column("Live", width=62, minwidth=56, stretch=False, anchor="e")
-strategy_summary.column("Open", width=42, minwidth=38, stretch=False, anchor="center")
-strategy_summary.column("Net", width=64, minwidth=58, stretch=False, anchor="e")
-strategy_summary.column("WR", width=52, minwidth=48, stretch=False, anchor="e")
-strategy_summary.column("Trd", width=46, minwidth=42, stretch=False, anchor="center")
-strategy_summary.tag_configure("active", foreground=SUCCESS)
-strategy_summary.tag_configure("standby", foreground=INFO)
-strategy_summary.tag_configure("locked", foreground=DANGER)
-strategy_summary.tag_configure("weak", foreground=WARNING)
-strategy_summary_scroll = ttk.Scrollbar(strategy_summary_wrap, orient="vertical", command=strategy_summary.yview)
-strategy_summary.configure(yscrollcommand=strategy_summary_scroll.set)
-strategy_summary.pack(side="left", fill="x", expand=True)
-strategy_summary_scroll.pack(side="right", fill="y", padx=(4, 0))
+strategy_lists = tk.Frame(strategy_frame, bg=CARD_BG)
+strategy_lists.pack(fill="both", expand=True, padx=6, pady=6)
+strategy_lists.grid_rowconfigure(0, weight=3)
+strategy_lists.grid_rowconfigure(1, weight=5)
+strategy_lists.grid_columnconfigure(0, weight=1)
 
-strategy_divider = tk.Frame(strategy_frame, bg=BORDER_SOFT, height=1)
-strategy_divider.pack(fill="x", padx=6, pady=(0, 2))
+strategy_active_wrap = tk.Frame(strategy_lists, bg=LOG_BG_2, highlightthickness=1, highlightbackground=BORDER_SOFT)
+strategy_active_wrap.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+tk.Label(strategy_active_wrap, text="ATTIVE OGGI", bg=LOG_BG_2, fg=FG, font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=8, pady=(6, 2))
+strategy_active_tree = ttk.Treeview(
+    strategy_active_wrap,
+    columns=("Strategy", "Asset", "Trade", "WR", "PnL", "Avg", "Last"),
+    show="headings",
+    height=8,
+)
+for col in ("Strategy", "Asset", "Trade", "WR", "PnL", "Avg", "Last"):
+    strategy_active_tree.heading(col, text=col, anchor="center")
+strategy_active_tree.column("Strategy", width=134, minwidth=118, stretch=True, anchor="w")
+strategy_active_tree.column("Asset", width=72, minwidth=62, stretch=False, anchor="center")
+strategy_active_tree.column("Trade", width=52, minwidth=46, stretch=False, anchor="center")
+strategy_active_tree.column("WR", width=58, minwidth=54, stretch=False, anchor="e")
+strategy_active_tree.column("PnL", width=76, minwidth=70, stretch=False, anchor="e")
+strategy_active_tree.column("Avg", width=70, minwidth=64, stretch=False, anchor="e")
+strategy_active_tree.column("Last", width=118, minwidth=96, stretch=True, anchor="w")
+strategy_active_tree.tag_configure("active", foreground=SUCCESS)
+strategy_active_tree.tag_configure("weak", foreground=WARNING)
+strategy_active_tree.tag_configure("loss", foreground=DANGER)
+strategy_active_tree.tag_configure("idle", foreground=TEXT_DIM)
+strategy_active_scroll = ttk.Scrollbar(strategy_active_wrap, orient="vertical", command=strategy_active_tree.yview)
+strategy_active_tree.configure(yscrollcommand=strategy_active_scroll.set)
+strategy_active_scroll.pack(side="right", fill="y", padx=(0, 4), pady=(0, 6))
+strategy_active_tree.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
-strategy_canvas = tk.Canvas(strategy_frame, bg=CARD_BG, highlightthickness=0, bd=0)
-strategy_scroll = ttk.Scrollbar(strategy_frame, orient="vertical", command=strategy_canvas.yview)
-strategy_list = tk.Frame(strategy_canvas, bg=CARD_BG)
-strategy_list.bind(
-    "<Configure>",
-    lambda e: strategy_canvas.configure(scrollregion=strategy_canvas.bbox("all"))
+strategy_blocked_wrap = tk.Frame(strategy_lists, bg=LOG_BG_2, highlightthickness=1, highlightbackground=BORDER_SOFT)
+strategy_blocked_wrap.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+tk.Label(strategy_blocked_wrap, text="BLOCCATE OGGI", bg=LOG_BG_2, fg=FG, font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=8, pady=(6, 2))
+strategy_blocked_tree = ttk.Treeview(
+    strategy_blocked_wrap,
+    columns=("Strategy", "Asset", "Block", "Tent", "Pre"),
+    show="headings",
+    height=8,
 )
-strategy_canvas_window = strategy_canvas.create_window((0, 0), window=strategy_list, anchor="nw")
-strategy_canvas.configure(yscrollcommand=strategy_scroll.set)
-strategy_scroll.pack(side="right", fill="y", padx=(0, 4), pady=6)
-strategy_canvas.pack(fill="both", expand=True, padx=(6, 0), pady=6)
-strategy_canvas.bind(
-    "<Configure>",
-    lambda e: strategy_canvas.itemconfigure(strategy_canvas_window, width=e.width - 2)
-)
+for col in ("Strategy", "Asset", "Block", "Tent", "Pre"):
+    strategy_blocked_tree.heading(col, text=col, anchor="center")
+strategy_blocked_tree.heading("Tent", text="Tent", anchor="center")
+strategy_blocked_tree.column("Strategy", width=134, minwidth=118, stretch=True, anchor="w")
+strategy_blocked_tree.column("Asset", width=72, minwidth=62, stretch=False, anchor="center")
+strategy_blocked_tree.column("Block", width=134, minwidth=118, stretch=True, anchor="w")
+strategy_blocked_tree.column("Tent", width=52, minwidth=46, stretch=False, anchor="center")
+strategy_blocked_tree.column("Pre", width=126, minwidth=104, stretch=True, anchor="w")
+strategy_blocked_tree.tag_configure("standby", foreground=INFO)
+strategy_blocked_tree.tag_configure("locked", foreground=DANGER)
+strategy_blocked_tree.tag_configure("weak", foreground=WARNING)
+strategy_blocked_tree.tag_configure("idle", foreground=TEXT_DIM)
+strategy_blocked_scroll = ttk.Scrollbar(strategy_blocked_wrap, orient="vertical", command=strategy_blocked_tree.yview)
+strategy_blocked_tree.configure(yscrollcommand=strategy_blocked_scroll.set)
+strategy_blocked_scroll.pack(side="right", fill="y", padx=(0, 4), pady=(0, 6))
+strategy_blocked_tree.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
 mod_positions = make_card(workspace)
 mod_positions.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
@@ -992,7 +1006,10 @@ add_title(mod_telemetry, "LIVE MAP", "Radar rapido degli asset")
 live_map_body = tk.Frame(mod_telemetry, bg=CARD_BG)
 live_map_body.pack(fill="both", expand=True, padx=5, pady=5)
 
-live_map_grid = tk.Frame(live_map_body, bg=CARD_BG)
+live_map_wrap = tk.Frame(live_map_body, bg=CARD_BG)
+live_map_wrap.pack(fill="both", expand=True, padx=0, pady=0)
+
+live_map_grid = tk.Frame(live_map_wrap, bg=CARD_BG)
 live_map_grid.pack(fill="both", expand=True, padx=4, pady=4)
 for _col in range(5):
     live_map_grid.grid_columnconfigure(_col, weight=1, uniform="live_map")
@@ -1024,38 +1041,53 @@ log_box.pack(fill="both", expand=True)
 scroll_log.config(command=log_box.yview)
 style_text_widget(log_box, LOG_BG, TEXT_MAIN)
 
-mod_debug = make_card(workspace)
-mod_debug.grid(row=2, column=1, sticky="nsew", padx=5, pady=5)
-add_title(mod_debug, "DEBUG", "Stato engine ed errori critici")
+right_lower = tk.Frame(workspace, bg=BG_ALT)
+right_lower.grid(row=2, column=1, sticky="nsew", padx=5, pady=5)
+right_lower.grid_rowconfigure(0, weight=12)
+right_lower.grid_rowconfigure(1, weight=0, minsize=24)
+right_lower.grid_columnconfigure(0, weight=1)
 
-debug_cont = tk.Frame(mod_debug, bg=LOG_BG_2, highlightthickness=1, highlightbackground=BORDER_SOFT)
-debug_cont.pack(fill="x", padx=5, pady=(5, 2))
-debug_cont.configure(height=170)
-debug_cont.pack_propagate(False)
-tk.Label(debug_cont, text="STATE", bg=LOG_BG_2, fg=FG, font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=8, pady=(6, 2))
-debug_tree = ttk.Treeview(debug_cont, columns=("Asset", "Feed", "Strategy", "Block", "Final"), show="headings")
-debug_scroll = ttk.Scrollbar(debug_cont, orient="vertical", command=debug_tree.yview)
-debug_tree.configure(yscrollcommand=debug_scroll.set)
-debug_scroll.pack(side="right", fill="y")
-debug_tree.pack(fill="both", expand=True)
-for col in ("Asset", "Feed", "Strategy", "Block", "Final"):
-    debug_tree.heading(col, text=col, anchor="center")
-debug_tree.column("Asset", width=64, minwidth=60, stretch=False, anchor="center")
-debug_tree.column("Feed", width=56, minwidth=50, stretch=False, anchor="center")
-debug_tree.column("Strategy", width=156, minwidth=140, stretch=False, anchor="w")
-debug_tree.column("Block", width=150, minwidth=136, stretch=False, anchor="w")
-debug_tree.column("Final", width=110, minwidth=100, stretch=True, anchor="w")
-debug_tree.tag_configure("ok", foreground=SUCCESS)
-debug_tree.tag_configure("warn", foreground=WARNING)
-debug_tree.tag_configure("bad", foreground=DANGER)
+mod_history = make_card(right_lower)
+mod_history.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+add_title(mod_history, "STORICO", "Uso sessione strategie")
+history_wrap = tk.Frame(mod_history, bg=LOG_BG_2, highlightthickness=1, highlightbackground=BORDER_SOFT)
+history_wrap.pack(fill="both", expand=True, padx=5, pady=5)
+history_tree = ttk.Treeview(
+    history_wrap,
+    columns=("Strategy", "Asset", "Used", "WR", "PnL", "State"),
+    show="headings",
+    height=12,
+)
+for col in ("Strategy", "Asset", "Used", "WR", "PnL", "State"):
+    history_tree.heading(col, text=col, anchor="center")
+history_tree.column("Strategy", width=168, minwidth=150, stretch=True, anchor="w")
+history_tree.column("Asset", width=82, minwidth=72, stretch=False, anchor="center")
+history_tree.column("Used", width=60, minwidth=54, stretch=False, anchor="center")
+history_tree.column("WR", width=64, minwidth=58, stretch=False, anchor="e")
+history_tree.column("PnL", width=86, minwidth=80, stretch=False, anchor="e")
+history_tree.column("State", width=132, minwidth=116, stretch=True, anchor="w")
+history_tree.tag_configure("pos", foreground=SUCCESS)
+history_tree.tag_configure("neg", foreground=DANGER)
+history_tree.tag_configure("used", foreground=WARNING)
+history_tree.tag_configure("idle", foreground=TEXT_DIM)
+history_scroll = ttk.Scrollbar(history_wrap, orient="vertical", command=history_tree.yview)
+history_tree.configure(yscrollcommand=history_scroll.set)
+history_scroll.pack(side="right", fill="y", padx=(0, 4), pady=(0, 6))
+history_tree.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+mod_debug = make_card(right_lower)
+mod_debug.grid(row=1, column=0, sticky="new")
+mod_debug.configure(height=22)
+mod_debug.grid_propagate(False)
+tk.Label(mod_debug, text="ERRORS", bg=CARD_BG_2, fg=ERR_FG, font=("Segoe UI Semibold", 7), anchor="w").pack(fill="x", padx=0, pady=0, ipady=1)
 
 err_cont = tk.Frame(mod_debug, bg=ERR_BG, highlightthickness=1, highlightbackground=ERR_BORDER)
-err_cont.pack(fill="both", expand=True, padx=5, pady=(2, 5))
-tk.Label(err_cont, text="ERRORS", bg=ERR_BG, fg=ERR_FG, font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=8, pady=(6, 2))
+err_cont.pack(fill="both", expand=True, padx=4, pady=(1, 3))
 scroll_err = ttk.Scrollbar(err_cont)
 scroll_err.pack(side="right", fill="y")
-error_box = tk.Text(err_cont, bg=ERR_BG, fg="#fca5a5", font=("Consolas", 8), relief="flat", wrap="none", yscrollcommand=scroll_err.set)
+error_box = tk.Text(err_cont, bg=ERR_BG, fg="#fca5a5", font=("Consolas", 6), relief="flat", wrap="none", yscrollcommand=scroll_err.set)
 error_box.pack(fill="both", expand=True)
+error_box.configure(height=1)
 scroll_err.config(command=error_box.yview)
 style_text_widget(error_box, ERR_BG, ERR_FG)
 
@@ -1098,263 +1130,177 @@ def update_prop_panel():
 
 def update_strategy_panel():
     try:
-        summary_scroll_pos = strategy_summary.yview()[0]
+        active_scroll_pos = strategy_active_tree.yview()[0]
     except Exception:
-        summary_scroll_pos = 0.0
+        active_scroll_pos = 0.0
     try:
-        detail_scroll_pos = strategy_canvas.yview()[0]
+        blocked_scroll_pos = strategy_blocked_tree.yview()[0]
     except Exception:
-        detail_scroll_pos = 0.0
-
-    for widget in strategy_list.winfo_children():
-        widget.destroy()
+        blocked_scroll_pos = 0.0
 
     strategies = bot_core.get_strategy_dashboard()
-    strategy_summary.delete(*strategy_summary.get_children())
-    strategies = sorted(
-        strategies,
+    strategy_active_tree.delete(*strategy_active_tree.get_children())
+    strategy_blocked_tree.delete(*strategy_blocked_tree.get_children())
+
+    used_strategies = sorted(
+        [s for s in strategies if s.get("used_today")],
         key=lambda s: (
-            0 if s["status"] == "ACTIVE" else 1 if s["status"] == "STANDBY" else 2,
-            -float(s.get("total_net_profit", 0.0)),
+            -float(s.get("session_net_profit", 0.0) or 0.0),
+            -int(s.get("session_closed", 0) or 0),
             s["name"],
         ),
     )
-    strategy_summary.configure(height=min(max(len(strategies), 10), 16))
+    blocked_strategies = sorted(
+        [
+            s
+            for s in strategies
+            if not s.get("used_today")
+            and s.get("blocked_today")
+        ],
+        key=lambda s: (
+            -int(s.get("session_attempts", 0) or 0),
+            -int(s.get("session_signals", 0) or 0),
+            s["name"],
+        ),
+    )
 
-    asset_count = len({s.get("family", "---") for s in strategies})
-    strategy_count = len(strategies)
-    active_count = len([s for s in strategies if s["status"] == "ACTIVE"])
     open_count = sum(int(s.get("open_positions", 0) or 0) for s in strategies)
     live_total = round(sum(float(s.get("live_pnl", 0.0) or 0.0) for s in strategies), 2)
     session_total = round(sum(float(s.get("session_net_profit", 0.0) or 0.0) for s in strategies), 2)
-    best_branch = max(strategies, key=lambda s: s.get("total_net_profit", 0.0))["name"] if strategies else "---"
+    best_branch = used_strategies[0]["name"] if used_strategies else "---"
+    worst_branch = min(used_strategies, key=lambda s: float(s.get("session_net_profit", 0.0) or 0.0))["name"] if used_strategies else "---"
     strategy_overview_var.set(
-        f"Assets {asset_count} | Branch {strategy_count} | Active {active_count} | Open {open_count} | Live {live_total}€ | Session {session_total}€ | Best {best_branch}"
+        f"Session {session_total:.2f}€ | Used {len(used_strategies)} | Blocked {len(blocked_strategies)} | Open {open_count} | Live {live_total:.2f}€ | Best {best_branch} | Worst {worst_branch}"
     )
 
-    for strategy in strategies:
-        if strategy["status"] == "LOCKED":
-            row_tag = "locked"
-        elif strategy["status"] == "STANDBY":
-            row_tag = "standby"
-        elif strategy.get("total_net_profit", 0.0) < 0:
-            row_tag = "weak"
+    for strategy in used_strategies:
+        session_net = float(strategy.get("session_net_profit", 0.0) or 0.0)
+        live_pnl = float(strategy.get("live_pnl", 0.0) or 0.0)
+        last_result = str(strategy.get("last_result", "---") or "---")
+        if last_result != "---":
+            last_text = f"{last_result} {float(strategy.get('last_result_profit', 0.0) or 0.0):.2f}€"
+        elif int(strategy.get("open_positions", 0) or 0) > 0:
+            last_text = f"OPEN {live_pnl:.2f}€"
         else:
+            last_text = "---"
+        avg_profit = float(strategy.get("session_avg_profit", 0.0) or 0.0)
+        if session_net < 0:
+            row_tag = "loss"
+        elif session_net > 0:
             row_tag = "active"
-        strategy_summary.insert(
+        else:
+            row_tag = "weak" if int(strategy.get("open_positions", 0) or 0) > 0 else "idle"
+        strategy_active_tree.insert(
             "",
             "end",
             values=(
                 strategy["name"],
-                strategy["status"],
-                str(strategy.get("live_block", "INIT"))[:12],
-                f"{strategy.get('live_pnl', 0.0)}€",
-                strategy.get("open_positions", 0),
-                f"{strategy['net_profit']}€",
-                f"{strategy['winrate']}%",
-                strategy["closed"],
+                strategy.get("family", "---"),
+                int(strategy.get("session_closed", 0) or 0),
+                f"{float(strategy.get('session_winrate', 0.0) or 0.0):.1f}%",
+                f"{session_net:.2f}€",
+                f"{avg_profit:.2f}€" if int(strategy.get("session_closed", 0) or 0) > 0 else "---",
+                last_text,
             ),
             tags=(row_tag,),
         )
 
-    for strategy in strategies:
-        card = tk.Frame(strategy_list, bg=CARD_BG_2, highlightthickness=1, highlightbackground=BORDER_SOFT)
-        card.pack(fill="x", padx=8, pady=6)
+    for strategy in blocked_strategies:
+        main_block = str(strategy.get("session_main_block", "---") or "---")
+        if main_block in {"---", "INIT"}:
+            main_block = str(strategy.get("live_block", "INIT") or "INIT")
+        pretrigger = str(strategy.get("pretrigger", "---") or "---")
+        if pretrigger in {"---", ""}:
+            last_signal = str(strategy.get("last_signal", "---") or "---")
+            if last_signal not in {"---", "NONE", "NEUTRAL"}:
+                pretrigger = f"{last_signal} {float(strategy.get('last_signal_conf', 0.0) or 0.0):.0f}%"
+            else:
+                pretrigger = "---"
+        if strategy["status"] == "LOCKED":
+            row_tag = "locked"
+        elif strategy["status"] == "STANDBY":
+            row_tag = "standby"
+        else:
+            row_tag = "weak"
+        strategy_blocked_tree.insert(
+            "",
+            "end",
+            values=(
+                strategy["name"],
+                strategy.get("family", "---"),
+                main_block,
+                int(strategy.get("session_attempts", 0) or 0),
+                pretrigger,
+            ),
+            tags=(row_tag,),
+        )
 
-        header = tk.Frame(card, bg=CARD_BG_2)
-        header.pack(fill="x", padx=10, pady=(8, 2))
-        tk.Label(header, text=strategy["name"], bg=CARD_BG_2, fg=TEXT_MAIN, font=("Segoe UI Semibold", 10)).pack(side="left")
-        chip_text, chip_fg, chip_bg = strategy_chip_style(strategy)
-        tk.Label(header, text="●", bg=CARD_BG_2, fg=chip_fg, font=("Segoe UI Semibold", 12)).pack(side="right", padx=(0, 8))
-        tk.Label(
-            header,
-            text=chip_text,
-            bg=chip_bg,
-            fg=chip_fg,
-            font=("Segoe UI Semibold", 8),
-            padx=8,
-            pady=2,
-            highlightthickness=1,
-            highlightbackground=chip_fg,
-            highlightcolor=chip_fg,
-        ).pack(side="right")
-        tk.Label(header, text=strategy["status"], bg=CARD_BG_2, fg=status_color(strategy["status"]), font=("Segoe UI Semibold", 9)).pack(side="right", padx=(0, 8))
+    if not used_strategies:
+        strategy_active_tree.insert("", "end", values=("—", "—", 0, "0.0%", "0.00€", "---", "Nessun trade"), tags=("idle",))
+    if not blocked_strategies:
+        strategy_blocked_tree.insert("", "end", values=("—", "—", "Nessun blocco", 0, "—"), tags=("idle",))
 
-        meta = tk.Frame(card, bg=CARD_BG_2)
-        meta.pack(fill="x", padx=10, pady=(0, 4))
-        tk.Label(
-            meta,
-            text=f"{strategy['family']} | {strategy['tag']} | {strategy['mode']} | risk x{strategy['risk_multiplier']}",
-            bg=CARD_BG_2,
-            fg=TEXT_DIM,
-            font=("Segoe UI", 8),
-        ).pack(anchor="w")
-
-        matrix = tk.Frame(card, bg=CARD_BG_2)
-        matrix.pack(fill="x", padx=10, pady=(0, 6))
-        tk.Label(
-            matrix,
-            text=f"{strategy['session']} | TP {strategy['tp_mode']} {strategy.get('split_range', '1')} | rr {strategy['tp_rr']} | SL atr {strategy['sl_atr']}",
-            bg=CARD_BG_2,
-            fg=TEXT_SOFT,
-            font=("Segoe UI", 8),
-        ).pack(anchor="w")
-
-        tk.Label(
-            matrix,
-            text=f"BE {strategy['be_trigger']}% | Trail {strategy['trail']}",
-            bg=CARD_BG_2,
-            fg=TEXT_DIM,
-            font=("Segoe UI", 8),
-        ).pack(anchor="w")
-
-        badge_row = tk.Frame(card, bg=CARD_BG_2)
-        badge_row.pack(fill="x", padx=10, pady=(0, 6))
-        badge_fg, badge_bg = block_badge_style(strategy.get("live_block", "INIT"))
-        tk.Label(
-            badge_row,
-            text="LIVE BLOCK",
-            bg=CARD_BG_2,
-            fg=TEXT_DIM,
-            font=("Segoe UI Semibold", 8),
-        ).pack(side="left")
-        tk.Label(
-            badge_row,
-            text=strategy.get("live_block", "INIT"),
-            bg=badge_bg,
-            fg=badge_fg,
-            font=("Segoe UI Semibold", 8),
-            padx=8,
-            pady=2,
-            highlightthickness=1,
-            highlightbackground=badge_fg,
-            highlightcolor=badge_fg,
-        ).pack(side="left", padx=(8, 0))
-
-        stats = tk.Frame(card, bg=CARD_BG_2)
-        stats.pack(fill="x", padx=10, pady=(0, 8))
-        tk.Label(stats, text=f"WR {strategy['winrate']}%", bg=CARD_BG_2, fg=SUCCESS if strategy["winrate"] >= 50 else WARNING, font=("Segoe UI Semibold", 9)).pack(side="left")
-        tk.Label(stats, text=f"PF {strategy['profit_factor']}", bg=CARD_BG_2, fg=INFO, font=("Segoe UI Semibold", 9)).pack(side="left", padx=(12, 0))
-        tk.Label(stats, text=f"Live {strategy.get('live_pnl', 0.0)}€", bg=CARD_BG_2, fg=SUCCESS if strategy.get("live_pnl", 0.0) >= 0 else DANGER, font=("Segoe UI Semibold", 9)).pack(side="left", padx=(12, 0))
-        tk.Label(stats, text=f"Sess {strategy['net_profit']}€", bg=CARD_BG_2, fg=SUCCESS if strategy["net_profit"] >= 0 else DANGER, font=("Segoe UI Semibold", 9)).pack(side="left", padx=(12, 0))
-        tk.Label(stats, text=f"{strategy.get('open_positions', 0)} open | {strategy['closed']} cls", bg=CARD_BG_2, fg=TEXT_SOFT, font=("Segoe UI", 9)).pack(side="right")
-
-        live_box = tk.Frame(card, bg=CARD_BG, highlightthickness=1, highlightbackground=BORDER_SOFT)
-        live_box.pack(fill="x", padx=10, pady=(0, 8))
-        tk.Label(
-            live_box,
-            text=f"Last signal: {strategy['last_signal']} {strategy['last_signal_symbol']} {strategy['last_signal_conf']}% @ {strategy['last_signal_time']}",
-            bg=CARD_BG,
-            fg=TEXT_SOFT,
-            font=("Segoe UI", 8),
-            anchor="w",
-            justify="left",
-        ).pack(fill="x", padx=8, pady=(6, 2))
-        pre_color = SUCCESS if strategy.get("pretrigger") == "TRIGGER READY" else INFO
-        if strategy.get("pretrigger") in ("---", "", None):
-            pre_color = TEXT_DIM
-        tk.Label(
-            live_box,
-            text=f"Pre-trigger: {strategy.get('pretrigger', '---')}",
-            bg=CARD_BG,
-            fg=pre_color,
-            font=("Segoe UI", 8),
-            anchor="w",
-            justify="left",
-        ).pack(fill="x", padx=8, pady=(0, 2))
-        tk.Label(
-            live_box,
-            text=f"TP plan: {strategy.get('tp_plan', '---')}",
-            bg=CARD_BG,
-            fg=INFO if strategy.get("tp_plan") not in ("---", "", None) else TEXT_DIM,
-            font=("Segoe UI", 8),
-            anchor="w",
-            justify="left",
-        ).pack(fill="x", padx=8, pady=(0, 2))
-        result_color = SUCCESS if strategy["last_result"] == "WIN" else (DANGER if strategy["last_result"] == "LOSS" else WARNING)
-        tk.Label(
-            live_box,
-            text=f"Last result: {strategy['last_result']} {strategy['last_result_profit']}€ @ {strategy['last_result_time']} | Event: {strategy['last_event']}",
-            bg=CARD_BG,
-            fg=result_color if strategy["last_result"] != "---" else TEXT_DIM,
-            font=("Segoe UI", 8),
-            anchor="w",
-            justify="left",
-        ).pack(fill="x", padx=8, pady=(0, 6))
-        tk.Label(
-            live_box,
-            text=f"Last close: {strategy.get('last_close_symbol', '---')} @ {strategy.get('last_close_time', '---')} | {strategy.get('last_close_reason', '---')}",
-            bg=CARD_BG,
-            fg=TEXT_DIM if strategy.get("last_close_time", "---") == "---" else INFO,
-            font=("Segoe UI", 8),
-            anchor="w",
-            justify="left",
-        ).pack(fill="x", padx=8, pady=(0, 6))
-
-        if strategy["disabled_reason"]:
-            tk.Label(
-                card,
-                text=f"Locked: {strategy['disabled_reason']}",
-                bg=CARD_BG_2,
-                fg=DANGER,
-                font=("Segoe UI", 8),
-                anchor="w",
-                justify="left",
-            ).pack(fill="x", padx=10, pady=(0, 8))
-
-    strategy_summary.update_idletasks()
-    strategy_list.update_idletasks()
-    strategy_summary.yview_moveto(summary_scroll_pos)
-    strategy_canvas.yview_moveto(detail_scroll_pos)
+    strategy_active_tree.update_idletasks()
+    strategy_blocked_tree.update_idletasks()
+    strategy_active_tree.yview_moveto(active_scroll_pos)
+    strategy_blocked_tree.yview_moveto(blocked_scroll_pos)
 
     root.after(1500, update_strategy_panel)
 
 
 def update_debug_panel():
-    if running:
-        data = bot_core.get_debug_state()
-        debug_tree.delete(*debug_tree.get_children())
-        for s, d in data.items():
-            status = "ok"
-            blocked_by = d.get("blocked_by")
-            if not d.get("data", False):
-                status = "bad"
-            elif blocked_by not in (None, "", "NONE", "OK", "CLEARED"):
-                status = "warn"
-            debug_tree.insert(
-                "",
-                "end",
-                values=(s, "YES" if d.get("data") else "NO", d.get("signal", ""), d.get("blocked_by", "-"), d.get("final", "")),
-                tags=(status,),
-            )
     root.after(1000, update_debug_panel)
 
 
-def update_telemetry():
+def get_live_symbol_entries():
     symbol_pool = [bot_core.PRIMARY_SYMBOL, *bot_core.SECONDARY_SYMBOLS, *bot_core.CRYPTO_SYMBOLS]
-    active_symbols = []
+    live_symbols = list(getattr(bot_core, "symbols", []) or [])
+    symbol_entries = []
+    seen_labels = set()
     for base_symbol in symbol_pool:
         resolved = bot_core.resolve_broker_symbol(base_symbol)
-        if resolved not in active_symbols:
-            active_symbols.append(resolved)
+        live_key = resolved if resolved in live_symbols else base_symbol
+        if base_symbol in seen_labels:
+            continue
+        seen_labels.add(base_symbol)
+        symbol_entries.append({"label": base_symbol, "key": live_key, "resolved": resolved})
+    if not symbol_entries:
+        for live_symbol in live_symbols:
+            if live_symbol in seen_labels:
+                continue
+            seen_labels.add(live_symbol)
+            symbol_entries.append({"label": live_symbol, "key": live_symbol, "resolved": live_symbol})
+    return symbol_entries
 
-    columns = 5 if len(active_symbols) >= 12 else 4 if len(active_symbols) >= 9 else 3
-    rows = max(1, (len(active_symbols) + columns - 1) // columns)
+
+def update_telemetry():
+    symbol_entries = get_live_symbol_entries()
+
+    columns = 5 if len(symbol_entries) >= 12 else 4 if len(symbol_entries) >= 9 else 3
+    rows = max(1, (len(symbol_entries) + columns - 1) // columns)
 
     for col_idx in range(5):
         live_map_grid.grid_columnconfigure(col_idx, weight=(1 if col_idx < columns else 0), uniform="live_map")
     for row_idx in range(rows):
         live_map_grid.grid_rowconfigure(row_idx, weight=1, uniform="live_map_row", minsize=46)
 
-    stale = [sym for sym in live_map_tiles.keys() if sym not in active_symbols]
+    active_labels = [entry["label"] for entry in symbol_entries]
+    stale = [sym for sym in live_map_tiles.keys() if sym not in active_labels]
     for sym in stale:
         tile = live_map_tiles.pop(sym, None)
         if tile:
             tile["frame"].destroy()
 
-    for idx, s in enumerate(active_symbols):
+    for idx, entry in enumerate(symbol_entries):
         row_idx, col_idx = divmod(idx, columns)
-        state = bot_core.radar_state.get(s, {})
+        label = entry["label"]
+        live_key = entry["key"]
+        resolved = entry["resolved"]
+        state = (
+            bot_core.radar_state.get(label)
+            or bot_core.radar_state.get(live_key, {})
+            or bot_core.radar_state.get(resolved, {})
+        )
         sig = state.get("sig", "NEUTRAL")
         conf = state.get("conf", 0)
         status = str(state.get("status", "INIT"))
@@ -1372,10 +1318,10 @@ def update_telemetry():
         compact_status = status.replace("_", " ").strip() or "INIT"
         if len(compact_status) > 22:
             compact_status = compact_status[:21] + "…"
-        header_text = s
+        header_text = label
         status_text = f"{sig} {conf}% | {compact_status}"
 
-        tile = live_map_tiles.get(s)
+        tile = live_map_tiles.get(label)
         if tile is None:
             frame = tk.Frame(
                 live_map_grid,
@@ -1404,7 +1350,7 @@ def update_telemetry():
             )
             status_lbl.pack(fill="x", padx=4, pady=(0, 4))
             tile = {"frame": frame, "header": header_lbl, "status": status_lbl}
-            live_map_tiles[s] = tile
+            live_map_tiles[label] = tile
 
         tile["frame"].configure(bg=color, highlightbackground=BORDER_SOFT)
         tile["header"].configure(text=header_text, bg=color, fg=TEXT_MAIN)
@@ -1420,12 +1366,74 @@ def update_telemetry():
     root.after(1500, update_telemetry)
 
 
+def update_history_panel():
+    try:
+        history_scroll_pos = history_tree.yview()[0]
+    except Exception:
+        history_scroll_pos = 0.0
+
+    strategies = bot_core.get_strategy_dashboard()
+    history_tree.delete(*history_tree.get_children())
+    history_rows = sorted(
+        strategies,
+        key=lambda s: (
+            -int(s.get("session_entries", 0) or 0),
+            -int(s.get("session_closed", 0) or 0),
+            -float(s.get("session_net_profit", 0.0) or 0.0),
+            str(s.get("family", "---")),
+            str(s.get("name", "")),
+        ),
+    )
+
+    for strategy in history_rows:
+        used_count = int(strategy.get("session_entries", 0) or 0)
+        wr = float(strategy.get("session_winrate", 0.0) or 0.0)
+        pnl = float(strategy.get("session_net_profit", 0.0) or 0.0)
+        if int(strategy.get("open_positions", 0) or 0) > 0:
+            state = f"LIVE {float(strategy.get('live_pnl', 0.0) or 0.0):.2f}€"
+        elif int(strategy.get("session_closed", 0) or 0) > 0:
+            last_result = str(strategy.get("last_result", "---") or "---")
+            state = last_result if last_result != "---" else "CLOSED"
+        else:
+            state = str(strategy.get("live_block", "INIT") or "INIT")
+        if pnl < 0:
+            row_tag = "neg"
+        elif pnl > 0:
+            row_tag = "pos"
+        elif used_count > 0 or int(strategy.get("session_closed", 0) or 0) > 0:
+            row_tag = "used"
+        else:
+            row_tag = "idle"
+        history_tree.insert(
+            "",
+            "end",
+            values=(
+                strategy.get("name", "---"),
+                strategy.get("family", "---"),
+                used_count,
+                f"{wr:.1f}%",
+                f"{pnl:.2f}€",
+                state,
+            ),
+            tags=(row_tag,),
+        )
+
+    history_tree.update_idletasks()
+    history_tree.yview_moveto(history_scroll_pos)
+    root.after(1500, update_history_panel)
+
+
 def update_analysis():
     items = []
     live_count = 0
     wait_count = 0
-    for s in bot_core.symbols:
-        state = bot_core.radar_state.get(s, {})
+    for entry in get_live_symbol_entries():
+        s = entry["label"]
+        state = (
+            bot_core.radar_state.get(s)
+            or bot_core.radar_state.get(entry["key"], {})
+            or bot_core.radar_state.get(entry["resolved"], {})
+        )
         st = state.get("status", "INIT")
         sig = state.get("sig", "---")
         conf = state.get("conf", 0)
@@ -1594,6 +1602,7 @@ update_prop_panel()
 update_strategy_panel()
 update_debug_panel()
 update_telemetry()
+update_history_panel()
 update_distribution_panel()
 
 root.mainloop()
