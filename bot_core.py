@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ==============================================================================
-# CONFIGURAZIONE (KRYON ULTIMATE PRO V 16.4.4 - RELEASE CHECK + LUKE DATA FIX)
+# CONFIGURAZIONE (KRYON ULTIMATE PRO V 16.4.5 - STRATEGY REBALANCE + BLOCK AUDIT)
 # ==============================================================================
 PROFIT_MODE = True
 PRIMARY_SYMBOL = "XAUUSD"
@@ -3414,7 +3414,7 @@ def strategy_xau_luke(df, symbol):
 
     point_value = _luke_point_value(info)
     spread_points = abs(float(tick.ask - tick.bid)) / max(point_value, 1e-9)
-    if spread_points > 1.2:
+    if spread_points > 1.60:
         return blocked_signal(branch_name, "SPREAD HIGH", f"SP {spread_points:.1f}pt")
 
     atr_m1 = float(df_m1["atr"].iloc[-2] or 0.0)
@@ -4321,8 +4321,8 @@ def strategy_trend_vwap(df, symbol):
     overnight_xau = is_xau and (hour >= 21 or hour <= 2)
     friction_xau = is_xau and (5 <= hour <= 7 or 12 <= hour <= 13)
 
-    min_trend = 0.10 if attack else 0.26
-    vwap_limit = 1.85 if attack else 1.25
+    min_trend = 0.10 if attack else 0.28
+    vwap_limit = 1.85 if attack else 1.22
     confirm_pad = 0.18 if attack else 0.10
     ema_hold_pad = 0.24 if attack else 0.15
     body_floor = 0.025 if attack else 0.05
@@ -4330,14 +4330,14 @@ def strategy_trend_vwap(df, symbol):
     wick_atr = 0.22 if attack else 0.16
 
     if overnight_xau:
-        min_trend = min(min_trend, 0.07 if attack else 0.14)
+        min_trend = max(min_trend, 0.12 if attack else 0.20)
         if trend_strength >= (0.85 if attack else 0.65):
-            vwap_limit = max(vwap_limit, 5.20 if attack else 4.40)
-        confirm_pad = 0.30 if attack else 0.18
-        ema_hold_pad = 0.36 if attack else 0.24
-        body_floor = 0.018 if attack else 0.032
-        wick_mult = 1.80 if attack else 1.45
-        wick_atr = 0.28 if attack else 0.20
+            vwap_limit = max(vwap_limit, 3.60 if attack else 2.80)
+        confirm_pad = 0.22 if attack else 0.12
+        ema_hold_pad = 0.28 if attack else 0.18
+        body_floor = 0.022 if attack else 0.042
+        wick_mult = 1.58 if attack else 1.30
+        wick_atr = 0.24 if attack else 0.17
     elif friction_xau:
         min_trend = max(min_trend, 0.16 if attack else 0.32)
         vwap_limit = min(vwap_limit, 1.60 if attack else 1.10)
@@ -4386,7 +4386,7 @@ def strategy_trend_vwap(df, symbol):
             and last["high"] <= ema20 + atr * ema_hold_pad
             and strong_body
             and clean_short_candle
-            and trend_strength >= (0.22 if attack else 0.34)
+            and trend_strength >= (0.28 if attack else 0.42)
         ):
             return {"signal": "SELL", "confidence": 72, "name": "XAU_TREND", "signal_key": f"XTRD|SELL|{candle_key}"}
         if ema20 > ema50 and price > vwap and distance >= atr * vwap_limit:
@@ -4596,9 +4596,10 @@ def strategy_xau_m1_scalp(df, symbol):
     vwap = df["vwap"].iloc[-1]
     trend_strength = compute_trend_strength(df)
 
-    min_trend = 0.08 if attack else 0.14
-    long_bias = ema20_m5 > ema50_m5 and ema20_m15 > ema50_m15 and price > vwap and trend_strength >= min_trend
-    short_bias = ema20_m5 < ema50_m5 and ema20_m15 < ema50_m15 and price < vwap and trend_strength >= min_trend
+    min_trend = 0.09 if attack else 0.12
+    vwap_bias_pad = atr_m5 * (0.05 if attack else 0.04)
+    long_bias = ema20_m5 > ema50_m5 and ema20_m15 > ema50_m15 and price > vwap - vwap_bias_pad and trend_strength >= min_trend
+    short_bias = ema20_m5 < ema50_m5 and ema20_m15 < ema50_m15 and price < vwap + vwap_bias_pad and trend_strength >= min_trend
 
     long_stack = ema8.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1]
     short_stack = ema8.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1]
@@ -5680,15 +5681,15 @@ def strategy_ger40_pullback_scalp(df, symbol):
         ema50.iloc[-1] < ema200.iloc[-1]
         and ema20_m15 < ema50_m15
         and ema20_h1 < ema50_h1
-        and m15_close <= ema50_m15 - atr_m1 * 0.08
-        and m15_slope <= -atr_m1 * 0.04
+        and m15_close <= ema50_m15 - atr_m1 * 0.10
+        and m15_slope <= -atr_m1 * 0.05
         and h1_slope <= -atr_m1 * 0.02
-        and last["close"] < ema200.iloc[-1] - atr_m1 * 0.03
+        and last["close"] < ema200.iloc[-1] - atr_m1 * 0.05
     )
     long_pullback = min(prev["low"], last["low"]) <= ema50.iloc[-1] + atr_m1 * (0.20 if attack else 0.14) and min(prev["low"], last["low"]) >= ema200.iloc[-1] - atr_m1 * 0.10
-    short_pullback = max(prev["high"], last["high"]) >= ema50.iloc[-1] - atr_m1 * (0.16 if attack else 0.10) and max(prev["high"], last["high"]) <= ema200.iloc[-1] + atr_m1 * 0.06
+    short_pullback = max(prev["high"], last["high"]) >= ema50.iloc[-1] - atr_m1 * (0.16 if attack else 0.10) and max(prev["high"], last["high"]) <= ema200.iloc[-1] + atr_m1 * 0.04
     long_confirm = last["close"] > last["open"] and last["close"] > ema50.iloc[-1] and last["close"] >= recent_high - atr_m1 * (0.16 if attack else 0.07)
-    short_confirm = last["close"] < last["open"] and last["close"] < ema50.iloc[-1] and last["close"] <= recent_low - atr_m1 * (0.03 if attack else 0.02)
+    short_confirm = last["close"] < last["open"] and last["close"] < ema50.iloc[-1] and last["close"] <= recent_low - atr_m1 * (0.04 if attack else 0.03)
 
     if long_trend and long_pullback and long_confirm and strong_body and clean_long and rsi.iloc[-1] > 50:
         conf = 75
@@ -5696,7 +5697,7 @@ def strategy_ger40_pullback_scalp(df, symbol):
             conf = 80
         return {"signal": "BUY", "confidence": conf, "name": "GER40_PULLBACK_SCALP", "execution_df": df_m1}
 
-    if short_trend and short_pullback and short_confirm and strong_body and clean_short and rsi.iloc[-1] < 45:
+    if short_trend and short_pullback and short_confirm and strong_body and clean_short and rsi.iloc[-1] < 43:
         conf = 75
         if rsi.iloc[-1] < 40 and last["close"] <= ema50.iloc[-1] - atr_m1 * 0.10:
             conf = 80
@@ -6178,15 +6179,15 @@ BREAK_RETEST_TEST_PROFILES = {
     "XAUUSD": {
         "session": (11, 4),
         "spread_mult": (0.46, 0.34),
-        "trend_min": (0.08, 0.16),
-        "vwap_limit": (2.70, 2.05),
+        "trend_min": (0.10, 0.20),
+        "vwap_limit": (2.50, 1.85),
         "lookback": 24,
-        "break_pad": (0.02, 0.04),
-        "retest_top": (0.24, 0.18),
+        "break_pad": (0.02, 0.05),
+        "retest_top": (0.22, 0.16),
         "retest_hold": (0.06, 0.04),
-        "confirm_pad": (0.14, 0.08),
+        "confirm_pad": (0.12, 0.06),
         "break_body": (0.08, 0.11),
-        "body_floor": (0.045, 0.06),
+        "body_floor": (0.05, 0.07),
         "wick_ratio": (1.22, 1.02),
         "wick_atr": (0.20, 0.14),
         "base_conf": 76,
@@ -6216,15 +6217,15 @@ BREAK_RETEST_TEST_PROFILES = {
     "ETHUSD": {
         "session": (0, 23),
         "spread_mult": (0.95, 0.76),
-        "trend_min": (0.12, 0.20),
-        "vwap_limit": (3.40, 2.60),
+        "trend_min": (0.14, 0.24),
+        "vwap_limit": (3.10, 2.30),
         "lookback": 26,
-        "break_pad": (0.01, 0.03),
-        "retest_top": (0.24, 0.18),
+        "break_pad": (0.015, 0.04),
+        "retest_top": (0.22, 0.16),
         "retest_hold": (0.06, 0.04),
-        "confirm_pad": (0.12, 0.06),
-        "break_body": (0.07, 0.10),
-        "body_floor": (0.05, 0.07),
+        "confirm_pad": (0.10, 0.05),
+        "break_body": (0.08, 0.11),
+        "body_floor": (0.055, 0.08),
         "wick_ratio": (1.20, 1.02),
         "wick_atr": (0.18, 0.12),
         "base_conf": 75,
@@ -6276,13 +6277,13 @@ RECLAIM_TEST_PROFILES = {
     "XAUUSD": {
         "session": (11, 4),
         "spread_mult": (0.40, 0.30),
-        "trend_min": (0.08, 0.14),
-        "m15_min": (0.06, 0.12),
+        "trend_min": (0.08, 0.12),
+        "m15_min": (0.06, 0.10),
         "vwap_limit": (2.60, 2.00),
         "pullback_top": (0.14, 0.10),
         "pullback_bottom": (0.22, 0.16),
-        "reclaim_pad": (0.02, 0.01),
-        "confirm_pad": (0.16, 0.10),
+        "reclaim_pad": (0.02, 0.00),
+        "confirm_pad": (0.16, 0.12),
         "body_floor": (0.04, 0.055),
         "wick_ratio": (1.24, 1.04),
         "wick_atr": (0.20, 0.14),
@@ -8718,14 +8719,15 @@ def strategy_us500_orb(df, symbol):
     recent_high = post_orb["high"].tail(8).max()
     recent_low = post_orb["low"].tail(8).min()
 
-    trend_min = 0.18 if attack else 0.95
+    trend_min = 0.22 if attack else 1.05
     long_trigger = orb_high + atr_m5 * (0.02 if attack else 0.06)
-    short_trigger = orb_low - atr_m5 * (0.02 if attack else 0.06)
+    short_trigger = orb_low - atr_m5 * (0.04 if attack else 0.08)
     long_hold = min(prev["low"], last["low"]) >= orb_high - atr_m5 * (0.14 if attack else 0.08)
-    short_hold = max(prev["high"], last["high"]) <= orb_low + atr_m5 * (0.14 if attack else 0.08)
+    short_hold = max(prev["high"], last["high"]) <= orb_low + atr_m5 * (0.10 if attack else 0.06)
     strong_body = body >= atr_m5 * (0.06 if attack else 0.09)
     clean_long_candle = wick_up <= max(body * (1.00 if attack else 0.82), atr_m5 * (0.18 if attack else 0.12))
     clean_short_candle = wick_down <= max(body * (1.00 if attack else 0.82), atr_m5 * (0.18 if attack else 0.12))
+    short_vwap_buffer = atr_m5 * (0.03 if attack else 0.05)
 
     if (
         ema20 > ema50
@@ -8748,9 +8750,9 @@ def strategy_us500_orb(df, symbol):
         ema20 < ema50
         and ema20_m15 < ema50_m15
         and trend_strength >= trend_min
-        and price < vwap
+        and price < vwap - short_vwap_buffer
         and price <= short_trigger
-        and last["close"] <= prev["low"]
+        and last["close"] <= prev["low"] - atr_m5 * (0.02 if attack else 0.01)
         and short_hold
         and strong_body
         and clean_short_candle
@@ -8769,8 +8771,8 @@ def strategy_us500_orb(df, symbol):
         return blocked_signal("US500_ORB", "TREND WEAK", f"STR {round(trend_strength, 2)}")
     if ema20 > ema50 and price <= vwap:
         return blocked_signal("US500_ORB", "VWAP LOST", pretrigger_text("VWAP", vwap - price, atr_m5))
-    if ema20 < ema50 and price >= vwap:
-        return blocked_signal("US500_ORB", "VWAP LOST", pretrigger_text("VWAP", price - vwap, atr_m5))
+    if ema20 < ema50 and price >= vwap - short_vwap_buffer:
+        return blocked_signal("US500_ORB", "VWAP LOST", pretrigger_text("VWAP", price - (vwap - short_vwap_buffer), atr_m5))
     if ema20 > ema50 and price < long_trigger:
         return blocked_signal("US500_ORB", "NO BREAKOUT", pretrigger_text("BRK", long_trigger - price, atr_m5))
     if ema20 < ema50 and price > short_trigger:
@@ -11854,11 +11856,11 @@ def _apply_v163_stress_test_governance():
         strategy["toggle_arm"] = True
 
     xau_overrides = {
-        "XAU_TREND": {"min_score": 0.44, "cooldown_sec": 90, "risk_multiplier": 0.30, "allowed_regimes": {"TREND"}},
-        "XAU_M1_SCALP": {"min_score": 0.46, "cooldown_sec": 28, "risk_multiplier": 0.16, "allowed_regimes": {"TREND", "RANGE"}},
-        "XAU_BREAK_RETEST": {"min_score": 0.40, "cooldown_sec": 24, "risk_multiplier": 0.20, "allowed_regimes": {"TREND", "RANGE"}},
-        "XAU_VWAP_RECLAIM": {"min_score": 0.41, "cooldown_sec": 22, "risk_multiplier": 0.18, "allowed_regimes": {"TREND", "RANGE"}},
-        "XAU_LUKE": {"min_score": 0.42, "cooldown_sec": 20, "risk_multiplier": 0.55, "allowed_regimes": {"TREND", "RANGE"}},
+        "XAU_TREND": {"min_score": 0.50, "cooldown_sec": 150, "risk_multiplier": 0.24, "allowed_regimes": {"TREND"}},
+        "XAU_M1_SCALP": {"min_score": 0.45, "cooldown_sec": 34, "risk_multiplier": 0.15, "allowed_regimes": {"TREND", "RANGE"}},
+        "XAU_BREAK_RETEST": {"min_score": 0.46, "cooldown_sec": 48, "risk_multiplier": 0.16, "allowed_regimes": {"TREND", "RANGE"}},
+        "XAU_VWAP_RECLAIM": {"min_score": 0.43, "cooldown_sec": 28, "risk_multiplier": 0.17, "allowed_regimes": {"TREND", "RANGE"}},
+        "XAU_LUKE": {"min_score": 0.44, "cooldown_sec": 28, "risk_multiplier": 0.48, "allowed_regimes": {"TREND", "RANGE"}},
     }
     for name, override in xau_overrides.items():
         strategy = get_strategy_config(name)
@@ -11871,11 +11873,11 @@ def _apply_v163_stress_test_governance():
             strategy["disabled_reason"] = ""
 
     branch_overrides = {
-        "US500_ORB": {"min_score": 0.44, "cooldown_sec": 54},
-        "ETH_BREAK_RETEST": {"min_score": 0.38, "cooldown_sec": 36},
-        "GER40_PULLBACK_SCALP": {"min_score": 0.58, "cooldown_sec": 60},
+        "US500_ORB": {"min_score": 0.50, "cooldown_sec": 96, "risk_multiplier": 0.10},
+        "ETH_BREAK_RETEST": {"min_score": 0.44, "cooldown_sec": 60, "risk_multiplier": 0.13},
+        "GER40_PULLBACK_SCALP": {"min_score": 0.64, "cooldown_sec": 120, "risk_multiplier": 0.07},
         "GER40_SCALP": {"min_score": 0.56, "cooldown_sec": 42},
-        "BTC_TREND": {"min_score": 0.40, "cooldown_sec": 42},
+        "BTC_TREND": {"min_score": 0.42, "cooldown_sec": 54, "risk_multiplier": 0.20},
         "ETH_PULSE": {"min_score": 0.40, "cooldown_sec": 34},
         "US500_TREND": {"min_score": 0.42, "cooldown_sec": 42},
         "USTECH_TREND": {"min_score": 0.42, "cooldown_sec": 42},
@@ -12165,10 +12167,10 @@ _DORMANT_STRESS_RELAX_OVERRIDES = {
     "U1SG": {"min_score": 0.30, "cooldown_sec": 84},
     "U1SD": {"min_score": 0.29, "cooldown_sec": 84},
     "USTR": {"min_score": 0.42, "cooldown_sec": 42},
-    "XBRT": {"min_score": 0.40, "cooldown_sec": 24},
-    "XLUK": {"min_score": 0.42, "cooldown_sec": 20},
-    "XTRD": {"min_score": 0.44, "cooldown_sec": 90},
-    "XVRC": {"min_score": 0.41, "cooldown_sec": 22},
+    "XBRT": {"min_score": 0.46, "cooldown_sec": 48},
+    "XLUK": {"min_score": 0.44, "cooldown_sec": 28},
+    "XTRD": {"min_score": 0.50, "cooldown_sec": 150},
+    "XVRC": {"min_score": 0.43, "cooldown_sec": 28},
 }
 
 
